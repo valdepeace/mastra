@@ -38,7 +38,7 @@ import { AzureAISearchVector } from '@mastra/azure-ai-search';
 const azureVector = new AzureAISearchVector({
   id: 'azure-search-vectors',
   endpoint: 'https://your-service.search.windows.net',
-  credential: 'your-api-key'
+  credential: 'your-api-key',
 });
 ```
 
@@ -51,7 +51,7 @@ import { DefaultAzureCredential } from '@azure/identity';
 const azureVector = new AzureAISearchVector({
   id: 'azure-search-vectors',
   endpoint: 'https://your-service.search.windows.net',
-  credential: new DefaultAzureCredential()
+  credential: new DefaultAzureCredential(),
 });
 ```
 
@@ -77,16 +77,16 @@ const azureVector = new AzureAISearchVector({
             // Add custom headers
             request.headers.set('X-Custom-Header', 'my-value');
             return next(request);
-          }
-        }
-      }
+          },
+        },
+      },
     ],
     // Configure retry behavior
     retryOptions: {
       maxRetries: 3,
-      retryDelayInMs: 1000
-    }
-  }
+      retryDelayInMs: 1000,
+    },
+  },
 });
 ```
 
@@ -97,36 +97,44 @@ import { AzureAISearchVector } from '@mastra/azure-ai-search';
 import type { PipelinePolicy } from '@azure/core-rest-pipeline';
 
 // Custom proxy policy
-const createProxyPolicy = (config: {
-  proxyUrl: string;
-  token: string;
-}): PipelinePolicy => ({
+const createProxyPolicy = (config: { proxyUrl: string; token: string }): PipelinePolicy => ({
   name: 'ProxyPolicy',
   async sendRequest(request, next) {
+    // Only ever proxy through HTTPS - never leak the auth header over plaintext
+    const proxyUrl = new URL(config.proxyUrl);
+    if (proxyUrl.protocol !== 'https:') {
+      throw new Error(`Proxy URL must use HTTPS, got: ${proxyUrl.protocol}`);
+    }
+
     // Rewrite URL to proxy
     const originalUrl = new URL(request.url);
     request.url = `${config.proxyUrl}${originalUrl.pathname}${originalUrl.search}`;
-    
-    // Add proxy authentication
+
+    // The AzureKeyCredential placeholder set on the client adds an api-key
+    // header - drop it so the placeholder never leaves this process, then
+    // add the real proxy authentication.
+    request.headers.delete('api-key');
     request.headers.set('Authorization', `Bearer ${config.token}`);
-    
+
     return next(request);
-  }
+  },
 });
 
 const azureVector = new AzureAISearchVector({
   id: 'azure-search-proxy',
   endpoint: 'https://your-service.search.windows.net',
-  credential: 'dummy-key', // Not used with proxy
+  credential: 'dummy-key', // Placeholder; the proxy strips this header and injects real auth
   clientOptions: {
-    additionalPolicies: [{
-      position: 'perCall',
-      policy: createProxyPolicy({
-        proxyUrl: 'https://my-proxy.example.com',
-        token: process.env.PROXY_TOKEN!
-      })
-    }]
-  }
+    additionalPolicies: [
+      {
+        position: 'perCall',
+        policy: createProxyPolicy({
+          proxyUrl: 'https://my-proxy.example.com',
+          token: process.env.PROXY_TOKEN!,
+        }),
+      },
+    ],
+  },
 });
 ```
 
@@ -177,13 +185,13 @@ import { AzureAISearchVector } from '@mastra/azure-ai-search';
 const azureVector = new AzureAISearchVector({
   id: 'azure-search',
   endpoint: process.env.AZURE_AI_SEARCH_ENDPOINT!,
-  credential: process.env.AZURE_AI_SEARCH_CREDENTIAL!
+  credential: process.env.AZURE_AI_SEARCH_CREDENTIAL!,
 });
 
 const mastra = new Mastra({
   vectors: {
-    'azure-search': azureVector
-  }
+    'azure-search': azureVector,
+  },
 });
 ```
 
@@ -196,7 +204,7 @@ const mastra = new Mastra({
 await azureVector.createIndex({
   indexName: 'products',
   dimension: 1536, // Vector dimension (e.g., for OpenAI embeddings)
-  metric: 'cosine' // Similarity metric: 'cosine', 'euclidean', or 'dotproduct'
+  metric: 'cosine', // Similarity metric: 'cosine', 'euclidean', or 'dotproduct'
 });
 ```
 
@@ -235,20 +243,20 @@ const vectorIds = await azureVector.upsert({
     [0.4, 0.5, 0.6 /* ...1536 dimensions */], // Vector 2
   ],
   metadata: [
-    { 
-      category: 'electronics', 
-      brand: 'Apple', 
+    {
+      category: 'electronics',
+      brand: 'Apple',
       price: 999,
-      content: 'iPhone 15 Pro Max with advanced camera system'
+      content: 'iPhone 15 Pro Max with advanced camera system',
     },
-    { 
-      category: 'electronics', 
-      brand: 'Samsung', 
+    {
+      category: 'electronics',
+      brand: 'Samsung',
       price: 899,
-      content: 'Galaxy S24 Ultra with S Pen and AI features'
-    }
+      content: 'Galaxy S24 Ultra with S Pen and AI features',
+    },
   ],
-  ids: ['iphone-15-pro', 'galaxy-s24-ultra'] // Optional: provide custom IDs
+  ids: ['iphone-15-pro', 'galaxy-s24-ultra'], // Optional: provide custom IDs
 });
 
 console.log('Inserted vector IDs:', vectorIds);
@@ -265,7 +273,7 @@ const results = await azureVector.query({
   indexName: 'products',
   queryVector: [0.1, 0.2, 0.3 /* ...1536 dimensions */],
   topK: 5, // Return top 5 similar results
-  includeVector: false // Set to true if you want the vectors in results
+  includeVector: false, // Set to true if you want the vectors in results
 });
 
 console.log('Search results:', results);
@@ -283,12 +291,8 @@ const results = await azureVector.query({
   queryVector: [0.1, 0.2, 0.3 /* ...1536 dimensions */],
   topK: 10,
   filter: {
-    and: [
-      { eq: { category: 'electronics' } },
-      { gt: { price: 500 } },
-      { contains: { content: 'camera' } }
-    ]
-  }
+    and: [{ eq: { category: 'electronics' } }, { gt: { price: 500 } }, { contains: { content: 'camera' } }],
+  },
 });
 ```
 
@@ -312,30 +316,24 @@ const results = await azureVector.query({
 const complexFilter = {
   and: [
     {
-      or: [
-        { eq: { brand: 'Apple' } },
-        { eq: { brand: 'Samsung' } }
-      ]
+      or: [{ eq: { brand: 'Apple' } }, { eq: { brand: 'Samsung' } }],
     },
-    { 
-      and: [
-        { ge: { price: 500 } },
-        { le: { price: 1500 } }
-      ]
+    {
+      and: [{ ge: { price: 500 } }, { le: { price: 1500 } }],
     },
     {
       not: {
-        contains: { content: 'refurbished' }
-      }
-    }
-  ]
+        contains: { content: 'refurbished' },
+      },
+    },
+  ],
 };
 
 const results = await azureVector.query({
   indexName: 'products',
   queryVector: queryEmbedding,
   filter: complexFilter,
-  topK: 20
+  topK: 20,
 });
 ```
 
@@ -347,9 +345,9 @@ const results = await azureVector.query({
   indexName: 'products',
   queryVector: queryEmbedding,
   filter: {
-    $filter: "category eq 'electronics' and price lt 1000 and search.ismatch('smartphone', 'content')"
+    $filter: "category eq 'electronics' and price lt 1000 and search.ismatch('smartphone', 'content')",
   },
-  topK: 5
+  topK: 5,
 });
 ```
 
@@ -363,7 +361,7 @@ Significantly improves result relevance using advanced language models:
 
 ```typescript
 // Basic semantic search
-const results = await azureVector.query({
+const results = await azureVector.advancedQuery({
   indexName: 'my-index',
   queryVector: [0.1, 0.2 /* ...more dimensions */],
   topK: 10,
@@ -373,8 +371,8 @@ const results = await azureVector.query({
     semanticQuery: 'What is artificial intelligence?',
     answers: true,
     captions: true,
-    maxWaitTime: 5000
-  }
+    maxWaitTime: 5000,
+  },
 });
 ```
 
@@ -384,45 +382,45 @@ Combines multiple vectors with different weights for more sophisticated searches
 
 ```typescript
 // Multi-vector search with text vectorization
-const results = await azureVector.query({
+const results = await azureVector.advancedQuery({
   indexName: 'my-index',
   queryVector: manualVector,
   topK: 10,
   textVectorization: {
     text: 'machine learning algorithms',
-    fields: ['content_vector', 'title_vector']
-  }
+    fields: ['content_vector', 'title_vector'],
+  },
 });
 ```
 
 ### Advanced Vector Search Options
 
 ```typescript
-const results = await azureVector.query({
+const results = await azureVector.advancedQuery({
   indexName: 'my-index',
   queryVector: [0.1, 0.2 /* ...more dimensions */],
   topK: 10,
-  exhaustiveSearch: true,    // Exact k-NN search for precision
-  weight: 2.0,              // Relative weight in hybrid searches
-  oversampling: 3,          // Only with compressed vectors
-  queryType: 'full',        // 'simple' | 'full' | 'semantic'
-  filterMode: 'preFilter'   // 'preFilter' | 'postFilter'
+  exhaustiveSearch: true, // Exact k-NN search for precision
+  weight: 2.0, // Relative weight in hybrid searches
+  oversampling: 3, // Only with compressed vectors
+  queryType: 'full', // 'simple' | 'full' | 'semantic'
+  filterMode: 'preFilter', // 'preFilter' | 'postFilter'
 });
 ```
 
 ### Document Search with Automatic Answers
 
 ```typescript
-const results = await azureVector.query({
+const results = await azureVector.advancedQuery({
   indexName: 'knowledge-base',
   queryVector: await embed('What are the benefits of AI?'),
   topK: 5,
   useSemanticSearch: true,
   semanticOptions: {
     configurationName: 'default',
-    answers: true,    // Extract direct answers
-    captions: true    // Generate passage summaries
-  }
+    answers: true, // Extract direct answers
+    captions: true, // Generate passage summaries
+  },
 });
 
 // Results will include:
@@ -447,29 +445,29 @@ await azureVector.createIndex({
       name: 'title',
       type: 'Edm.String',
       searchable: true,
-      filterable: true
+      filterable: true,
     },
     {
       name: 'tags',
       type: 'Collection(Edm.String)',
       searchable: true,
       filterable: true,
-      facetable: true
-    }
+      facetable: true,
+    },
   ],
   hnswParameters: {
-    m: 16,              // Connections per layer
+    m: 16, // Connections per layer
     efConstruction: 800, // Construction time accuracy
-    efSearch: 500       // Query time accuracy
+    efSearch: 500, // Query time accuracy
   },
   semanticConfig: {
     name: 'semantic-config',
     prioritizedFields: {
       titleField: { fieldName: 'title' },
       prioritizedContentFields: [{ fieldName: 'content' }],
-      prioritizedKeywordsFields: [{ fieldName: 'tags' }]
-    }
-  }
+      prioritizedKeywordsFields: [{ fieldName: 'tags' }],
+    },
+  },
 });
 ```
 
@@ -482,25 +480,26 @@ The implementation automatically detects vector fields in existing indexes:
 const results = await azureVector.query({
   indexName: 'legacy-index', // May use 'vector', 'embedding', etc.
   queryVector: [0.1, 0.2 /* ...more dimensions */],
-  topK: 5
+  topK: 5,
 });
 // Automatically detects and uses the correct vector field
 ```
 
 ### Feature Comparison
 
-| Feature | Pinecone | Qdrant | **Azure AI Search** |
-|---------|----------|--------|---------------------|
-| Basic vector search | ✅ | ✅ | ✅ |
-| Metadata/payload filters | ✅ | ✅ | ✅ |
-| Hybrid lexical + vector search | ✅ | ✅ | ✅ |
-| Semantic reranking (platform-provided) | ❌ | ❌ | ✅ |
-| Automatic vectorization (platform-provided) | ✅ (integrated embedding indexes) | ❌ | ✅ (integrated vectorization) |
-| Exact search mode | Not explicitly exposed as query option | ✅ (`exact: true`) | ✅ (`exhaustive: true`) |
-| Multiple vector fields per record | Limited (single dense + single sparse index design) | ✅ (named vectors) | ✅ (multi-vector fields) |
-| HNSW query tuning | Not exposed as HNSW params | ✅ (`hnsw_ef`, collection config) | ✅ (algorithm/profile configuration) |
+| Feature                                     | Pinecone                                            | Qdrant                            | **Azure AI Search**                  |
+| ------------------------------------------- | --------------------------------------------------- | --------------------------------- | ------------------------------------ |
+| Basic vector search                         | ✅                                                  | ✅                                | ✅                                   |
+| Metadata/payload filters                    | ✅                                                  | ✅                                | ✅                                   |
+| Hybrid lexical + vector search              | ✅                                                  | ✅                                | ✅                                   |
+| Semantic reranking (platform-provided)      | ❌                                                  | ❌                                | ✅                                   |
+| Automatic vectorization (platform-provided) | ✅ (integrated embedding indexes)                   | ❌                                | ✅ (integrated vectorization)        |
+| Exact search mode                           | Not explicitly exposed as query option              | ✅ (`exact: true`)                | ✅ (`exhaustive: true`)              |
+| Multiple vector fields per record           | Limited (single dense + single sparse index design) | ✅ (named vectors)                | ✅ (multi-vector fields)             |
+| HNSW query tuning                           | Not exposed as HNSW params                          | ✅ (`hnsw_ef`, collection config) | ✅ (algorithm/profile configuration) |
 
 Comparison notes:
+
 - This table is based on vendor documentation and public APIs as of February 2026.
 - "Platform-provided" means available directly in the vendor platform, not via external rerankers or custom pipelines.
 
@@ -513,13 +512,13 @@ await azureVector.updateVector({
   id: 'iphone-15-pro',
   update: {
     vector: [0.2, 0.3, 0.4 /* ...more dimensions */], // New vector
-    metadata: { 
+    metadata: {
       category: 'electronics',
       brand: 'Apple',
       price: 899, // Updated price
-      content: 'iPhone 15 Pro Max - Now with better price!'
-    }
-  }
+      content: 'iPhone 15 Pro Max - Now with better price!',
+    },
+  },
 });
 ```
 
@@ -545,7 +544,7 @@ await azureVector.deleteIndex({ indexName: 'products' });
 // Delete specific vector
 await azureVector.deleteVector({
   indexName: 'products',
-  id: 'iphone-15-pro'
+  id: 'iphone-15-pro',
 });
 ```
 
@@ -555,20 +554,20 @@ Azure AI Search uses OData syntax for filtering. This package supports both stru
 
 ### Structured Filter Syntax
 
-| Operation | Description | Example |
-|-----------|-------------|---------|
-| `eq` | Equals | `{ eq: { category: 'electronics' } }` |
-| `ne` | Not equals | `{ ne: { status: 'discontinued' } }` |
-| `gt` | Greater than | `{ gt: { price: 100 } }` |
-| `ge` | Greater than or equal | `{ ge: { rating: 4.0 } }` |
-| `lt` | Less than | `{ lt: { price: 1000 } }` |
-| `le` | Less than or equal | `{ le: { discount: 50 } }` |
-| `contains` | String contains | `{ contains: { description: 'wireless' } }` |
-| `startsWith` | String starts with | `{ startsWith: { name: 'iPhone' } }` |
-| `endsWith` | String ends with | `{ endsWith: { model: 'Pro' } }` |
-| `and` | Logical AND | `{ and: [filter1, filter2] }` |
-| `or` | Logical OR | `{ or: [filter1, filter2] }` |
-| `not` | Logical NOT | `{ not: filter }` |
+| Operation    | Description           | Example                                     |
+| ------------ | --------------------- | ------------------------------------------- |
+| `eq`         | Equals                | `{ eq: { category: 'electronics' } }`       |
+| `ne`         | Not equals            | `{ ne: { status: 'discontinued' } }`        |
+| `gt`         | Greater than          | `{ gt: { price: 100 } }`                    |
+| `ge`         | Greater than or equal | `{ ge: { rating: 4.0 } }`                   |
+| `lt`         | Less than             | `{ lt: { price: 1000 } }`                   |
+| `le`         | Less than or equal    | `{ le: { discount: 50 } }`                  |
+| `contains`   | String contains       | `{ contains: { description: 'wireless' } }` |
+| `startsWith` | String starts with    | `{ startsWith: { name: 'iPhone' } }`        |
+| `endsWith`   | String ends with      | `{ endsWith: { model: 'Pro' } }`            |
+| `and`        | Logical AND           | `{ and: [filter1, filter2] }`               |
+| `or`         | Logical OR            | `{ or: [filter1, filter2] }`                |
+| `not`        | Logical NOT           | `{ not: filter }`                           |
 
 ### Raw OData Filter
 
@@ -576,7 +575,8 @@ For advanced scenarios, you can use raw OData syntax:
 
 ```typescript
 const filter = {
-  $filter: "category eq 'electronics' and price lt 1000 and geo.distance(location, geography'POINT(-122.131577 47.678581)') le 10"
+  $filter:
+    "category eq 'electronics' and price lt 1000 and geo.distance(location, geography'POINT(-122.131577 47.678581)') le 10",
 };
 ```
 
@@ -591,7 +591,7 @@ try {
   await azureVector.createIndex({
     indexName: 'test',
     dimension: 1536,
-    metric: 'cosine'
+    metric: 'cosine',
   });
 } catch (error) {
   if (error instanceof MastraError) {
@@ -611,7 +611,7 @@ try {
 
 ### Azure AI Search Limitations
 
-- **Maximum vector dimensions**: 3072 per field
+- **Maximum vector dimensions**: 4096 per field
 - **Maximum document size**: 16 MB
 - **Query limits**: Rate limits apply based on your pricing tier
 - **Index limits**: Number of indexes varies by pricing tier
@@ -646,7 +646,7 @@ AZURE_AI_SEARCH_CREDENTIAL=your-api-key
 const azureVector = new AzureAISearchVector({
   id: 'azure-search',
   endpoint: process.env.AZURE_AI_SEARCH_ENDPOINT!,
-  credential: process.env.AZURE_AI_SEARCH_CREDENTIAL!
+  credential: process.env.AZURE_AI_SEARCH_CREDENTIAL!,
 });
 ```
 
@@ -655,18 +655,15 @@ const azureVector = new AzureAISearchVector({
 This package is written in TypeScript:
 
 ```typescript
-import type { 
-  AzureAISearchVector, 
+import type {
+  AzureAISearchVector,
   AzureAISearchVectorFilter,
-  AzureAISearchVectorOptions 
+  AzureAISearchVectorOptions,
 } from '@mastra/azure-ai-search';
 
 // Type-safe filter construction
 const filter: AzureAISearchVectorFilter = {
-  and: [
-    { eq: { category: 'electronics' } },
-    { gt: { price: 100 } }
-  ]
+  and: [{ eq: { category: 'electronics' } }, { gt: { price: 100 } }],
 };
 ```
 

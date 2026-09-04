@@ -1,6 +1,6 @@
 /**
  * Example: Using AzureAISearchVector with a custom proxy
- * 
+ *
  * This example demonstrates how to use clientOptions to configure
  * a custom proxy for Azure AI Search requests.
  */
@@ -22,30 +22,39 @@ function createProxyPolicy(config: {
   return {
     name: 'CustomProxyPolicy',
     async sendRequest(request, next) {
+      // Only ever proxy through HTTPS - never leak the auth header over plaintext
+      const proxyUrl = new URL(config.proxyUrl);
+      if (proxyUrl.protocol !== 'https:') {
+        throw new Error(`Proxy URL must use HTTPS, got: ${proxyUrl.protocol}`);
+      }
+
       // Rewrite the URL to use the proxy
       const originalUrl = new URL(request.url);
       const proxyPath = `${originalUrl.pathname}${originalUrl.search}`;
       request.url = `${config.proxyUrl}${proxyPath}`;
-      
-      // Add authentication header
+
+      // The AzureKeyCredential placeholder set on the client adds an api-key
+      // header - drop it so the placeholder never leaves this process, then
+      // add the real auth header the proxy expects.
+      request.headers.delete('api-key');
       request.headers.set('Authorization', `Bearer ${config.token}`);
-      
+
       // Add optional user ID header
       if (config.userId) {
         request.headers.set('X-User-ID', config.userId);
       }
-      
+
       // Add any custom headers
       if (config.customHeaders) {
         Object.entries(config.customHeaders).forEach(([key, value]) => {
           request.headers.set(key, value);
         });
       }
-      
+
       console.log(`[Proxy] Redirecting: ${originalUrl.href} -> ${request.url}`);
-      
+
       return next(request);
-    }
+    },
   };
 }
 
@@ -70,17 +79,17 @@ async function main() {
             userId,
             customHeaders: {
               'X-Custom-Header': 'example-value',
-              'X-Request-Source': 'mastra-aisearch'
-            }
-          })
-        }
+              'X-Request-Source': 'mastra-aisearch',
+            },
+          }),
+        },
       ],
       // Optional: Configure retry behavior
       retryOptions: {
         maxRetries: 3,
-        retryDelayInMs: 1000
-      }
-    }
+        retryDelayInMs: 1000,
+      },
+    },
   });
 
   try {
@@ -89,7 +98,7 @@ async function main() {
     await vectorStore.createIndex({
       indexName: 'test-index',
       dimension: 1536,
-      metric: 'cosine'
+      metric: 'cosine',
     });
 
     console.log('Index created successfully through proxy!');
@@ -98,11 +107,10 @@ async function main() {
     const results = await vectorStore.query({
       indexName: 'test-index',
       queryVector: Array(1536).fill(0.1),
-      topK: 5
+      topK: 5,
     });
 
     console.log(`Found ${results.length} results through proxy`);
-
   } catch (error) {
     console.error('Error using proxy:', error);
   }

@@ -280,6 +280,19 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
     });
   }
 
+  // Azure AI Search rejects a single uploadDocuments/deleteDocuments batch
+  // over 1,000 documents (and over the service payload-size limit), so large
+  // upsert/delete operations must be split and sent as separate batches.
+  private static readonly BATCH_SIZE = 1000;
+
+  private chunk<T>(items: T[], size: number): T[][] {
+    const chunks: T[][] = [];
+    for (let i = 0; i < items.length; i += size) {
+      chunks.push(items.slice(i, i + size));
+    }
+    return chunks;
+  }
+
   /**
    * Gets or creates a search client for a specific index
    */
@@ -321,17 +334,38 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
     }
   }
 
-  private async getIndexFieldCapabilities(indexName: string): Promise<Map<string, IndexFieldCapabilities>> {
+  /**
+   * Fetches the index schema once and derives everything the write path
+   * (upsert/updateVector) needs from it - the vector field's dimension and
+   * name, and per-field capabilities - instead of separate getIndex round
+   * trips (via describeIndex and getVectorFieldName).
+   */
+  private async getIndexSchemaInfo(
+    indexName: string,
+  ): Promise<{ dimension: number; vectorFieldName: string; fields: Map<string, IndexFieldCapabilities> }> {
     const index = await this.indexClient.getIndex(indexName);
-    const capabilities = new Map<string, IndexFieldCapabilities>();
 
+    const fields = new Map<string, IndexFieldCapabilities>();
     for (const field of index.fields ?? []) {
-      capabilities.set((field as any).name, {
-        type: (field as any).type,
-      });
+      fields.set((field as any).name, { type: (field as any).type });
     }
 
-    return capabilities;
+    const vectorField = index.fields?.find(
+      (field: any) => field.type === 'Collection(Edm.Single)' && (field.dimensions || field.vectorSearchDimensions),
+    ) as any;
+    // For backward compatibility, fall back to a field literally named 'vector'
+    const resolvedVectorField = vectorField ?? (index.fields?.find((field: any) => field.name === 'vector') as any);
+    const dimension = resolvedVectorField?.dimensions || resolvedVectorField?.vectorSearchDimensions;
+
+    if (!dimension) {
+      throw new Error('Vector field not found or missing dimensions');
+    }
+
+    return {
+      dimension,
+      vectorFieldName: resolvedVectorField?.name || 'vector',
+      fields,
+    };
   }
 
   private getMetadataIndexFields(
@@ -352,7 +386,9 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
     const reservedFieldNames = new Set(['id', 'metadata', 'content', 'vector']);
     return metadataIndexes
       .map(entry => (typeof entry === 'string' ? { name: entry, type: 'string' as const } : entry))
-      .filter(entry => !reservedFieldNames.has(entry.name) && !additionalFields?.some(field => field.name === entry.name))
+      .filter(
+        entry => !reservedFieldNames.has(entry.name) && !additionalFields?.some(field => field.name === entry.name),
+      )
       .map(entry => ({
         name: entry.name,
         type: edmTypeFor(entry.type),
@@ -491,7 +527,8 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
           type: 'Edm.String',
           key: true,
           filterable: true,
-          sortable: false,
+          // Sortable so findIdsByFilter can page deterministically with orderBy
+          sortable: true,
           facetable: false,
           searchable: false,
         },
@@ -768,13 +805,7 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
    * @returns Array of IDs of the upserted vectors
    * @throws {MastraError} When upsert operation fails
    */
-  async upsert({
-    indexName,
-    vectors,
-    metadata = [],
-    ids,
-    deleteFilter,
-  }: AzureAISearchUpsertParams): Promise<string[]> {
+  async upsert({ indexName, vectors, metadata = [], ids, deleteFilter }: AzureAISearchUpsertParams): Promise<string[]> {
     if (metadata.length > 0 && metadata.length !== vectors.length) {
       throw new MastraError({
         id: 'STORAGE_AZURE_AI_SEARCH_UPSERT_METADATA_LENGTH_MISMATCH',
@@ -795,17 +826,9 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
     }
 
     try {
-      if (deleteFilter) {
-        await this.deleteVectors({ indexName, filter: deleteFilter });
-      }
-
-      // Get index info to validate vector dimensions and detect vector field
-      const indexInfo = await this.describeIndex({ indexName });
-      this.validateVectorDimensions(vectors, indexInfo.dimension);
-
-      // Detect vector field name
-      const vectorFieldName = await this.getVectorFieldName(indexName);
-      const fields = await this.getIndexFieldCapabilities(indexName);
+      // Fetch the index schema once and validate vector dimensions against it
+      const { dimension, vectorFieldName, fields } = await this.getIndexSchemaInfo(indexName);
+      this.validateVectorDimensions(vectors, dimension);
 
       // Generate IDs if not provided
       const vectorIds = ids || vectors.map(() => crypto.randomUUID());
@@ -821,28 +844,37 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
         }),
       );
 
-      // Upload documents
+      // Upload documents, batched to stay under Azure's per-request document limit
       const searchClient = this.getSearchClient(indexName);
-      const uploadResult = await searchClient.uploadDocuments(documents as any);
+      for (const batch of this.chunk(documents, AzureAISearchVector.BATCH_SIZE)) {
+        const uploadResult = await searchClient.uploadDocuments(batch as any);
 
-      // Check for failures
-      const failures = uploadResult.results.filter(result => !result.succeeded);
-      if (failures.length > 0) {
-        throw new MastraError(
-          {
-            id: 'STORAGE_AZURE_AI_SEARCH_UPSERT_PARTIAL_FAILURE',
-            domain: ErrorDomain.STORAGE,
-            category: ErrorCategory.THIRD_PARTY,
-            details: {
-              indexName,
-              totalDocuments: uploadResult.results.length,
-              failedCount: failures.length,
-              firstFailedKey: failures[0]?.key || 'unknown',
-              firstFailedError: failures[0]?.errorMessage || 'No error message',
+        // Check for failures
+        const failures = uploadResult.results.filter(result => !result.succeeded);
+        if (failures.length > 0) {
+          throw new MastraError(
+            {
+              id: 'STORAGE_AZURE_AI_SEARCH_UPSERT_PARTIAL_FAILURE',
+              domain: ErrorDomain.STORAGE,
+              category: ErrorCategory.THIRD_PARTY,
+              details: {
+                indexName,
+                totalDocuments: uploadResult.results.length,
+                failedCount: failures.length,
+                firstFailedKey: failures[0]?.key || 'unknown',
+                firstFailedError: failures[0]?.errorMessage || 'No error message',
+              },
             },
-          },
-          new Error(`${failures.length} of ${uploadResult.results.length} documents failed to upload`),
-        );
+            new Error(`${failures.length} of ${uploadResult.results.length} documents failed to upload`),
+          );
+        }
+      }
+
+      // Only remove the documents being replaced after the new ones are
+      // confirmed written, so a failed upload never leaves data deleted
+      // without its replacement in place.
+      if (deleteFilter) {
+        await this.deleteVectors({ indexName, filter: deleteFilter });
       }
 
       return vectorIds;
@@ -961,7 +993,9 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
 
       // Prepare field selection. The vector field is declared `retrievable: true`
       // in the index schema, so it can be selected back when explicitly requested.
-      const selectFields = includeVector ? ['id', 'metadata', 'content', vectorFieldName] : ['id', 'metadata', 'content'];
+      const selectFields = includeVector
+        ? ['id', 'metadata', 'content', vectorFieldName]
+        : ['id', 'metadata', 'content'];
 
       // Build search options
       let searchOptions: SearchRequestOptions<any> = {
@@ -1108,14 +1142,11 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
 
       const searchClient = this.getSearchClient(indexName);
 
-      // Get vector field name
-      const vectorFieldName = await this.getVectorFieldName(indexName);
-      const fields = await this.getIndexFieldCapabilities(indexName);
-
-      // Validate vector dimension if updating vector
+      // Fetch the index schema once for the vector field name/capabilities,
+      // and to validate dimension if a vector update was requested
+      const { dimension, vectorFieldName, fields } = await this.getIndexSchemaInfo(indexName);
       if (update.vector) {
-        const indexInfo = await this.describeIndex({ indexName });
-        this.validateVectorDimensions([update.vector], indexInfo.dimension);
+        this.validateVectorDimensions([update.vector], dimension);
       }
 
       let targetIds: string[];
@@ -1242,26 +1273,29 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
       }
 
       const searchClient = this.getSearchClient(indexName);
-      const deleteResult = await searchClient.deleteDocuments(idsToDelete.map(id => ({ id })) as any);
+      // Batched to stay under Azure's per-request document limit
+      for (const batch of this.chunk(idsToDelete, AzureAISearchVector.BATCH_SIZE)) {
+        const deleteResult = await searchClient.deleteDocuments(batch.map(id => ({ id })) as any);
 
-      // Check for per-document failures
-      const deleteFailures = deleteResult.results.filter(result => !result.succeeded);
-      if (deleteFailures.length > 0) {
-        throw new MastraError(
-          {
-            id: 'STORAGE_AZURE_AI_SEARCH_DELETE_PARTIAL_FAILURE',
-            domain: ErrorDomain.STORAGE,
-            category: ErrorCategory.THIRD_PARTY,
-            details: {
-              indexName,
-              totalDocuments: deleteResult.results.length,
-              failedCount: deleteFailures.length,
-              firstFailedKey: deleteFailures[0]?.key || 'unknown',
-              firstFailedError: deleteFailures[0]?.errorMessage || 'No error message',
+        // Check for per-document failures
+        const deleteFailures = deleteResult.results.filter(result => !result.succeeded);
+        if (deleteFailures.length > 0) {
+          throw new MastraError(
+            {
+              id: 'STORAGE_AZURE_AI_SEARCH_DELETE_PARTIAL_FAILURE',
+              domain: ErrorDomain.STORAGE,
+              category: ErrorCategory.THIRD_PARTY,
+              details: {
+                indexName,
+                totalDocuments: deleteResult.results.length,
+                failedCount: deleteFailures.length,
+                firstFailedKey: deleteFailures[0]?.key || 'unknown',
+                firstFailedError: deleteFailures[0]?.errorMessage || 'No error message',
+              },
             },
-          },
-          new Error(`${deleteFailures.length} of ${deleteResult.results.length} documents failed to delete`),
-        );
+            new Error(`${deleteFailures.length} of ${deleteResult.results.length} documents failed to delete`),
+          );
+        }
       }
     } catch (error) {
       if (error instanceof MastraError) {
@@ -1370,6 +1404,9 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
         top: pageSize,
         skip,
         select: ['id'],
+        // Deterministic order so skip/top pagination doesn't skip or repeat
+        // results across pages
+        orderBy: ['id asc'],
       } as any);
 
       let count = 0;

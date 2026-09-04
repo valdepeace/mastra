@@ -113,8 +113,21 @@ export class AzureAISearchFilterTranslator {
   }
 
   private static readonly LEGACY_OPERATOR_KEYS = new Set([
-    'and', 'or', 'not', 'eq', 'ne', 'gt', 'ge', 'lt', 'le',
-    'contains', 'startsWith', 'endsWith', 'any', 'all', '$filter',
+    'and',
+    'or',
+    'not',
+    'eq',
+    'ne',
+    'gt',
+    'ge',
+    'lt',
+    'le',
+    'contains',
+    'startsWith',
+    'endsWith',
+    'any',
+    'all',
+    '$filter',
   ]);
 
   private isMastraFilterSyntax(filter: Record<string, any>): boolean {
@@ -201,6 +214,15 @@ export class AzureAISearchFilterTranslator {
     return conditions.join(' and ');
   }
 
+  // An empty $or/$in/array filter has no value it could match, so — unlike an
+  // empty $and, which is vacuously true — it must match nothing. Azure OData
+  // requires a comparison to involve an actual field, not two bare literals,
+  // so this compares the always-present `id` key field against a sentinel
+  // value no real document id can equal.
+  private matchNoneCondition(): string {
+    return `id eq '__mastra_empty_or_never_matches__'`;
+  }
+
   private translateMastraFilter(filter: Record<string, any>): string {
     const conditions: string[] = [];
 
@@ -215,12 +237,7 @@ export class AzureAISearchFilterTranslator {
 
       if (key === '$or' && Array.isArray(value)) {
         if (value.length === 0) {
-          // An empty $or has no clause it could satisfy, so — unlike an empty
-          // $and, which is vacuously true — it must match nothing. Azure OData
-          // requires a comparison to involve an actual field, not two bare
-          // literals, so this compares the always-present `id` key field
-          // against a sentinel value no real document id can equal.
-          conditions.push(`id eq '__mastra_empty_or_never_matches__'`);
+          conditions.push(this.matchNoneCondition());
           continue;
         }
         const orConditions = value.map(item => this.translateMastraFilter(item)).filter(Boolean);
@@ -251,7 +268,7 @@ export class AzureAISearchFilterTranslator {
   private translateMastraFieldCondition(field: string, value: any): string[] {
     if (Array.isArray(value)) {
       if (value.length === 0) {
-        return [];
+        return [this.matchNoneCondition()];
       }
       return [this.formatInClause(field, value)];
     }
@@ -282,8 +299,10 @@ export class AzureAISearchFilterTranslator {
           conditions.push(`${this.escapeFieldName(field)} le ${this.formatValue(operatorValue)}`);
           break;
         case '$in':
-          if (Array.isArray(operatorValue) && operatorValue.length > 0) {
-            conditions.push(this.formatInClause(field, operatorValue));
+          if (Array.isArray(operatorValue)) {
+            conditions.push(
+              operatorValue.length > 0 ? this.formatInClause(field, operatorValue) : this.matchNoneCondition(),
+            );
           }
           break;
         case '$nin':

@@ -15,8 +15,8 @@ Added a new `@mastra/azure-ai-search` vector store package for Azure AI Search.
 import { AzureAISearchVector } from '@mastra/azure-ai-search';
 
 const vectorStore = new AzureAISearchVector({
-  endpoint: process.env.AZURE_AISEARCH_ENDPOINT!,
-  credential: process.env.AZURE_AISEARCH_API_KEY!,
+  endpoint: process.env.AZURE_AI_SEARCH_ENDPOINT!,
+  credential: process.env.AZURE_AI_SEARCH_CREDENTIAL!,
   id: 'azure-search-vectors',
 });
 ```

@@ -725,11 +725,17 @@ describeIntegration('AzureAISearchVector Advanced Features Integration Tests', (
 // `test:unit`'s --testNamePattern exclusion also skips these (they hit a
 // real Azure AI Search resource just like the rest of this file).
 describeIntegration('AzureAISearchVector Conformance Suite Integration Tests', () => {
-  const conformanceVector = new AzureAISearchVector({
-    id: 'azure-ai-search-conformance',
-    endpoint: AZURE_AI_SEARCH_ENDPOINT!,
-    credential: AZURE_AI_SEARCH_CREDENTIAL!,
-  });
+  // describeIntegration is describe.skip (not a full skip) when credentials are
+  // absent, so this body still runs at collection time - only construct the
+  // real client when there's something valid to construct it with.
+  const conformanceVector =
+    AZURE_AI_SEARCH_ENDPOINT && AZURE_AI_SEARCH_CREDENTIAL
+      ? new AzureAISearchVector({
+          id: 'azure-ai-search-conformance',
+          endpoint: AZURE_AI_SEARCH_ENDPOINT,
+          credential: AZURE_AI_SEARCH_CREDENTIAL,
+        })
+      : (undefined as unknown as AzureAISearchVector);
 
   // Every metadata field the shared suite filters on across all its domains, with
   // its real type — Azure AI Search requires filterable fields to be declared in
