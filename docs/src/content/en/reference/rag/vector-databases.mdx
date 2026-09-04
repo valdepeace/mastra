@@ -3,6 +3,7 @@ title: "Storing embeddings in a vector database | RAG"
 description: "After generating embeddings, you need to store them in a database that supports vector similarity search."
 packages:
   - "@mastra/astra"
+  - "@mastra/azure-ai-search"
   - "@mastra/chroma"
   - "@mastra/core"
   - "@mastra/couchbase"
@@ -223,6 +224,29 @@ After generating embeddings, you need to store them in a database that supports 
 
     await store.upsert({
       indexName: 'myCollection',
+      vectors: embeddings,
+      metadata: chunks.map(chunk => ({ text: chunk.text })),
+    })
+    ```
+  </TabItem>
+
+  <TabItem value="azure-ai-search" label="Azure AI Search">
+    ```ts title="vector-store.ts"
+    import { AzureAISearchVector } from '@mastra/azure-ai-search'
+
+    const store = new AzureAISearchVector({
+      id: 'azure-search-vectors',
+      endpoint: process.env.AZURE_AI_SEARCH_ENDPOINT,
+      credential: process.env.AZURE_AI_SEARCH_CREDENTIAL,
+    })
+
+    await store.createIndex({
+      indexName: 'my-collection',
+      dimension: 1536,
+    })
+
+    await store.upsert({
+      indexName: 'my-collection',
       vectors: embeddings,
       metadata: chunks.map(chunk => ({ text: chunk.text })),
     })
@@ -526,6 +550,17 @@ Each vector database enforces specific naming conventions for indexes and collec
     - Contain only letters, numbers, and `_` characters
     - Example: `my_collection_123` is valid
     - Example: `my-collection` isn't valid (contains hyphen)
+  </TabItem>
+
+  <TabItem value="azure-ai-search" label="Azure AI Search">
+    Index names must:
+
+    - Use only lowercase letters, numbers, and dashes
+    - Start with a letter
+    - Not end with a dash or contain consecutive dashes
+    - Be 2-128 characters long
+    - Example: `my-index-123` is valid
+    - Example: `My_Index` isn't valid (uppercase and underscore)
   </TabItem>
 
   <TabItem value="libsql" label="libSQL">
