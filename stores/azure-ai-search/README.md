@@ -127,7 +127,9 @@ const azureVector = new AzureAISearchVector({
   clientOptions: {
     additionalPolicies: [
       {
-        position: 'perCall',
+        // perRetry so the URL rewrite and auth header are re-applied on every
+        // retry attempt, not just the first
+        position: 'perRetry',
         policy: createProxyPolicy({
           proxyUrl: 'https://my-proxy.example.com',
           token: process.env.PROXY_TOKEN!,
@@ -388,7 +390,9 @@ const results = await azureVector.advancedQuery({
   topK: 10,
   textVectorization: {
     text: 'machine learning algorithms',
-    fields: ['content_vector', 'title_vector'],
+    // Searchable text fields to match the BM25 side of the hybrid search
+    // against, not vector fields
+    fields: ['content', 'title'],
   },
 });
 ```

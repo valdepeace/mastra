@@ -72,7 +72,9 @@ async function main() {
     clientOptions: {
       additionalPolicies: [
         {
-          position: 'perCall',
+          // perRetry so the URL rewrite and auth header are re-applied on every
+          // retry attempt, not just the first
+          position: 'perRetry',
           policy: createProxyPolicy({
             proxyUrl,
             token: proxyToken,

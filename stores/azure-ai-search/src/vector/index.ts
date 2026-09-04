@@ -281,15 +281,44 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
   }
 
   // Azure AI Search rejects a single uploadDocuments/deleteDocuments batch
-  // over 1,000 documents (and over the service payload-size limit), so large
-  // upsert/delete operations must be split and sent as separate batches.
+  // over 1,000 documents, so large upsert/delete operations must be split
+  // and sent as separate batches.
   private static readonly BATCH_SIZE = 1000;
+
+  // ...and also rejects a request body over 16 MB. Only documents (which
+  // carry full vectors and metadata) can realistically hit that; id-only
+  // delete batches never come close. Leave headroom for request overhead.
+  private static readonly BATCH_MAX_BYTES = 15 * 1024 * 1024;
 
   private chunk<T>(items: T[], size: number): T[][] {
     const chunks: T[][] = [];
     for (let i = 0; i < items.length; i += size) {
       chunks.push(items.slice(i, i + size));
     }
+    return chunks;
+  }
+
+  // Same as chunk(), but also caps each batch's approximate serialized size
+  // so an upload batch of large documents doesn't cross Azure's 16 MB limit.
+  private chunkBySizeAndCount<T>(items: T[], maxCount: number, maxBytes: number): T[][] {
+    const chunks: T[][] = [];
+    let current: T[] = [];
+    let currentBytes = 0;
+
+    for (const item of items) {
+      const itemBytes = Buffer.byteLength(JSON.stringify(item));
+      if (current.length > 0 && (current.length >= maxCount || currentBytes + itemBytes > maxBytes)) {
+        chunks.push(current);
+        current = [];
+        currentBytes = 0;
+      }
+      current.push(item);
+      currentBytes += itemBytes;
+    }
+    if (current.length > 0) {
+      chunks.push(current);
+    }
+
     return chunks;
   }
 
@@ -830,6 +859,12 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
       const { dimension, vectorFieldName, fields } = await this.getIndexSchemaInfo(indexName);
       this.validateVectorDimensions(vectors, dimension);
 
+      // Capture which existing documents match deleteFilter *before* uploading,
+      // so we know exactly what to remove afterward - if we waited and
+      // re-evaluated the filter after upload, a replacement document that
+      // itself matches deleteFilter would be deleted right after being written.
+      const idsMatchingDeleteFilter = deleteFilter ? await this.findIdsByFilter(indexName, deleteFilter) : [];
+
       // Generate IDs if not provided
       const vectorIds = ids || vectors.map(() => crypto.randomUUID());
 
@@ -844,9 +879,14 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
         }),
       );
 
-      // Upload documents, batched to stay under Azure's per-request document limit
+      // Upload documents, batched to stay under Azure's per-request document
+      // count and payload-size limits
       const searchClient = this.getSearchClient(indexName);
-      for (const batch of this.chunk(documents, AzureAISearchVector.BATCH_SIZE)) {
+      for (const batch of this.chunkBySizeAndCount(
+        documents,
+        AzureAISearchVector.BATCH_SIZE,
+        AzureAISearchVector.BATCH_MAX_BYTES,
+      )) {
         const uploadResult = await searchClient.uploadDocuments(batch as any);
 
         // Check for failures
@@ -872,9 +912,14 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
 
       // Only remove the documents being replaced after the new ones are
       // confirmed written, so a failed upload never leaves data deleted
-      // without its replacement in place.
-      if (deleteFilter) {
-        await this.deleteVectors({ indexName, filter: deleteFilter });
+      // without its replacement in place. Exclude any id that was just
+      // (re)written - those are the replacements, not stale matches.
+      if (idsMatchingDeleteFilter.length > 0) {
+        const newIds = new Set(vectorIds);
+        const idsToDelete = idsMatchingDeleteFilter.filter(id => !newIds.has(id));
+        if (idsToDelete.length > 0) {
+          await this.deleteVectors({ indexName, ids: idsToDelete });
+        }
       }
 
       return vectorIds;
@@ -1398,29 +1443,50 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
     let skip = 0;
     const pageSize = 1000;
 
-    while (true) {
-      const searchResults = await searchClient.search('*', {
-        filter: odataFilter,
-        top: pageSize,
-        skip,
-        select: ['id'],
-        // Deterministic order so skip/top pagination doesn't skip or repeat
-        // results across pages
-        orderBy: ['id asc'],
-      } as any);
+    try {
+      while (true) {
+        const searchResults = await searchClient.search('*', {
+          filter: odataFilter,
+          top: pageSize,
+          skip,
+          select: ['id'],
+          // Deterministic order so skip/top pagination doesn't skip or repeat
+          // results across pages
+          orderBy: ['id asc'],
+        } as any);
 
-      let count = 0;
-      for await (const result of searchResults.results) {
-        if (result.document?.id) {
-          ids.push(result.document.id);
+        let count = 0;
+        for await (const result of searchResults.results) {
+          if (result.document?.id) {
+            ids.push(result.document.id);
+          }
+          count++;
         }
-        count++;
-      }
 
-      if (count < pageSize) {
-        break;
+        if (count < pageSize) {
+          break;
+        }
+        skip += pageSize;
       }
-      skip += pageSize;
+    } catch (error) {
+      // Azure can't alter a field's `sortable` attribute in place, so an
+      // index created before `id` became sortable will reject `orderBy`.
+      // Surface that plainly instead of the raw Azure error, since the fix
+      // (recreate the index) isn't obvious from the OData failure alone.
+      const message = error instanceof Error ? error.message : String(error);
+      if (/sortable/i.test(message)) {
+        throw new MastraError(
+          {
+            id: 'STORAGE_AZURE_AI_SEARCH_ID_FIELD_NOT_SORTABLE',
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.USER,
+            text: `Index "${indexName}" has a non-sortable 'id' field, so filter-based delete/update can't page results deterministically. Recreate the index (Azure can't alter a field's sortable attribute in place) to pick up the sortable 'id' field.`,
+            details: { indexName },
+          },
+          error instanceof Error ? error : new Error(message),
+        );
+      }
+      throw error;
     }
 
     return ids;
