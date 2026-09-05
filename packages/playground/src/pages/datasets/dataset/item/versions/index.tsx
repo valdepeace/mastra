@@ -1,42 +1,25 @@
-import {
-  Breadcrumb,
-  Button,
-  ButtonsGroup,
-  Chip,
-  CodeDiff,
-  Column,
-  Columns,
-  Crumb,
-  Header,
-  HeaderAction,
-  Icon,
-  MainContentContent,
-  MainContentLayout,
-  MainHeader,
-  PermissionDenied,
-  SessionExpired,
-  TextAndIcon,
-  is401UnauthorizedError,
-  is403ForbiddenError,
-} from '@mastra/playground-ui';
+import { Badge } from '@mastra/playground-ui/components/Badge';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { ButtonsGroup } from '@mastra/playground-ui/components/ButtonsGroup';
+import { CodeDiff } from '@mastra/playground-ui/components/CodeDiff';
+import { Column, Columns } from '@mastra/playground-ui/components/Columns';
+import { MainContentContent, MainContentLayout } from '@mastra/playground-ui/components/MainContent';
+import { MainHeader } from '@mastra/playground-ui/components/MainHeader';
+import { PermissionDenied } from '@mastra/playground-ui/components/PermissionDenied';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@mastra/playground-ui/components/Select';
+import { SessionExpired } from '@mastra/playground-ui/components/SessionExpired';
+import { TextAndIcon } from '@mastra/playground-ui/components/Text';
+import { is401UnauthorizedError, is403ForbiddenError } from '@mastra/playground-ui/utils/errors';
 import { format } from 'date-fns';
-import {
-  Database,
-  ArrowLeft,
-  HistoryIcon,
-  GitCompareIcon,
-  ArrowLeftIcon,
-  ColumnsIcon,
-  GitCompareArrowsIcon,
-} from 'lucide-react';
+import { ArrowLeft, HistoryIcon, GitCompareIcon, ColumnsIcon, GitCompareArrowsIcon } from 'lucide-react';
 import { Fragment, useState } from 'react';
 import { useParams, useSearchParams, Link } from 'react-router';
-import { DatasetItemContent } from '@/domains/datasets';
+import { DatasetItemContent, DatasetItemVersionsPanel } from '@/domains/datasets';
 import { useDatasetItemVersion, useDatasetItemVersions } from '@/domains/datasets/hooks/use-dataset-item-versions';
 import type { DatasetItemVersion } from '@/domains/datasets/hooks/use-dataset-item-versions';
 import { useDataset } from '@/domains/datasets/hooks/use-datasets';
-import { SelectField } from '@/lib/form/components/select-field';
 import { useLinkComponent } from '@/lib/framework';
+import { RouteHeaderActions } from '@/lib/route-header';
 import { cn } from '@/lib/utils';
 
 function versionToText(version: DatasetItemVersion): string {
@@ -44,6 +27,7 @@ function versionToText(version: DatasetItemVersion): string {
     {
       input: version.input ?? null,
       groundTruth: version.groundTruth ?? null,
+      scorerIds: version.scorerIds ?? null,
       metadata: version.metadata ?? null,
     },
     null,
@@ -101,60 +85,39 @@ function DatasetItemVersionsComparePage() {
     );
   }
 
-  if (!datasetId || !itemId || versionNumbers.length < 2) {
+  if (!datasetId || !itemId) {
     return (
       <MainContentLayout>
-        <Header>
-          <Breadcrumb>
-            <Crumb as={Link} to="/datasets">
-              <Icon>
-                <Database />
-              </Icon>
-              Datasets
-            </Crumb>
-            <Crumb isCurrent as="span">
-              Compare Versions
-            </Crumb>
-          </Breadcrumb>
-        </Header>
         <MainContentContent>
-          <div className="text-neutral4 text-center py-8">
-            <p>Select at least two versions to compare.</p>
+          <div className="text-neutral4 py-8 text-center">
+            <p>Item not found.</p>
           </div>
         </MainContentContent>
       </MainContentLayout>
     );
   }
 
+  // No versions selected: show the item's version history, letting the user
+  // pick two versions to enter compare mode (sets `?ids=a,b`).
+  if (versionNumbers.length < 2) {
+    return (
+      <DatasetItemVersionHistory
+        datasetId={datasetId}
+        itemId={itemId}
+        Link={FrameworkLink}
+        onCompare={versionIds => setSearchParams({ ids: versionIds.join(',') })}
+      />
+    );
+  }
+
   return (
     <MainContentLayout>
-      <Header>
-        <Breadcrumb>
-          <Crumb as={Link} to="/datasets">
-            <Icon>
-              <Database />
-            </Icon>
-            Datasets
-          </Crumb>
-          <Crumb as={Link} to={`/datasets/${datasetId}`}>
-            {dataset?.name}
-          </Crumb>
-          <Crumb as={Link} to={`/datasets/${datasetId}/items/${itemId}`}>
-            Item
-          </Crumb>
-          <Crumb isCurrent as="span">
-            Compare Versions
-          </Crumb>
-        </Breadcrumb>
-        <HeaderAction>
-          <Button as={Link} to={`/datasets/${datasetId}/items/${itemId}`} variant="outline">
-            <Icon>
-              <ArrowLeft />
-            </Icon>
-            Back to Item
-          </Button>
-        </HeaderAction>
-      </Header>
+      <RouteHeaderActions owner="dataset-item-versions-compare">
+        <Button as={Link} to={`/datasets/${datasetId}/items/${itemId}`} variant="outline">
+          <ArrowLeft />
+          Back to Item
+        </Button>
+      </RouteHeaderActions>
 
       <div className="h-full overflow-hidden px-[3vw] pb-4">
         <div
@@ -179,10 +142,6 @@ function DatasetItemVersionsComparePage() {
             </MainHeader.Column>
             <MainHeader.Column>
               <ButtonsGroup>
-                <Button as={Link} to={`/datasets/${datasetId}/items/${itemId}`}>
-                  <ArrowLeftIcon />
-                  Back to Item
-                </Button>
                 <Button variant="primary" onClick={() => setIsDiffView(v => !v)}>
                   {isDiffView ? (
                     <>
@@ -230,6 +189,87 @@ function DatasetItemVersionsComparePage() {
   );
 }
 
+function DatasetItemVersionHistory({
+  datasetId,
+  itemId,
+  Link: FrameworkLink,
+  onCompare,
+}: {
+  datasetId: string;
+  itemId: string;
+  Link: ReturnType<typeof useLinkComponent>['Link'];
+  onCompare: (versionIds: string[]) => void;
+}) {
+  const [previewVersion, setPreviewVersion] = useState<number | null>(null);
+  const { data: allVersions, isLoading } = useDatasetItemVersions(datasetId, itemId);
+  const version =
+    (previewVersion != null ? allVersions?.find(v => v.datasetVersion === previewVersion) : undefined) ??
+    allVersions?.[0];
+
+  const displayItem = version
+    ? {
+        id: version.id,
+        datasetId,
+        datasetVersion: version.datasetVersion,
+        input: version.input,
+        groundTruth: version.groundTruth,
+        scorerIds: version.scorerIds,
+        metadata: version.metadata,
+        createdAt: version.createdAt,
+        updatedAt: version.updatedAt,
+      }
+    : null;
+
+  return (
+    <MainContentLayout>
+      <RouteHeaderActions owner="dataset-item-versions-history">
+        <Button as={Link} to={`/datasets/${datasetId}/items/${itemId}`} variant="outline">
+          <ArrowLeft />
+          Back to Item
+        </Button>
+      </RouteHeaderActions>
+
+      <div className="h-full overflow-hidden px-[3vw] pb-4">
+        <div className="mx-auto grid h-full max-w-[140rem] grid-rows-[auto_1fr] gap-6">
+          <MainHeader>
+            <MainHeader.Column>
+              <MainHeader.Title>
+                <HistoryIcon />
+                Item Version History
+              </MainHeader.Title>
+              <MainHeader.Description>
+                <TextAndIcon>Versions of {itemId}</TextAndIcon>
+              </MainHeader.Description>
+            </MainHeader.Column>
+          </MainHeader>
+
+          <Columns className="grid-cols-[1fr_auto]">
+            <Column>
+              <Column.Content>
+                {isLoading ? (
+                  <div className="text-neutral4 text-sm">Loading...</div>
+                ) : displayItem ? (
+                  <DatasetItemContent item={displayItem} Link={FrameworkLink} />
+                ) : (
+                  <div className="text-neutral4 text-sm">Item data not available</div>
+                )}
+              </Column.Content>
+            </Column>
+            <DatasetItemVersionsPanel
+              datasetId={datasetId}
+              itemId={itemId}
+              onClose={() => {}}
+              onVersionSelect={v => setPreviewVersion(v.datasetVersion)}
+              onCompareVersionsClick={onCompare}
+              activeVersion={previewVersion}
+            />
+          </Columns>
+        </div>
+      </div>
+    </MainContentLayout>
+  );
+}
+
 function CompareVersionColumn({
   datasetId,
   itemId,
@@ -264,9 +304,9 @@ function CompareVersionColumn({
         <>
           <b>v. {v.datasetVersion}</b> - {format(date, 'MMM d, yyyy h:mm a')}
           {v.isLatest ? (
-            <Chip color="blue" size="small">
+            <Badge variant="blue" size="xs">
               Latest
-            </Chip>
+            </Badge>
           ) : null}
         </>
       ),
@@ -281,6 +321,7 @@ function CompareVersionColumn({
         datasetVersion: version.datasetVersion,
         input: version.input,
         groundTruth: version.groundTruth,
+        scorerIds: version.scorerIds,
         metadata: version.metadata,
         createdAt: version.createdAt,
         updatedAt: version.updatedAt,
@@ -289,18 +330,24 @@ function CompareVersionColumn({
 
   return (
     <Column>
-      <Column.Toolbar className="grid gap-4 grid-cols-[auto_1fr]">
-        <HistoryIcon className="w-6 h-6 opacity-50" />
-        <SelectField
-          label="Version"
+      <Column.Toolbar className="grid grid-cols-[auto_1fr] gap-4">
+        <HistoryIcon className="h-6 w-6 opacity-50" />
+        <Select
           name={`compare-version-${idx}`}
           value={String(datasetVersion)}
           onValueChange={(val: string) => onVersionChange(Number(val))}
-          options={options}
-          placeholder="Select version"
-          labelIsHidden={true}
-          className="w-full"
-        />
+        >
+          <SelectTrigger aria-label="Version" className="w-full">
+            <SelectValue placeholder="Select version" />
+          </SelectTrigger>
+          <SelectContent>
+            {options.map(option => (
+              <SelectItem key={option.value} value={option.value} disabled={option.disabled}>
+                {option.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </Column.Toolbar>
 
       {showContent && (

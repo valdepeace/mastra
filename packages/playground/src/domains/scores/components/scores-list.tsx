@@ -1,10 +1,28 @@
 import type { ClientScoreRowData } from '@mastra/client-js';
 import type { ScoreRowData } from '@mastra/core/evals';
-import { ScoresDataList, DataListSkeleton, cn } from '@mastra/playground-ui';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { ScoresDataList, DataListSkeleton, useDataListKeyboard } from '@mastra/playground-ui/components/DataList';
+import { DropdownMenu } from '@mastra/playground-ui/components/DropdownMenu';
+import { cn } from '@mastra/playground-ui/utils/cn';
+import { Columns3Icon } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ScoreDataPanel } from '@/domains/traces/components/score-data-panel';
 
-const COLUMNS = 'auto auto 1fr auto auto';
+type ToggleableColumn = 'input' | 'entity';
+
+const TOGGLEABLE_COLUMNS: ToggleableColumn[] = ['input', 'entity'];
+
+const COLUMN_LABELS: Record<ToggleableColumn, string> = {
+  input: 'Input',
+  entity: 'Entity',
+};
+
+function buildColumns(visible: Set<ToggleableColumn>): string {
+  const parts: string[] = ['auto', 'auto', 'minmax(0, 10rem)'];
+  if (visible.has('entity')) parts.push('minmax(0, 14rem)');
+  if (visible.has('input')) parts.push('minmax(0, 40rem)');
+  return parts.join(' ');
+}
 
 type ScoresListProps = {
   selectedScoreId?: string;
@@ -38,7 +56,23 @@ export function ScoresList({
   const [internalSelectedId, setInternalSelectedId] = useState<string | undefined>(controlledSelectedId);
   const selectedScoreId = controlledSelectedId ?? internalSelectedId;
 
-  // Sync internal selection when parent updates the controlled prop (e.g. browser back clearing ?scoreId)
+  const [hiddenColumns, setHiddenColumns] = useState<Set<ToggleableColumn>>(new Set());
+  const visibleColumns = useMemo(
+    () => new Set<ToggleableColumn>(TOGGLEABLE_COLUMNS.filter(c => !hiddenColumns.has(c))),
+    [hiddenColumns],
+  );
+  const columns = useMemo(() => buildColumns(visibleColumns), [visibleColumns]);
+
+  const toggleColumn = useCallback((col: ToggleableColumn) => {
+    setHiddenColumns(prev => {
+      const next = new Set(prev);
+      if (next.has(col)) next.delete(col);
+      else next.add(col);
+      return next;
+    });
+  }, []);
+
+  // Sync internal selection when parent updates the controlled prop
   useEffect(() => {
     setInternalSelectedId(controlledSelectedId);
   }, [controlledSelectedId]);
@@ -77,13 +111,15 @@ export function ScoresList({
         }
       : undefined;
 
+  const { containerRef, getRowProps } = useDataListKeyboard({ count: scores?.length ?? 0 });
+
   const handleClose = useCallback(() => {
     setInternalSelectedId(undefined);
     onScoreClick?.('');
   }, [onScoreClick]);
 
   if (isLoading) {
-    return <DataListSkeleton columns={COLUMNS} />;
+    return <DataListSkeleton columns={columns} />;
   }
 
   if (!scores) {
@@ -94,15 +130,15 @@ export function ScoresList({
     <ScoresDataList.Top>
       <ScoresDataList.TopCell>Date</ScoresDataList.TopCell>
       <ScoresDataList.TopCell>Time</ScoresDataList.TopCell>
-      <ScoresDataList.TopCell>Input</ScoresDataList.TopCell>
-      <ScoresDataList.TopCell>Entity</ScoresDataList.TopCell>
       <ScoresDataList.TopCell>Score</ScoresDataList.TopCell>
+      {visibleColumns.has('entity') && <ScoresDataList.TopCell>Entity</ScoresDataList.TopCell>}
+      {visibleColumns.has('input') && <ScoresDataList.TopCell>Input</ScoresDataList.TopCell>}
     </ScoresDataList.Top>
   );
 
   if (errorMsg) {
     return (
-      <ScoresDataList columns={COLUMNS}>
+      <ScoresDataList columns={columns}>
         {header}
         <ScoresDataList.NoMatch message={errorMsg} />
       </ScoresDataList>
@@ -117,39 +153,67 @@ export function ScoresList({
 
   return (
     <div
-      className={cn('grid h-full min-h-0 gap-4 items-start', hasSidePanel ? 'grid-cols-[1fr_1fr]' : 'grid-cols-[1fr]')}
+      className={cn('grid h-full max-h-full min-h-0 gap-4', hasSidePanel ? 'grid-cols-[1fr_1fr]' : 'grid-cols-[1fr]')}
     >
-      <ScoresDataList columns={COLUMNS}>
-        {header}
+      <div className="flex h-full min-h-0 min-w-0 flex-col gap-0">
+        <div className="flex shrink-0 items-center justify-end pb-2">
+          <DropdownMenu>
+            <DropdownMenu.Trigger asChild>
+              <Button variant="outline" size="sm">
+                <Columns3Icon className="size-3.5" />
+                Columns
+              </Button>
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Content align="end">
+              <DropdownMenu.Label>Toggle columns</DropdownMenu.Label>
+              {TOGGLEABLE_COLUMNS.map(col => (
+                <DropdownMenu.CheckboxItem
+                  key={col}
+                  checked={visibleColumns.has(col)}
+                  onClick={() => toggleColumn(col)}
+                >
+                  {COLUMN_LABELS[col]}
+                </DropdownMenu.CheckboxItem>
+              ))}
+            </DropdownMenu.Content>
+          </DropdownMenu>
+        </div>
 
-        {scores.map(score => (
-          <ScoresDataList.RowButton
-            key={score.id}
-            onClick={() => handleScoreClick(score.id)}
-            className={selectedScoreId === score.id ? 'bg-surface4' : ''}
-          >
-            <ScoresDataList.DateCell timestamp={score.createdAt} />
-            <ScoresDataList.TimeCell timestamp={score.createdAt} />
-            <ScoresDataList.InputCell input={score.input} />
-            <ScoresDataList.EntityCell entityId={score.entityId} />
-            <ScoresDataList.ScoreCell score={score.score} />
-          </ScoresDataList.RowButton>
-        ))}
+        <ScoresDataList columns={columns} className="min-h-0 flex-1" scrollRef={containerRef}>
+          {header}
 
-        <ScoresDataList.NextPageLoading
-          isLoading={isFetchingNextPage}
-          hasMore={hasNextPage}
-          setEndOfListElement={setEndOfListElement}
-        />
-      </ScoresDataList>
+          {scores.map((score, index) => (
+            <ScoresDataList.RowButton
+              key={score.id}
+              onClick={() => handleScoreClick(score.id)}
+              className={selectedScoreId === score.id ? 'bg-surface4' : ''}
+              {...getRowProps(index)}
+            >
+              <ScoresDataList.DateCell timestamp={score.createdAt} />
+              <ScoresDataList.TimeCell timestamp={score.createdAt} />
+              <ScoresDataList.ScoreCell score={score.score} />
+              {visibleColumns.has('entity') && <ScoresDataList.EntityCell entityId={score.entityId} />}
+              {visibleColumns.has('input') && <ScoresDataList.InputCell input={score.input} />}
+            </ScoresDataList.RowButton>
+          ))}
+
+          <ScoresDataList.NextPageLoading
+            isLoading={isFetchingNextPage}
+            hasMore={hasNextPage}
+            setEndOfListElement={setEndOfListElement}
+          />
+        </ScoresDataList>
+      </div>
 
       {selectedScore && (
-        <ScoreDataPanel
-          score={mapScore(selectedScore)}
-          onClose={handleClose}
-          onPrevious={handlePrevious}
-          onNext={handleNext}
-        />
+        <div className="grid h-full max-h-full min-h-0 grid-rows-[1fr] overflow-hidden">
+          <ScoreDataPanel
+            score={mapScore(selectedScore)}
+            onClose={handleClose}
+            onPrevious={handlePrevious}
+            onNext={handleNext}
+          />
+        </div>
       )}
     </div>
   );

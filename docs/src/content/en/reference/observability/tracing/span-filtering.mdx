@@ -1,6 +1,6 @@
 ---
 title: "Reference: Span filtering | Observability"
-description: "Reference for excludeSpanTypes, spanFilter, and span filtering behavior"
+description: "Span filtering controls which spans are exported from an observability config. Use it to reduce noise or lower per-span costs."
 packages:
   - "@mastra/core"
   - "@mastra/observability"
@@ -10,7 +10,7 @@ import PropertiesTable from "@site/src/components/PropertiesTable";
 
 # Span filtering
 
-Span filtering controls which spans are exported from an observability config. Use it to reduce noise, lower per-span costs, or keep only the spans that matter for a specific exporter or environment.
+Span filtering controls which spans are exported from an observability config. Use it to reduce noise or lower per-span costs. It can also keep only the spans that matter for a specific exporter or environment.
 
 For a shorter overview of tracing configuration, see [Tracing](/docs/observability/tracing/overview).
 
@@ -21,7 +21,7 @@ The following example demonstrates how to combine `excludeSpanTypes` and `spanFi
 ```ts title="src/mastra/index.ts"
 import { Mastra } from '@mastra/core'
 import { SpanType } from '@mastra/core/observability'
-import { Observability, DefaultExporter } from '@mastra/observability'
+import { Observability, MastraStorageExporter } from '@mastra/observability'
 import { LangfuseExporter } from '@mastra/langfuse'
 
 export const mastra = new Mastra({
@@ -29,7 +29,7 @@ export const mastra = new Mastra({
     configs: {
       default: {
         serviceName: 'my-app',
-        exporters: [new DefaultExporter(), new LangfuseExporter()],
+        exporters: [new MastraStorageExporter(), new LangfuseExporter()],
         excludeSpanTypes: [SpanType.MODEL_CHUNK, SpanType.MODEL_STEP],
         spanFilter: span => {
           if (span.type === SpanType.TOOL_CALL && span.attributes?.success) {
@@ -117,4 +117,4 @@ If `spanFilter` throws an error, Mastra keeps the span and logs the error to avo
 
 - [Tracing overview](/docs/observability/tracing/overview) for setup and concepts
 - [Configuration API](/reference/observability/tracing/configuration) for `ObservabilityInstanceConfig`
-- [Sensitive data filter](/docs/observability/tracing/processors/sensitive-data-filter) for redacting span data
+- [Sensitive data filter](/reference/observability/tracing/processors/sensitive-data-filter) for redacting span data

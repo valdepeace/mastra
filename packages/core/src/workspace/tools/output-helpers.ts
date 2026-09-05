@@ -1,4 +1,6 @@
-import { getTiktoken } from '../../utils/tiktoken';
+import { estimateTokenCount, sliceByTokens } from 'tokenx';
+
+import { isValidationError } from '../../tools/validation';
 
 /** Default number of lines to return (tail). */
 export const DEFAULT_TAIL_LINES = 200;
@@ -31,10 +33,17 @@ export function stripAnsi(text: string): string {
  *
  * Returns `{ type: 'text', value: '...' }` to match the AI SDK's
  * expected tool-result output format.
+ *
+ * Mastra validation-error envelopes (e.g. from output-schema validation
+ * failures) are tagged as `{ type: 'error-json', value }` so providers
+ * receive a valid tool-result output instead of an untagged object.
  */
 export function sandboxToModelOutput(output: unknown): unknown {
   if (typeof output === 'string') {
     return { type: 'text', value: stripAnsi(output) };
+  }
+  if (isValidationError(output)) {
+    return { type: 'error-json', value: output };
   }
   return output;
 }
@@ -63,12 +72,12 @@ export function applyTail(output: string, tail: number | null | undefined): stri
 }
 
 // ---------------------------------------------------------------------------
-// Token-based truncation (uses tiktoken)
+// Token-based truncation (uses tokenx for fast, lightweight estimation)
 // ---------------------------------------------------------------------------
 
 /**
  * Token-based output limit. Truncates output to fit within a token budget.
- * Uses tiktoken for accurate token counting and truncates at the token level
+ * Uses tokenx for fast token estimation and truncates at the token level
  * (not line boundaries) to maximise use of the budget.
  *
  * @param output - The text to truncate
@@ -84,22 +93,21 @@ export async function applyTokenLimit(
 ): Promise<string> {
   if (!output) return output;
 
-  const tiktoken = await getTiktoken();
-  const allTokens = tiktoken.encode(output, 'all');
-  if (allTokens.length <= limit) return output;
+  const totalTokens = estimateTokenCount(output);
+  if (totalTokens <= limit) return output;
 
-  const kept = from === 'start' ? tiktoken.decode(allTokens.slice(-limit)) : tiktoken.decode(allTokens.slice(0, limit));
+  const kept = from === 'start' ? sliceByTokens(output, -limit) : sliceByTokens(output, 0, limit);
 
   const position = from === 'start' ? 'last' : 'first';
   return from === 'start'
-    ? `[output truncated: showing ${position} ~${limit} of ~${allTokens.length} tokens]\n${kept}`
-    : `${kept}\n[output truncated: showing ${position} ~${limit} of ~${allTokens.length} tokens]`;
+    ? `[output truncated: showing ${position} ~${limit} of ~${totalTokens} tokens]\n${kept}`
+    : `${kept}\n[output truncated: showing ${position} ~${limit} of ~${totalTokens} tokens]`;
 }
 
 /**
  * Head+tail sandwich truncation. Keeps lines from both the start and end
  * of the output, with a truncation notice in the middle.
- * Uses tiktoken for accurate token counting.
+ * Uses tokenx for fast token estimation.
  *
  * @param output - The text to truncate
  * @param limit - Maximum tokens (default: DEFAULT_MAX_OUTPUT_TOKENS)
@@ -112,16 +120,15 @@ export async function applyTokenLimitSandwich(
 ): Promise<string> {
   if (!output) return output;
 
-  const tiktoken = await getTiktoken();
-  const allTokens = tiktoken.encode(output, 'all');
-  if (allTokens.length <= limit) return output;
+  const totalTokens = estimateTokenCount(output);
+  if (totalTokens <= limit) return output;
   const headBudget = Math.floor(limit * headRatio);
   const tailBudget = limit - headBudget;
 
-  const head = headBudget > 0 ? tiktoken.decode(allTokens.slice(0, headBudget)) : '';
-  const tail = tailBudget > 0 ? tiktoken.decode(allTokens.slice(-tailBudget)) : '';
+  const head = headBudget > 0 ? sliceByTokens(output, 0, headBudget) : '';
+  const tail = tailBudget > 0 ? sliceByTokens(output, -tailBudget) : '';
 
-  const notice = `[...output truncated — showing first ~${headBudget} + last ~${tailBudget} of ~${allTokens.length} tokens...]`;
+  const notice = `[...output truncated — showing first ~${headBudget} + last ~${tailBudget} of ~${totalTokens} tokens...]`;
   return [head, notice, tail].filter(Boolean).join('\n');
 }
 

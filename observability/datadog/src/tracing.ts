@@ -16,13 +16,16 @@ import type {
   TracingEvent,
   AnyExportedSpan,
   ModelGenerationAttributes,
+  ModelInferenceAttributes,
   ModelStepAttributes,
+  ScoreEvent,
 } from '@mastra/core/observability';
 import { SpanType } from '@mastra/core/observability';
 import { omitKeys } from '@mastra/core/utils';
 import { BaseExporter } from '@mastra/observability';
 import type { BaseExporterConfig } from '@mastra/observability';
 import tracer from 'dd-trace';
+import { isModelInferenceEnabled } from './features';
 import { formatUsageMetrics } from './metrics';
 import { ensureTracer, kindFor, toDate, formatInput, formatOutput } from './utils';
 import type { DatadogSpanKind } from './utils';
@@ -302,11 +305,13 @@ export class DatadogExporter extends BaseExporter {
       annotations.outputData = formatOutput(span.output, span.type);
     }
 
-    // Add token usage metrics on MODEL_STEP spans only.
-    // MODEL_STEP is the actual LLM API call; MODEL_GENERATION is its parent wrapper.
-    // Reporting on both would double-count cost in Datadog.
-    if (span.type === SpanType.MODEL_STEP) {
-      const usage = (span.attributes as ModelStepAttributes)?.usage;
+    // Token usage metrics attach to the LLM-kind span only, to avoid
+    // double-counting cost in Datadog. With the `model-inference-span` feature
+    // that's MODEL_INFERENCE (the actual provider call); without it, MODEL_STEP
+    // is still the API call.
+    const usageSpanType = isModelInferenceEnabled() ? SpanType.MODEL_INFERENCE : SpanType.MODEL_STEP;
+    if (span.type === usageSpanType) {
+      const usage = (span.attributes as ModelStepAttributes | ModelInferenceAttributes | undefined)?.usage;
       const metrics = formatUsageMetrics(usage);
       if (metrics) {
         annotations.metrics = metrics;
@@ -314,8 +319,11 @@ export class DatadogExporter extends BaseExporter {
     }
 
     // Forward span.attributes to metadata (minus known fields handled separately)
-    // This ensures tool/workflow spans preserve custom attributes like other exporters
-    const knownFields = ['usage', 'model', 'provider', 'parameters'];
+    // This ensures tool/workflow spans preserve custom attributes like other exporters.
+    // `model`/`provider` are surfaced as native LLM Obs fields and `usage` as metrics;
+    // everything else (including `parameters`, which carries model settings like
+    // reasoning_effort/temperature) flows into metadata so it reaches Datadog.
+    const knownFields = ['usage', 'model', 'provider'];
     const otherAttributes = omitKeys((span.attributes ?? {}) as Record<string, any>, knownFields);
 
     // Separate requestContextKeys from span.metadata AND span.attributes:
@@ -405,6 +413,68 @@ export class DatadogExporter extends BaseExporter {
     }
 
     return annotations;
+  }
+
+  /**
+   * Submit an eval score to Datadog LLM Observability for the matching ddSpan.
+   *
+   * Ordering constraint: the matching span must have already been emitted to dd-trace
+   * (i.e. its `SPAN_ENDED` event must have been processed and the trace tree flushed).
+   * On Mastra's normal scoring path this is always true — scorer hooks fire after the
+   * scored entity completes, so the root span has ended by the time `onScoreEvent` runs.
+   *
+   * If a score arrives for an unexported span (either before `SPAN_ENDED` or after the
+   * `traceState` entry has been cleaned up), the event is dropped and a warning is logged
+   * so the misuse is observable. Scores must therefore only be submitted for spans whose
+   * lifecycle has completed.
+   */
+  async onScoreEvent(event: ScoreEvent): Promise<void> {
+    if (this.isDisabled || !(tracer as any).llmobs?.submitEvaluation) return;
+
+    const { score } = event;
+    if (!score.traceId || !score.spanId) {
+      this.logger.warn('Datadog exporter: dropping score with no traceId/spanId', {
+        scorerId: score.scorerId,
+      });
+      return;
+    }
+
+    const ctx = this.traceState.get(score.traceId)?.contexts.get(score.spanId);
+    const exported = ctx?.exported;
+    if (!exported) {
+      this.logger.warn(
+        'Datadog exporter: dropping score for span that has not been emitted to dd-trace yet ' +
+          '(span_ended must be processed before submitting a score for it)',
+        {
+          traceId: score.traceId,
+          spanId: score.spanId,
+          scorerId: score.scorerId,
+        },
+      );
+      return;
+    }
+
+    try {
+      tracer.llmobs.submitEvaluation(
+        { traceId: exported.traceId, spanId: exported.spanId },
+        {
+          label: score.scorerName ?? score.scorerId,
+          value: score.score,
+          metricType: 'score',
+          mlApp: this.config.mlApp,
+          timestampMs: score.timestamp instanceof Date ? score.timestamp.getTime() : Date.now(),
+          ...(score.reason ? { reasoning: score.reason } : {}),
+          ...(score.metadata ? { metadata: score.metadata } : {}),
+        },
+      );
+    } catch (err) {
+      this.logger.error('Datadog exporter: Failed to submit evaluation', {
+        error: err,
+        traceId: score.traceId,
+        spanId: score.spanId,
+        scorerId: score.scorerId,
+      });
+    }
   }
 
   /**
@@ -546,22 +616,39 @@ export class DatadogExporter extends BaseExporter {
       state.buffer.clear();
       state.treeEmitted = true;
     } else {
-      // Tree already emitted - handle late-arriving spans individually
-      // Use the old parent-first emission pattern for these
-      let emitted = false;
-      do {
+      // Tree already emitted - handle late-arriving spans (e.g. fire-and-forget
+      // work like memory title generation that outlives the root span).
+      // dd-trace derives LLMObs parent linkage only from an enclosing
+      // llmobs.trace() callback - scope().activate() does not link LLMObs
+      // parents - so emitting these spans one at a time flattens every chain
+      // into disconnected root spans. Emit each chain as a nested sub-tree
+      // instead, once the chain's local root can be resolved.
+      let emitted = true;
+      while (emitted) {
         emitted = false;
-        for (const [spanId, span] of state.buffer) {
+        for (const span of state.buffer.values()) {
+          // Will be emitted as part of the buffered parent's sub-tree
+          if (span.parentSpanId && state.buffer.has(span.parentSpanId)) {
+            continue;
+          }
+
           const parentCtx = span.parentSpanId ? state.contexts.get(span.parentSpanId) : undefined;
           if (span.parentSpanId && !parentCtx) {
             continue;
           }
 
-          this.emitSingleSpan(span, state, parentCtx?.ddSpan);
-          state.buffer.delete(spanId);
+          const subTree = this.takeSubTree(span, state.buffer);
+          if (parentCtx) {
+            // Activating the parent keeps APM trace continuity even though
+            // LLMObs cannot re-parent onto an already-emitted span
+            tracer.scope().activate(parentCtx.ddSpan, () => this.emitSpanTree(subTree, state));
+          } else {
+            this.emitSpanTree(subTree, state);
+          }
           emitted = true;
+          break;
         }
-      } while (emitted);
+      }
     }
 
     // Schedule cleanup if root has ended and buffer is empty
@@ -635,6 +722,33 @@ export class DatadogExporter extends BaseExporter {
     }
 
     return rootNode;
+  }
+
+  /**
+   * Builds a sub-tree rooted at the given span from its buffered descendants,
+   * removing every collected span from the buffer. Used for late-arriving span
+   * chains emitted after the main tree.
+   */
+  private takeSubTree(rootSpan: AnyExportedSpan, buffer: Map<string, AnyExportedSpan>): SpanNode {
+    buffer.delete(rootSpan.id);
+
+    const children: SpanNode[] = [];
+    for (const candidate of [...buffer.values()]) {
+      if (candidate.parentSpanId === rootSpan.id) {
+        children.push(this.takeSubTree(candidate, buffer));
+      }
+    }
+
+    // Sort children by start time for consistent ordering
+    children.sort((a, b) => {
+      const aTime =
+        a.span.startTime instanceof Date ? a.span.startTime.getTime() : new Date(a.span.startTime).getTime();
+      const bTime =
+        b.span.startTime instanceof Date ? b.span.startTime.getTime() : new Date(b.span.startTime).getTime();
+      return aTime - bTime;
+    });
+
+    return { span: rootSpan, children };
   }
 
   /**
@@ -734,40 +848,5 @@ export class DatadogExporter extends BaseExporter {
         ddSpan.finish(endTimeMs);
       }
     });
-  }
-
-  /**
-   * Emit a single span with the proper Datadog parent context.
-   * Used for late-arriving spans after the main tree has been emitted.
-   */
-  private emitSingleSpan(span: AnyExportedSpan, state: TraceState, parent?: any) {
-    const { traceOptions, endTimeMs } = this.buildSpanOptions(span);
-
-    const runTrace = () =>
-      tracer.llmobs.trace(traceOptions as any, (ddSpan: any) => {
-        const annotations = this.buildAnnotations(span);
-        if (Object.keys(annotations).length > 0) {
-          tracer.llmobs.annotate(ddSpan, annotations);
-        }
-
-        // Set native Datadog error tags for proper Error Tracking UI
-        if (span.errorInfo) {
-          this.setErrorTags(ddSpan, span.errorInfo);
-        }
-
-        const exported = tracer.llmobs.exportSpan ? tracer.llmobs.exportSpan(ddSpan) : undefined;
-        state.contexts.set(span.id, { ddSpan, exported });
-
-        // Explicitly finish with the correct end time (see emitSpanTree for details)
-        if (typeof ddSpan.finish === 'function') {
-          ddSpan.finish(endTimeMs);
-        }
-      });
-
-    if (parent) {
-      tracer.scope().activate(parent, runTrace);
-    } else {
-      runTrace();
-    }
   }
 }

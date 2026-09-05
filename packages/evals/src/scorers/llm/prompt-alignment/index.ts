@@ -1,9 +1,11 @@
+import { compileSchema } from '@internal/types-builder/compile-zod';
 import { createScorer } from '@mastra/core/evals';
 import type { MastraModelConfig } from '@mastra/core/llm';
-import { z } from 'zod';
+import { z } from 'zod/v4';
 import {
   getAssistantMessageFromRunOutput,
   getUserMessageFromRunInput,
+  getConversationHistoryFromRunInput,
   getCombinedSystemPrompt,
   roundToTwoDecimals,
 } from '../../utils';
@@ -13,41 +15,49 @@ import { PROMPT_ALIGNMENT_INSTRUCTIONS, createAnalyzePrompt, createReasonPrompt 
 export interface PromptAlignmentOptions {
   scale?: number;
   evaluationMode?: 'user' | 'system' | 'both';
+  /**
+   * Include prior conversation turns from the agent's remembered messages in the judge prompt.
+   *
+   * Off by default. Enable it for multi-turn agents so short, referential replies (e.g. "A",
+   * "yes") are judged against what was previously asked instead of in isolation. Only applies
+   * to agent runs that carry `rememberedMessages`.
+   */
+  includeConversationHistory?: boolean | { maxMessages?: number };
 }
 
 // Helper for score validation - uses refine() instead of min/max for Anthropic API compatibility
-const scoreSchema = z.number().refine(n => n >= 0 && n <= 1, { message: 'Score must be between 0 and 1' });
-
-const analyzeOutputSchema = z.object({
-  intentAlignment: z.object({
-    score: scoreSchema,
-    primaryIntent: z.string(),
-    isAddressed: z.boolean(),
-    reasoning: z.string(),
+const analyzeOutputSchema = compileSchema(
+  z.object({
+    intentAlignment: z.object({
+      score: z.number().refine(n => n >= 0 && n <= 1, { message: 'Score must be between 0 and 1' }),
+      primaryIntent: z.string(),
+      isAddressed: z.boolean(),
+      reasoning: z.string(),
+    }),
+    requirementsFulfillment: z.object({
+      requirements: z.array(
+        z.object({
+          requirement: z.string(),
+          isFulfilled: z.boolean(),
+          reasoning: z.string(),
+        }),
+      ),
+      overallScore: z.number().refine(n => n >= 0 && n <= 1, { message: 'Score must be between 0 and 1' }),
+    }),
+    completeness: z.object({
+      score: z.number().refine(n => n >= 0 && n <= 1, { message: 'Score must be between 0 and 1' }),
+      missingElements: z.array(z.string()),
+      reasoning: z.string(),
+    }),
+    responseAppropriateness: z.object({
+      score: z.number().refine(n => n >= 0 && n <= 1, { message: 'Score must be between 0 and 1' }),
+      formatAlignment: z.boolean(),
+      toneAlignment: z.boolean(),
+      reasoning: z.string(),
+    }),
+    overallAssessment: z.string(),
   }),
-  requirementsFulfillment: z.object({
-    requirements: z.array(
-      z.object({
-        requirement: z.string(),
-        isFulfilled: z.boolean(),
-        reasoning: z.string(),
-      }),
-    ),
-    overallScore: scoreSchema,
-  }),
-  completeness: z.object({
-    score: scoreSchema,
-    missingElements: z.array(z.string()),
-    reasoning: z.string(),
-  }),
-  responseAppropriateness: z.object({
-    score: scoreSchema,
-    formatAlignment: z.boolean(),
-    toneAlignment: z.boolean(),
-    reasoning: z.string(),
-  }),
-  overallAssessment: z.string(),
-});
+);
 
 // Weight distribution for different aspects of prompt alignment
 const SCORING_WEIGHTS = {
@@ -70,6 +80,13 @@ const SCORING_WEIGHTS = {
   },
 } as const;
 
+function normalizeConversationHistoryOptions(
+  includeConversationHistory: PromptAlignmentOptions['includeConversationHistory'],
+): { maxMessages?: number } | undefined {
+  if (!includeConversationHistory) return undefined;
+  return includeConversationHistory === true ? {} : includeConversationHistory;
+}
+
 export function createPromptAlignmentScorerLLM({
   model,
   options,
@@ -79,6 +96,7 @@ export function createPromptAlignmentScorerLLM({
 }) {
   const scale = options?.scale || 1;
   const evaluationMode = options?.evaluationMode || 'both';
+  const historyOptions = normalizeConversationHistoryOptions(options?.includeConversationHistory);
 
   return createScorer<ScorerRunInputForLLMJudge, ScorerRunOutputForLLMJudge>({
     id: 'prompt-alignment-scorer',
@@ -116,6 +134,7 @@ export function createPromptAlignmentScorerLLM({
           systemPrompt,
           agentResponse,
           evaluationMode,
+          conversationHistory: historyOptions && getConversationHistoryFromRunInput(run.input, historyOptions),
         });
       },
     })
@@ -190,6 +209,7 @@ export function createPromptAlignmentScorerLLM({
           scale,
           analysis,
           evaluationMode,
+          conversationHistory: historyOptions && getConversationHistoryFromRunInput(run.input, historyOptions),
         });
       },
     });

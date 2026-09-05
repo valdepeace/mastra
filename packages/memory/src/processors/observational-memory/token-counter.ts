@@ -1,10 +1,11 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import type { MastraDBMessage } from '@mastra/core/agent';
-import imageSize from 'image-size';
+import type { MastraToolInvocation } from '@mastra/core/agent/message-list';
 import { estimateTokenCount } from 'tokenx';
 
-import { formatToolResultForObserver, resolveToolResultValue } from './tool-result-helpers';
+import { measureImageBuffer } from './measure-image-buffer';
+import { resolveToolResultValue, serializeToolResultForTokenCounting } from './tool-result-helpers';
 
 type TokenEstimateCacheEntry = {
   v: number;
@@ -51,7 +52,18 @@ const IMAGE_FILE_EXTENSIONS = new Set([
   'avif',
 ]);
 
-const TOKEN_ESTIMATE_CACHE_VERSION = 6;
+const TOKEN_ESTIMATE_CACHE_VERSION = 7;
+
+/**
+ * Cache `source` marker for token estimates supplied by the caller via
+ * `part.providerMetadata.mastra.tokenEstimate`. Pipelines that strip the real
+ * binary payload before persistence (e.g. uploading files to cloud storage and
+ * leaving only a reference token in `data`) cannot rely on the on-device file
+ * size, so they can stamp an authoritative estimate here. Entries marked with
+ * this source survive cache-version rotations and are honored ahead of
+ * provider fetches and the default descriptor estimator.
+ */
+const CLIENT_TOKEN_ESTIMATE_SOURCE = 'client';
 
 const DEFAULT_IMAGE_ESTIMATOR: ImageTokenEstimatorConfig = {
   baseTokens: 85,
@@ -150,7 +162,7 @@ function ensureMessageMastraMetadata(message: MastraDBMessage): NonNullable<Mast
 }
 
 function buildEstimateKey(kind: string, text: string): string {
-  const payloadHash = createHash('sha1').update(text).digest('hex');
+  const payloadHash = createHash('sha256').update(text).digest('hex');
   return `${kind}:${payloadHash}`;
 }
 
@@ -212,6 +224,39 @@ function getPartCacheEntry(part: CacheablePart, key: string): TokenEstimateCache
 function setPartCacheEntry(part: CacheablePart, key: string, entry: TokenEstimateCacheEntry): void {
   const mastraMetadata = ensurePartMastraMetadata(part);
   mastraMetadata.tokenEstimate = mergeCacheEntry(mastraMetadata.tokenEstimate, key, entry);
+}
+
+/**
+ * Extracts a caller-supplied token estimate stamped on a part via
+ * `part.providerMetadata.mastra.tokenEstimate`. Used by pipelines that strip
+ * the binary payload from file parts (e.g. cloud-storage references) and
+ * therefore cannot rely on the on-device file size. Returns the entry only
+ * when `source === 'client'` and `tokens` is a finite non-negative number.
+ *
+ * Public contract for callers:
+ *   part.providerMetadata = {
+ *     mastra: {
+ *       tokenEstimate: { v: 0, source: 'client', key: 'client', tokens: N }
+ *     }
+ *   }
+ */
+function getClientPartTokenEstimate(part: CacheablePart): TokenEstimateCacheEntry | undefined {
+  const cache = getPartMastraMetadata(part)?.tokenEstimate;
+  if (!cache || typeof cache !== 'object') return undefined;
+
+  const matches = (entry: unknown): entry is TokenEstimateCacheEntry =>
+    isTokenEstimateEntry(entry) &&
+    entry.source === CLIENT_TOKEN_ESTIMATE_SOURCE &&
+    Number.isFinite(entry.tokens) &&
+    entry.tokens >= 0;
+
+  if (matches(cache)) return cache;
+
+  for (const value of Object.values(cache as Record<string, unknown>)) {
+    if (matches(value)) return value;
+  }
+
+  return undefined;
 }
 
 function getMessageCacheEntry(message: MastraDBMessage, key: string): TokenEstimateCacheEntry | undefined {
@@ -517,25 +562,25 @@ function resolveImageDimensions(part: CacheablePart): { width?: number; height?:
     return { width, height };
   }
 
-  try {
-    const measured = imageSize(buffer);
-    const measuredWidth = getFiniteNumber(measured.width);
-    const measuredHeight = getFiniteNumber(measured.height);
-
-    if (!measuredWidth || !measuredHeight) {
-      return { width, height };
-    }
-
-    const resolved = {
-      width: width ?? measuredWidth,
-      height: height ?? measuredHeight,
-    };
-
-    persistImageDimensions(part, resolved as { width: number; height: number });
-    return resolved;
-  } catch {
+  const measured = measureImageBuffer(buffer);
+  if (!measured) {
     return { width, height };
   }
+
+  const measuredWidth = getFiniteNumber(measured.width);
+  const measuredHeight = getFiniteNumber(measured.height);
+
+  if (!measuredWidth || !measuredHeight) {
+    return { width, height };
+  }
+
+  const resolved = {
+    width: width ?? measuredWidth,
+    height: height ?? measuredHeight,
+  };
+
+  persistImageDimensions(part, resolved as { width: number; height: number });
+  return resolved;
 }
 
 function getBase64Size(base64: string): number {
@@ -764,6 +809,82 @@ function estimateAnthropicImageTokens(
   return 1600;
 }
 
+/**
+ * Maps a non-image file part's byte size to a token estimate, using a
+ * provider-aware heuristic. This is the non-image-file equivalent of
+ * {@link estimateAnthropicImageTokens} / {@link estimateOpenAIHighDetailTiles}:
+ * it doesn't try to be exact, just close enough that the Observational Memory
+ * threshold check trips on large attachments.
+ *
+ * - Anthropic PDFs: ~1500–3000 tokens/page, ~5KB/page average → `bytes / 3`.
+ * - Google PDFs: 258 tokens/page (Gemini docs), ~5KB/page → `bytes / 20`.
+ * - OpenAI / unknown provider PDFs: `bytes / 4` (conservative).
+ * - Text-ish mime types (`text/*`, JSON, XML, YAML): `bytes / 4`.
+ * - Unknown binary: `bytes / 4` — conservative-upward so OM still fires.
+ *
+ * Floors guarantee a one-page file still produces a meaningful count even when
+ * the underlying bytes are heavily compressed.
+ */
+function estimateFileTokensFromBytes(provider: string | undefined, mimeType: string, sizeBytes: number): number {
+  // MIME types are case-insensitive (RFC 2045) and may carry parameters like
+  // `application/pdf; charset=binary` — normalize before branching.
+  const normalizedMime = (mimeType ?? '').toLowerCase().split(';', 1)[0]!.trim();
+  const isPdf = normalizedMime === 'application/pdf';
+  const isTextish =
+    normalizedMime.startsWith('text/') ||
+    ['application/json', 'application/xml', 'application/x-yaml', 'application/yaml'].includes(normalizedMime);
+
+  if (isPdf) {
+    if (provider === 'google') return Math.max(258, Math.ceil(sizeBytes / 20));
+    if (provider === 'anthropic') return Math.max(1500, Math.ceil(sizeBytes / 3));
+    return Math.max(500, Math.ceil(sizeBytes / 4));
+  }
+
+  if (isTextish) return Math.max(1, Math.ceil(sizeBytes / 4));
+
+  return Math.max(1, Math.ceil(sizeBytes / 4));
+}
+
+/**
+ * Builds a fixed token estimate for a non-image file part from its byte size.
+ * Returns `undefined` when the part has no measurable body (e.g. a remote URL
+ * with no fetched content) — in that case the caller falls back to the
+ * descriptor-only estimate, which preserves prior behavior for URL-only parts.
+ *
+ * Mirrors {@link estimateImageAssetTokens} so non-image files share the same
+ * cache shape as images and benefit from the same persistence path via
+ * `readOrPersistFixedPartEstimate`.
+ */
+function estimateNonImageFileTokens(
+  modelContext: TokenCounterModelContext | undefined,
+  part: CacheablePart,
+): { tokens: number; cachePayload: string } | undefined {
+  const sourceStats = resolveImageSourceStats(getObjectValue(part, 'data'));
+  if (sourceStats.sizeBytes === undefined) {
+    return undefined;
+  }
+
+  const provider = resolveProviderId(modelContext);
+  const modelId = modelContext?.modelId ?? null;
+  const mimeType = getAttachmentMimeType(part, 'application/octet-stream');
+  const filename = getAttachmentFilename(part) ?? null;
+  const tokens = estimateFileTokensFromBytes(provider, mimeType, sourceStats.sizeBytes);
+
+  return {
+    tokens,
+    cachePayload: JSON.stringify({
+      kind: 'non-image-file',
+      provider: provider ?? 'fallback',
+      modelId,
+      estimator: 'bytes',
+      source: sourceStats.source,
+      sizeBytes: sourceStats.sizeBytes,
+      mimeType,
+      filename,
+    }),
+  };
+}
+
 function estimateGoogleImageTokens(
   modelContext: TokenCounterModelContext | undefined,
   part: CacheablePart,
@@ -842,7 +963,7 @@ function getAttachmentFingerprint(asset: unknown): { url?: string; contentHash?:
 
   const base64 = encodeAttachmentBase64(asset);
   if (base64) {
-    return { contentHash: createHash('sha1').update(base64).digest('hex') };
+    return { contentHash: createHash('sha256').update(base64).digest('hex') };
   }
 
   return {};
@@ -1100,6 +1221,7 @@ export class TokenCounter {
   private readonly defaultModelContext?: TokenCounterModelContext;
   private readonly modelContextStorage = new AsyncLocalStorage<TokenCounterModelContext | undefined>();
   private readonly inFlightAttachmentCounts = new Map<string, Promise<number | undefined>>();
+  private readonly multimodalToolResultCounts = new WeakMap<object, { resultKey: string; tokens: number }>();
 
   // Per-message overhead: accounts for role tokens, message framing, and separators.
   // 3.8 remains a practical average across providers for OM thresholding.
@@ -1188,6 +1310,144 @@ export class TokenCounter {
     return resolveToolResultValue(part as { providerMetadata?: Record<string, any> }, invocationResult);
   }
 
+  private countMultimodalToolResultContent(part: CacheablePart, toolResult: unknown): number | undefined {
+    if (!toolResult || typeof toolResult !== 'object') {
+      return undefined;
+    }
+
+    const resultKey = buildEstimateKey('tool-result-multimodal-content-source', JSON.stringify(toolResult));
+    const cached = this.multimodalToolResultCounts.get(part);
+    if (cached?.resultKey === resultKey) {
+      return cached.tokens;
+    }
+
+    const output = toolResult as Record<string, unknown>;
+    const content = output.type === 'content' && Array.isArray(output.value) ? output.value : output.content;
+    if (!Array.isArray(content)) {
+      return undefined;
+    }
+
+    let hasAttachment = false;
+    let tokens = 0;
+    const cacheParts: unknown[] = [];
+    const countJsonContentPart = (contentPart: Record<string, unknown>) => {
+      const formatted = serializeToolResultForTokenCounting(contentPart);
+      tokens += this.countString(formatted);
+      cacheParts.push({ type: 'json', valueHash: createHash('sha256').update(formatted).digest('hex') });
+    };
+
+    for (const item of content) {
+      if (!item || typeof item !== 'object') {
+        continue;
+      }
+
+      const contentPart = item as Record<string, unknown>;
+      const partType = contentPart.type;
+
+      if (partType === 'text') {
+        const text = typeof contentPart.text === 'string' ? contentPart.text : String(contentPart.value ?? '');
+        tokens += this.countString(text);
+        cacheParts.push({ type: 'text', textHash: createHash('sha256').update(text).digest('hex') });
+        continue;
+      }
+
+      if (
+        partType === 'image' ||
+        partType === 'image-data' ||
+        (partType === 'media' && String(contentPart.mediaType ?? '').startsWith('image/'))
+      ) {
+        if (typeof contentPart.data !== 'string') {
+          countJsonContentPart(contentPart);
+          continue;
+        }
+        hasAttachment = true;
+        const imagePart = {
+          type: 'image',
+          image: contentPart.data,
+          mimeType: contentPart.mediaType ?? contentPart.mimeType,
+          providerOptions: contentPart.providerOptions,
+          providerMetadata: contentPart.providerMetadata,
+        };
+        const clientEstimate = getClientPartTokenEstimate(imagePart);
+        if (clientEstimate) {
+          tokens += clientEstimate.tokens;
+          cacheParts.push({
+            type: 'image-data-client-estimate',
+            key: clientEstimate.key,
+            tokens: clientEstimate.tokens,
+          });
+          continue;
+        }
+
+        const estimate = this.estimateImageTokens(imagePart);
+        tokens += estimate.tokens;
+        cacheParts.push({ type: 'image-data', estimate: JSON.parse(estimate.cachePayload) });
+        continue;
+      }
+
+      if (partType === 'audio' || partType === 'file-data' || partType === 'media') {
+        if (typeof contentPart.data !== 'string') {
+          countJsonContentPart(contentPart);
+          continue;
+        }
+        hasAttachment = true;
+        const filePart = {
+          type: 'file',
+          data: contentPart.data,
+          mimeType: contentPart.mediaType ?? contentPart.mimeType,
+          filename: contentPart.filename,
+          providerOptions: contentPart.providerOptions,
+          providerMetadata: contentPart.providerMetadata,
+        };
+
+        const clientEstimate = getClientPartTokenEstimate(filePart);
+        if (clientEstimate) {
+          tokens += clientEstimate.tokens;
+          cacheParts.push({
+            type: 'file-data-client-estimate',
+            key: clientEstimate.key,
+            tokens: clientEstimate.tokens,
+          });
+          continue;
+        }
+
+        if (isImageLikeFilePart(filePart)) {
+          const estimate = this.estimateImageLikeFileTokens(filePart);
+          tokens += estimate.tokens;
+          cacheParts.push({ type: 'image-like-file-data', estimate: JSON.parse(estimate.cachePayload) });
+          continue;
+        }
+
+        const byteEstimate = estimateNonImageFileTokens(this.getModelContext(), filePart);
+        if (byteEstimate) {
+          tokens += byteEstimate.tokens;
+          cacheParts.push({ type: 'file-data', estimate: JSON.parse(byteEstimate.cachePayload) });
+          continue;
+        }
+
+        const descriptor = serializeNonImageFilePartForTokenCounting(filePart);
+        tokens += this.countString(descriptor);
+        cacheParts.push({ type: 'file-data-descriptor', descriptor });
+        continue;
+      }
+
+      countJsonContentPart(contentPart);
+    }
+
+    if (!hasAttachment) {
+      return undefined;
+    }
+
+    const estimate = this.readOrPersistFixedPartEstimate(
+      part,
+      'tool-result-multimodal-content',
+      JSON.stringify({ type: 'content', value: cacheParts }),
+      tokens,
+    );
+    this.multimodalToolResultCounts.set(part, { resultKey, tokens: estimate });
+    return estimate;
+  }
+
   private estimateImageAssetTokens(part: CacheablePart, asset: unknown, kind: 'image' | 'file'): ImageTokenEstimate {
     const modelContext = this.getModelContext();
     const provider = resolveProviderId(modelContext);
@@ -1267,6 +1527,13 @@ export class TokenCounter {
   }
 
   private countAttachmentPartSync(part: CacheablePart): number | undefined {
+    if (part.type === 'image' || part.type === 'file') {
+      const clientEstimate = getClientPartTokenEstimate(part);
+      if (clientEstimate) {
+        return clientEstimate.tokens;
+      }
+    }
+
     if (part.type === 'image') {
       const estimate = this.estimateImageTokens(part);
       return this.readOrPersistFixedPartEstimate(part, 'image', estimate.cachePayload, estimate.tokens);
@@ -1278,6 +1545,15 @@ export class TokenCounter {
     }
 
     if (part.type === 'file') {
+      const byteEstimate = estimateNonImageFileTokens(this.getModelContext(), part);
+      if (byteEstimate) {
+        return this.readOrPersistFixedPartEstimate(
+          part,
+          'non-image-file',
+          byteEstimate.cachePayload,
+          byteEstimate.tokens,
+        );
+      }
       return this.readOrPersistPartEstimate(part, 'file-descriptor', serializeNonImageFilePartForTokenCounting(part));
     }
 
@@ -1343,6 +1619,13 @@ export class TokenCounter {
   }
 
   private async countAttachmentPartAsync(part: CacheablePart): Promise<number | undefined> {
+    if (part.type === 'image' || part.type === 'file') {
+      const clientEstimate = getClientPartTokenEstimate(part);
+      if (clientEstimate) {
+        return clientEstimate.tokens;
+      }
+    }
+
     const isImageAttachment = part.type === 'image' || (part.type === 'file' && isImageLikeFilePart(part));
     const remotePayload = this.buildRemoteAttachmentCachePayload(part);
 
@@ -1424,79 +1707,141 @@ export class TokenCounter {
     return localTokens;
   }
 
+  /**
+   * Count the name and the arguments of a tool call. Every state before the tool produces an
+   * output holds the same call signature in the context window, so all of those states share
+   * these cache kinds. `buildEstimateKey` hashes the text, so a shared kind stays correct and
+   * keeps the estimate warm while the invocation moves from one state to the next.
+   */
+  private countToolCallSignature(
+    part: CacheablePart,
+    invocation: MastraToolInvocation,
+  ): { tokens: number; overheadDelta: number } {
+    let tokens = 0;
+    let overheadDelta = 0;
+
+    if (invocation.toolName) {
+      tokens += this.readOrPersistPartEstimate(part, 'tool-call-name', invocation.toolName);
+    }
+    if (invocation.args) {
+      if (typeof invocation.args === 'string') {
+        tokens += this.readOrPersistPartEstimate(part, 'tool-call-args', invocation.args);
+      } else {
+        const argsJson = JSON.stringify(invocation.args);
+        tokens += this.readOrPersistPartEstimate(part, 'tool-call-args-json', argsJson);
+        overheadDelta -= 12;
+      }
+    }
+
+    return { tokens, overheadDelta };
+  }
+
   private countNonAttachmentPart(part: CacheablePart): {
     tokens: number;
     overheadDelta: number;
-    toolResultDelta: number;
+    /** Number of extra messages this part costs, each charged one `TOKENS_PER_MESSAGE`. */
+    extraMessageDelta: number;
   } {
     let overheadDelta = 0;
-    let toolResultDelta = 0;
+    let extraMessageDelta = 0;
 
     if (part.type === 'text') {
-      return { tokens: this.readOrPersistPartEstimate(part, 'text', part.text), overheadDelta, toolResultDelta };
+      return { tokens: this.readOrPersistPartEstimate(part, 'text', part.text), overheadDelta, extraMessageDelta };
     }
 
     if (part.type === 'tool-invocation') {
-      const invocation = part.toolInvocation;
+      // Typed alias of the untyped part so the branches below narrow the state union down to
+      // `never`. A state added to the core type then breaks the build here.
+      const invocation: MastraToolInvocation = part.toolInvocation;
+      const state = invocation.state;
       let tokens = 0;
 
-      if (invocation.state === 'call' || invocation.state === 'partial-call') {
-        if (invocation.toolName) {
-          tokens += this.readOrPersistPartEstimate(part, `tool-${invocation.state}-name`, invocation.toolName);
-        }
-        if (invocation.args) {
-          if (typeof invocation.args === 'string') {
-            tokens += this.readOrPersistPartEstimate(part, `tool-${invocation.state}-args`, invocation.args);
-          } else {
-            const argsJson = JSON.stringify(invocation.args);
-            tokens += this.readOrPersistPartEstimate(part, `tool-${invocation.state}-args-json`, argsJson);
-            overheadDelta -= 12;
-          }
-        }
-
-        return { tokens, overheadDelta, toolResultDelta };
+      if (state === 'call' || state === 'partial-call' || state === 'approval-requested') {
+        // A call that waits for approval still holds its name and args in the context window
+        // exactly like a plain call, so it costs the same until the tool produces an output.
+        const signature = this.countToolCallSignature(part, invocation);
+        return { tokens: signature.tokens, overheadDelta: overheadDelta + signature.overheadDelta, extraMessageDelta };
       }
 
-      if (invocation.state === 'result') {
-        toolResultDelta++;
+      if (state === 'approval-responded') {
+        // The approval reply travels as its own tool message, so charge one more message of
+        // overhead on top of the call signature, plus the reason the user gave with the decision.
+        extraMessageDelta++;
+        const signature = this.countToolCallSignature(part, invocation);
+        tokens += signature.tokens;
+        overheadDelta += signature.overheadDelta;
+        const reason = invocation.approval?.reason;
+        if (reason) {
+          tokens += this.readOrPersistPartEstimate(part, 'tool-approval-reason', reason);
+        }
+        return { tokens, overheadDelta, extraMessageDelta };
+      }
+
+      if (state === 'result') {
+        extraMessageDelta++;
         const { value: resultForCounting, usingStoredModelOutput } = this.resolveToolResultForTokenCounting(
           part,
           invocation.result,
         );
 
         if (resultForCounting !== undefined) {
-          const formattedResult = formatToolResultForObserver(resultForCounting);
-          tokens += this.readOrPersistPartEstimate(
-            part,
-            usingStoredModelOutput ? 'tool-result-model-output-json' : 'tool-result-json',
-            formattedResult,
-          );
+          const contentTokens = this.countMultimodalToolResultContent(part, resultForCounting);
+
+          if (contentTokens !== undefined) {
+            tokens += contentTokens;
+          } else {
+            const formattedResult = serializeToolResultForTokenCounting(resultForCounting);
+            tokens += this.readOrPersistPartEstimate(
+              part,
+              usingStoredModelOutput ? 'tool-result-model-output-json' : 'tool-result-json',
+              formattedResult,
+            );
+          }
+
           if (typeof resultForCounting !== 'string') {
             overheadDelta -= 12;
           }
         }
 
-        return { tokens, overheadDelta, toolResultDelta };
+        return { tokens, overheadDelta, extraMessageDelta };
       }
 
-      throw new Error(
-        `Unhandled tool-invocation state '${(part as any).toolInvocation?.state}' in token counting for part type '${part.type}'`,
-      );
+      if (state === 'output-denied') {
+        // A declined approval carries no tool result; count its denial reason like a small result
+        // so token accounting stays consistent.
+        extraMessageDelta++;
+        const reason = invocation.approval?.reason ?? 'Tool call was not approved by the user';
+        tokens += this.readOrPersistPartEstimate(part, 'tool-result-denied', reason);
+        return { tokens, overheadDelta, extraMessageDelta };
+      }
+
+      if (state === 'output-error') {
+        extraMessageDelta++;
+        const errorMessage = typeof invocation.errorText === 'string' ? invocation.errorText : 'Tool execution failed';
+        tokens += this.readOrPersistPartEstimate(part, 'tool-result-error', errorMessage);
+        return { tokens, overheadDelta, extraMessageDelta };
+      }
+
+      // Compile-time exhaustiveness check only. This counter reads rows that another
+      // @mastra/core version may have written, so an unknown state must not stop the count.
+      // It falls through to the generic serializer below and yields an over-estimate instead.
+      const exhaustiveStateCheck: never = state;
+      void exhaustiveStateCheck;
     }
 
     if (typeof part.type === 'string' && part.type.startsWith('data-')) {
-      return { tokens: 0, overheadDelta, toolResultDelta };
+      return { tokens: 0, overheadDelta, extraMessageDelta };
     }
 
     if (part.type === 'reasoning') {
-      return { tokens: 0, overheadDelta, toolResultDelta };
+      return { tokens: 0, overheadDelta, extraMessageDelta };
     }
 
     const serialized = serializePartForTokenCounting(part);
     return {
       tokens: this.readOrPersistPartEstimate(part, `part-${part.type}`, serialized),
       overheadDelta,
-      toolResultDelta,
+      extraMessageDelta,
     };
   }
 
@@ -1506,7 +1851,7 @@ export class TokenCounter {
   countMessage(message: MastraDBMessage): number {
     let payloadTokens = this.countString(message.role);
     let overhead = TokenCounter.TOKENS_PER_MESSAGE;
-    let toolResultCount = 0;
+    let extraMessageCount = 0;
 
     if (typeof message.content === 'string') {
       payloadTokens += this.readOrPersistMessageEstimate(message, 'message-content', message.content);
@@ -1524,13 +1869,13 @@ export class TokenCounter {
           const result = this.countNonAttachmentPart(part);
           payloadTokens += result.tokens;
           overhead += result.overheadDelta;
-          toolResultCount += result.toolResultDelta;
+          extraMessageCount += result.extraMessageDelta;
         }
       }
     }
 
-    if (toolResultCount > 0) {
-      overhead += toolResultCount * TokenCounter.TOKENS_PER_MESSAGE;
+    if (extraMessageCount > 0) {
+      overhead += extraMessageCount * TokenCounter.TOKENS_PER_MESSAGE;
     }
 
     return Math.round(payloadTokens + overhead);
@@ -1539,7 +1884,7 @@ export class TokenCounter {
   async countMessageAsync(message: MastraDBMessage): Promise<number> {
     let payloadTokens = this.countString(message.role);
     let overhead = TokenCounter.TOKENS_PER_MESSAGE;
-    let toolResultCount = 0;
+    let extraMessageCount = 0;
 
     if (typeof message.content === 'string') {
       payloadTokens += this.readOrPersistMessageEstimate(message, 'message-content', message.content);
@@ -1557,13 +1902,13 @@ export class TokenCounter {
           const result = this.countNonAttachmentPart(part);
           payloadTokens += result.tokens;
           overhead += result.overheadDelta;
-          toolResultCount += result.toolResultDelta;
+          extraMessageCount += result.extraMessageDelta;
         }
       }
     }
 
-    if (toolResultCount > 0) {
-      overhead += toolResultCount * TokenCounter.TOKENS_PER_MESSAGE;
+    if (extraMessageCount > 0) {
+      overhead += extraMessageCount * TokenCounter.TOKENS_PER_MESSAGE;
     }
 
     return Math.round(payloadTokens + overhead);

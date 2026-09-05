@@ -16,19 +16,29 @@ import type {
   Experiment,
   ExperimentResult,
   ExperimentReviewCounts,
+  ExperimentTenancyFilters,
   CreateExperimentInput,
   UpdateExperimentInput,
   AddExperimentResultInput,
   UpdateExperimentResultInput,
+  UpsertExperimentResultInput,
   ListExperimentsInput,
   ListExperimentsOutput,
   ListExperimentResultsInput,
   ListExperimentResultsOutput,
   CreateIndexOptions,
+  TABLE_NAMES,
+  PruneOptions,
+  PruneResult,
+  RetentionTablesDescriptor,
+  TableRetentionPolicy,
 } from '@mastra/core/storage';
 import { PgDB, resolvePgConfig, generateTableSQL } from '../../db';
 import type { PgDomainConfig } from '../../db';
-import { getTableName, getSchemaName } from '../utils';
+import { cutoffFor, runBatchedDelete } from '../../retention';
+import { getTableName, getSchemaName, tenancyWhere } from '../utils';
+
+const DEFAULT_PRUNE_BATCH_SIZE = 1000;
 
 export class ExperimentsPG extends ExperimentsStorage {
   #db: PgDB;
@@ -37,6 +47,18 @@ export class ExperimentsPG extends ExperimentsStorage {
   #indexes?: CreateIndexOptions[];
 
   static readonly MANAGED_TABLES = [TABLE_EXPERIMENTS, TABLE_EXPERIMENT_RESULTS] as const;
+
+  /**
+   * Experiments prune as whole units: an aged experiment and its result rows go
+   * together, mirroring `deleteExperiment`. Anchored on `completedAt` (not the
+   * `completedAtZ` mirror, which carries a `DEFAULT NOW()` this domain never
+   * overrides — it holds insert time even for running rows). `completedAt` is
+   * written as a UTC ISO string and stays NULL while running, so
+   * `completedAt < cutoff` is false for in-flight experiments.
+   */
+  static override readonly retentionTables: RetentionTablesDescriptor = {
+    experiments: { table: TABLE_EXPERIMENTS, column: 'completedAt', indexed: true },
+  };
 
   constructor(config: PgDomainConfig) {
     super();
@@ -69,32 +91,157 @@ export class ExperimentsPG extends ExperimentsStorage {
     await this.#db.alterTable({
       tableName: TABLE_EXPERIMENTS,
       schema: EXPERIMENTS_SCHEMA,
-      ifNotExists: ['agentVersion'],
+      ifNotExists: [
+        'agentVersion',
+        'organizationId',
+        'projectId',
+        'provenance',
+        'runnerAttestation',
+        'experimentSetId',
+        'comparisonId',
+        'variantId',
+        'trialIndex',
+        'scorerIds',
+      ],
     });
     await this.#db.alterTable({
       tableName: TABLE_EXPERIMENT_RESULTS,
       schema: EXPERIMENT_RESULTS_SCHEMA,
-      ifNotExists: ['status', 'tags'],
+      ifNotExists: [
+        'status',
+        'tags',
+        'comment',
+        'toolMockReport',
+        'metadata',
+        'organizationId',
+        'projectId',
+        'attempt',
+      ],
     });
     await this.createDefaultIndexes();
     await this.createCustomIndexes();
   }
 
+  /**
+   * Lazily ensures a btree index exists on each configured policy's retention
+   * anchor column so age-based `prune()` deletes stay fast on large tables.
+   * Called from the prune path (not init) so only deployments that configure
+   * retention pay the index's write/disk overhead. Best-effort: failures are
+   * logged and pruning proceeds (correct, just slower).
+   * Created even with `skipDefaultIndexes` — retention is an explicit opt-in,
+   * so its supporting index is not part of the default index set.
+   */
+  private async ensureRetentionIndexes(policies: Record<string, TableRetentionPolicy>): Promise<void> {
+    const prefix = this.#schema !== 'public' ? `${this.#schema}_` : '';
+    for (const [key, entry] of Object.entries(ExperimentsPG.retentionTables)) {
+      if (!entry.indexed || !policies[key]) continue;
+      try {
+        await this.#db.ensureIndex({
+          indexName: `${prefix}mastra_${key}_retention_idx`,
+          tableName: entry.table as TABLE_NAMES,
+          column: entry.column,
+        });
+      } catch (error) {
+        this.logger?.warn?.(`Failed to create retention index for ${entry.table}:`, error);
+      }
+    }
+  }
+
+  /**
+   * Delete experiments whose `completedAt` is older than the policy's `maxAge`.
+   *
+   * Each batch selects up to `batchSize` aged experiments and deletes their
+   * `experiment_results` rows and the experiment rows in one transaction —
+   * mirroring `deleteExperiment` — so hitting `maxBatches`/`maxRows` or the
+   * abort signal between batches never leaves a run hollow (parent kept,
+   * results gone). NULL `completedAt` (still running) is excluded by the
+   * `< cutoff` predicate. Bounds count whole experiments, not rows.
+   */
+  async prune(policies: Record<string, TableRetentionPolicy>, options?: PruneOptions): Promise<PruneResult[]> {
+    const policy = policies['experiments'];
+    if (!policy || options?.signal?.aborted) {
+      return policy
+        ? [
+            { domain: 'experiments', table: TABLE_EXPERIMENT_RESULTS, deleted: 0, done: false },
+            { domain: 'experiments', table: TABLE_EXPERIMENTS, deleted: 0, done: false },
+          ]
+        : [];
+    }
+
+    await this.ensureRetentionIndexes(policies);
+
+    // `completedAt` is a naive TIMESTAMP holding UTC ISO strings, so bind the
+    // cutoff as a UTC ISO string too — a Date would be serialized with the
+    // session's local offset and compared against the wrong wall time.
+    const rawCutoff = cutoffFor(policy, 'timestamp');
+    const cutoff = rawCutoff instanceof Date ? rawCutoff.toISOString() : rawCutoff;
+    const batchSize = policy.batchSize ?? DEFAULT_PRUNE_BATCH_SIZE;
+
+    let childDeleted = 0;
+    const parent = await runBatchedDelete({
+      deleteBatch: async limit => {
+        const { parents, children } = await this.#db.pruneUnitsBatch({
+          parentTable: TABLE_EXPERIMENTS,
+          parentKey: 'id',
+          parentColumn: 'completedAt',
+          childTable: TABLE_EXPERIMENT_RESULTS,
+          childForeignKey: 'experimentId',
+          cutoff,
+          limit,
+        });
+        childDeleted += children;
+        return parents;
+      },
+      batchSize,
+      options,
+    });
+
+    return [
+      { domain: 'experiments', table: TABLE_EXPERIMENT_RESULTS, deleted: childDeleted, done: parent.done },
+      { domain: 'experiments', table: TABLE_EXPERIMENTS, deleted: parent.deleted, done: parent.done },
+    ];
+  }
+
   getDefaultIndexDefinitions(): CreateIndexOptions[] {
     return [
       { name: 'idx_experiments_datasetid', table: TABLE_EXPERIMENTS, columns: ['datasetId'] },
-      { name: 'idx_experiment_results_experimentid', table: TABLE_EXPERIMENT_RESULTS, columns: ['experimentId'] },
       {
-        name: 'idx_experiment_results_exp_item',
+        name: 'idx_experiments_grouping',
+        table: TABLE_EXPERIMENTS,
+        columns: ['experimentSetId', 'comparisonId', 'variantId', 'trialIndex'],
+      },
+      { name: 'idx_experiment_results_experimentid', table: TABLE_EXPERIMENT_RESULTS, columns: ['experimentId'] },
+      // The natural key includes `attempt` so external runners can record
+      // repeated trials as separate rows (retry convergence happens per attempt).
+      {
+        name: 'idx_experiment_results_exp_item_attempt',
         table: TABLE_EXPERIMENT_RESULTS,
-        columns: ['experimentId', 'itemId'],
+        columns: ['experimentId', 'itemId', 'attempt'],
         unique: true,
+      },
+      // Tenancy: leading-tenant indexes for multi-tenant scans (parity with datasets domain).
+      {
+        name: 'idx_experiments_org_project',
+        table: TABLE_EXPERIMENTS,
+        columns: ['organizationId', 'projectId'],
+      },
+      {
+        name: 'idx_experiment_results_org_project',
+        table: TABLE_EXPERIMENT_RESULTS,
+        columns: ['organizationId', 'projectId'],
       },
     ];
   }
 
   async createDefaultIndexes(): Promise<void> {
     if (this.#skipDefaultIndexes) return;
+    // Legacy unique index without `attempt` — superseded by idx_experiment_results_exp_item_attempt.
+    // dropIndex is snapshot-aware, so converged inits stay DDL- and probe-free.
+    try {
+      await this.#db.dropIndex('idx_experiment_results_exp_item');
+    } catch (error) {
+      this.logger?.warn?.('Failed to drop legacy index idx_experiment_results_exp_item:', error);
+    }
     for (const indexDef of this.getDefaultIndexDefinitions()) {
       try {
         await this.#db.createIndex(indexDef);
@@ -123,11 +270,20 @@ export class ExperimentsPG extends ExperimentsStorage {
       name: (row.name as string) ?? undefined,
       description: (row.description as string) ?? undefined,
       metadata: row.metadata ? safelyParseJSON(row.metadata) : undefined,
+      provenance: row.provenance ? safelyParseJSON(row.provenance) : null,
+      runnerAttestation: row.runnerAttestation ? safelyParseJSON(row.runnerAttestation) : null,
+      experimentSetId: (row.experimentSetId as string | null) ?? null,
+      comparisonId: (row.comparisonId as string | null) ?? null,
+      variantId: (row.variantId as string | null) ?? null,
+      trialIndex: row.trialIndex != null ? (row.trialIndex as number) : null,
       datasetId: (row.datasetId as string | null) ?? null,
       datasetVersion: row.datasetVersion != null ? (row.datasetVersion as number) : null,
       agentVersion: (row.agentVersion as string | null) ?? null,
-      targetType: row.targetType as Experiment['targetType'],
-      targetId: row.targetId as string,
+      organizationId: (row.organizationId as string | null) ?? null,
+      projectId: (row.projectId as string | null) ?? null,
+      targetType: (row.targetType as Experiment['targetType']) ?? null,
+      targetId: (row.targetId as string | null) ?? null,
+      scorerIds: row.scorerIds ? safelyParseJSON(row.scorerIds) : null,
       status: row.status as Experiment['status'],
       totalItems: row.totalItems as number,
       succeededCount: row.succeededCount as number,
@@ -146,16 +302,22 @@ export class ExperimentsPG extends ExperimentsStorage {
       experimentId: row.experimentId as string,
       itemId: row.itemId as string,
       itemDatasetVersion: row.itemDatasetVersion != null ? (row.itemDatasetVersion as number) : null,
+      organizationId: (row.organizationId as string | null) ?? null,
+      projectId: (row.projectId as string | null) ?? null,
       input: safelyParseJSON(row.input),
       output: row.output ? safelyParseJSON(row.output) : null,
       groundTruth: row.groundTruth ? safelyParseJSON(row.groundTruth) : null,
+      metadata: row.metadata ? safelyParseJSON(row.metadata) : null,
       error: row.error ? safelyParseJSON(row.error) : null,
       startedAt: ensureDate(row.startedAtZ || row.startedAt)!,
       completedAt: ensureDate(row.completedAtZ || row.completedAt)!,
       retryCount: row.retryCount as number,
+      attempt: row.attempt != null ? (row.attempt as number) : 0,
       traceId: (row.traceId as string | null) ?? null,
       status: (row.status as ExperimentResult['status']) ?? null,
       tags: row.tags ? safelyParseJSON(row.tags) : null,
+      comment: (row.comment as string | null) ?? null,
+      toolMockReport: row.toolMockReport ? safelyParseJSON(row.toolMockReport) : null,
       createdAt: ensureDate(row.createdAtZ || row.createdAt)!,
     };
   }
@@ -175,11 +337,20 @@ export class ExperimentsPG extends ExperimentsStorage {
           name: input.name ?? null,
           description: input.description ?? null,
           metadata: input.metadata ?? null,
+          provenance: input.provenance ?? null,
+          runnerAttestation: input.runnerAttestation ?? null,
+          experimentSetId: input.experimentSetId ?? null,
+          comparisonId: input.comparisonId ?? null,
+          variantId: input.variantId ?? null,
+          trialIndex: input.trialIndex ?? null,
           datasetId: input.datasetId ?? null,
           datasetVersion: input.datasetVersion ?? null,
           agentVersion: input.agentVersion ?? null,
-          targetType: input.targetType,
-          targetId: input.targetId,
+          organizationId: input.organizationId ?? null,
+          projectId: input.projectId ?? null,
+          targetType: input.targetType ?? null,
+          targetId: input.targetId ?? null,
+          scorerIds: input.scorerIds ?? null,
           status: 'pending',
           totalItems: input.totalItems,
           succeededCount: 0,
@@ -197,11 +368,20 @@ export class ExperimentsPG extends ExperimentsStorage {
         name: input.name,
         description: input.description,
         metadata: input.metadata,
+        provenance: input.provenance ?? null,
+        runnerAttestation: input.runnerAttestation ?? null,
+        experimentSetId: input.experimentSetId ?? null,
+        comparisonId: input.comparisonId ?? null,
+        variantId: input.variantId ?? null,
+        trialIndex: input.trialIndex ?? null,
         datasetId: input.datasetId ?? null,
         datasetVersion: input.datasetVersion ?? null,
         agentVersion: input.agentVersion ?? null,
-        targetType: input.targetType,
-        targetId: input.targetId,
+        organizationId: input.organizationId ?? null,
+        projectId: input.projectId ?? null,
+        targetType: input.targetType ?? null,
+        targetId: input.targetId ?? null,
+        scorerIds: input.scorerIds ?? null,
         status: 'pending',
         totalItems: input.totalItems,
         succeededCount: 0,
@@ -305,10 +485,18 @@ export class ExperimentsPG extends ExperimentsStorage {
     }
   }
 
-  async getExperimentById({ id }: { id: string }): Promise<Experiment | null> {
+  async getExperimentById({
+    id,
+    filters,
+  }: {
+    id: string;
+    filters?: ExperimentTenancyFilters;
+  }): Promise<Experiment | null> {
     try {
       const tableName = getTableName({ indexName: TABLE_EXPERIMENTS, schemaName: getSchemaName(this.#schema) });
-      const result = await this.#db.client.oneOrNone(`SELECT * FROM ${tableName} WHERE "id" = $1`, [id]);
+      const { conditions, params } = tenancyWhere(filters, 2);
+      const whereSql = ['"id" = $1', ...conditions].join(' AND ');
+      const result = await this.#db.client.oneOrNone(`SELECT * FROM ${tableName} WHERE ${whereSql}`, [id, ...params]);
       return result ? this.transformExperimentRow(result) : null;
     } catch (error) {
       throw new MastraError(
@@ -351,6 +539,33 @@ export class ExperimentsPG extends ExperimentsStorage {
       if (args.status) {
         conditions.push(`"status" = $${paramIndex++}`);
         queryParams.push(args.status);
+      }
+      if (args.experimentSetId !== undefined) {
+        conditions.push(`"experimentSetId" = $${paramIndex++}`);
+        queryParams.push(args.experimentSetId);
+      }
+      if (args.comparisonId !== undefined) {
+        conditions.push(`"comparisonId" = $${paramIndex++}`);
+        queryParams.push(args.comparisonId);
+      }
+      if (args.variantId !== undefined) {
+        conditions.push(`"variantId" = $${paramIndex++}`);
+        queryParams.push(args.variantId);
+      }
+      if (args.trialIndex !== undefined) {
+        conditions.push(`"trialIndex" = $${paramIndex++}`);
+        queryParams.push(args.trialIndex);
+      }
+      if (args.filters) {
+        const { organizationId, projectId } = args.filters;
+        if (organizationId !== undefined) {
+          conditions.push(`"organizationId" = $${paramIndex++}`);
+          queryParams.push(organizationId);
+        }
+        if (projectId !== undefined) {
+          conditions.push(`"projectId" = $${paramIndex++}`);
+          queryParams.push(projectId);
+        }
       }
 
       const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -396,7 +611,7 @@ export class ExperimentsPG extends ExperimentsStorage {
     }
   }
 
-  async deleteExperiment({ id }: { id: string }): Promise<void> {
+  async deleteExperiment({ id, filters }: { id: string; filters?: ExperimentTenancyFilters }): Promise<void> {
     try {
       const resultsTable = getTableName({
         indexName: TABLE_EXPERIMENT_RESULTS,
@@ -404,9 +619,18 @@ export class ExperimentsPG extends ExperimentsStorage {
       });
       const experimentsTable = getTableName({ indexName: TABLE_EXPERIMENTS, schemaName: getSchemaName(this.#schema) });
 
-      // Delete results first (FK semantics)
-      await this.#db.client.none(`DELETE FROM ${resultsTable} WHERE "experimentId" = $1`, [id]);
-      await this.#db.client.none(`DELETE FROM ${experimentsTable} WHERE "id" = $1`, [id]);
+      // Tenancy gate + cascade run in a single transaction with SELECT ... FOR UPDATE,
+      // so a concurrent delete/recreate cannot let a scoped delete hit another tenant's row.
+      // Silent no-op on tenancy mismatch (does not throw).
+      const { conditions, params } = tenancyWhere(filters, 2);
+      const gateSql = `SELECT "id" FROM ${experimentsTable} WHERE ${['"id" = $1', ...conditions].join(' AND ')} FOR UPDATE`;
+
+      await this.#db.client.tx(async t => {
+        const parent = await t.oneOrNone(gateSql, [id, ...params]);
+        if (!parent) return;
+        await t.none(`DELETE FROM ${resultsTable} WHERE "experimentId" = $1`, [id]);
+        await t.none(`DELETE FROM ${experimentsTable} WHERE "id" = $1`, [id]);
+      });
     } catch (error) {
       throw new MastraError(
         {
@@ -434,16 +658,21 @@ export class ExperimentsPG extends ExperimentsStorage {
           experimentId: input.experimentId,
           itemId: input.itemId,
           itemDatasetVersion: input.itemDatasetVersion ?? null,
+          organizationId: input.organizationId ?? null,
+          projectId: input.projectId ?? null,
           input: input.input,
           output: input.output ?? null,
           groundTruth: input.groundTruth ?? null,
+          metadata: input.metadata ?? null,
           error: input.error ?? null,
           startedAt: input.startedAt.toISOString(),
           completedAt: input.completedAt.toISOString(),
           retryCount: input.retryCount,
+          attempt: input.attempt ?? 0,
           traceId: input.traceId ?? null,
           status: input.status ?? null,
           tags: input.tags ?? null,
+          toolMockReport: input.toolMockReport ?? null,
           createdAt: nowIso,
         },
       });
@@ -453,22 +682,123 @@ export class ExperimentsPG extends ExperimentsStorage {
         experimentId: input.experimentId,
         itemId: input.itemId,
         itemDatasetVersion: input.itemDatasetVersion ?? null,
+        organizationId: input.organizationId ?? null,
+        projectId: input.projectId ?? null,
         input: input.input,
         output: input.output ?? null,
         groundTruth: input.groundTruth ?? null,
+        metadata: input.metadata ?? null,
         error: input.error ?? null,
         startedAt: input.startedAt,
         completedAt: input.completedAt,
         retryCount: input.retryCount,
+        attempt: input.attempt ?? 0,
         traceId: input.traceId ?? null,
         status: input.status ?? null,
         tags: input.tags ?? null,
+        toolMockReport: input.toolMockReport ?? null,
         createdAt: now,
       };
     } catch (error) {
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'ADD_EXPERIMENT_RESULT', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+        },
+        error,
+      );
+    }
+  }
+
+  async upsertExperimentResult(input: UpsertExperimentResultInput): Promise<ExperimentResult> {
+    try {
+      const tableName = getTableName({ indexName: TABLE_EXPERIMENT_RESULTS, schemaName: getSchemaName(this.#schema) });
+      const attempt = input.attempt ?? 0;
+
+      const row = await this.#db.client.tx(async t => {
+        // Natural key lookup under FOR UPDATE so concurrent retries serialize
+        // on the same row instead of inserting duplicates.
+        // Note: COALESCE("attempt", 0) is an expression predicate, so the
+        // planner narrows on the ("experimentId", "itemId") index prefix and
+        // filters the attempt term — bounded cost since one item has few
+        // attempts. Once legacy NULL attempts are backfilled to 0 and the
+        // column is NOT NULL DEFAULT 0, this can become "attempt" = $3 for a
+        // full index match.
+        const existing = await t.oneOrNone(
+          `SELECT "id" FROM ${tableName} WHERE "experimentId" = $1 AND "itemId" = $2 AND COALESCE("attempt", 0) = $3 FOR UPDATE`,
+          [input.experimentId, input.itemId, attempt],
+        );
+
+        if (!existing) {
+          const id = crypto.randomUUID();
+          return t.one(
+            `INSERT INTO ${tableName} (
+              "id", "experimentId", "itemId", "itemDatasetVersion", "organizationId", "projectId",
+              "input", "output", "groundTruth", "metadata", "error", "startedAt", "completedAt",
+              "retryCount", "attempt", "traceId", "status", "tags", "toolMockReport", "createdAt"
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+            RETURNING *`,
+            [
+              id,
+              input.experimentId,
+              input.itemId,
+              input.itemDatasetVersion ?? null,
+              input.organizationId ?? null,
+              input.projectId ?? null,
+              JSON.stringify(input.input),
+              input.output != null ? JSON.stringify(input.output) : null,
+              input.groundTruth != null ? JSON.stringify(input.groundTruth) : null,
+              input.metadata != null ? JSON.stringify(input.metadata) : null,
+              input.error != null ? JSON.stringify(input.error) : null,
+              input.startedAt.toISOString(),
+              input.completedAt.toISOString(),
+              input.retryCount,
+              attempt,
+              input.traceId ?? null,
+              input.status ?? null,
+              input.tags != null ? JSON.stringify(input.tags) : null,
+              input.toolMockReport != null ? JSON.stringify(input.toolMockReport) : null,
+              new Date().toISOString(),
+            ],
+          );
+        }
+
+        // Last write wins on the natural key; keep row id + createdAt stable.
+        return t.one(
+          `UPDATE ${tableName} SET
+            "itemDatasetVersion" = $2, "organizationId" = $3, "projectId" = $4,
+            "input" = $5, "output" = $6, "groundTruth" = $7, "metadata" = $8, "error" = $9,
+            "startedAt" = $10, "completedAt" = $11, "retryCount" = $12, "attempt" = $13,
+            "traceId" = $14, "status" = $15, "tags" = $16, "toolMockReport" = $17
+          WHERE "id" = $1 RETURNING *`,
+          [
+            existing.id,
+            input.itemDatasetVersion ?? null,
+            input.organizationId ?? null,
+            input.projectId ?? null,
+            JSON.stringify(input.input),
+            input.output != null ? JSON.stringify(input.output) : null,
+            input.groundTruth != null ? JSON.stringify(input.groundTruth) : null,
+            input.metadata != null ? JSON.stringify(input.metadata) : null,
+            input.error != null ? JSON.stringify(input.error) : null,
+            input.startedAt.toISOString(),
+            input.completedAt.toISOString(),
+            input.retryCount,
+            attempt,
+            input.traceId ?? null,
+            input.status ?? null,
+            input.tags != null ? JSON.stringify(input.tags) : null,
+            input.toolMockReport != null ? JSON.stringify(input.toolMockReport) : null,
+          ],
+        );
+      });
+
+      return this.transformExperimentResultRow(row);
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'UPSERT_EXPERIMENT_RESULT', 'FAILED'),
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
         },
@@ -491,6 +821,10 @@ export class ExperimentsPG extends ExperimentsStorage {
       if (input.tags !== undefined) {
         setClauses.push(`"tags" = $${paramIndex++}`);
         values.push(JSON.stringify(input.tags));
+      }
+      if (input.comment !== undefined) {
+        setClauses.push(`"comment" = $${paramIndex++}`);
+        values.push(input.comment);
       }
 
       if (setClauses.length === 0) {
@@ -541,10 +875,18 @@ export class ExperimentsPG extends ExperimentsStorage {
     }
   }
 
-  async getExperimentResultById({ id }: { id: string }): Promise<ExperimentResult | null> {
+  async getExperimentResultById({
+    id,
+    filters,
+  }: {
+    id: string;
+    filters?: ExperimentTenancyFilters;
+  }): Promise<ExperimentResult | null> {
     try {
       const tableName = getTableName({ indexName: TABLE_EXPERIMENT_RESULTS, schemaName: getSchemaName(this.#schema) });
-      const result = await this.#db.client.oneOrNone(`SELECT * FROM ${tableName} WHERE "id" = $1`, [id]);
+      const { conditions, params } = tenancyWhere(filters, 2);
+      const whereSql = ['"id" = $1', ...conditions].join(' AND ');
+      const result = await this.#db.client.oneOrNone(`SELECT * FROM ${tableName} WHERE ${whereSql}`, [id, ...params]);
       return result ? this.transformExperimentResultRow(result) : null;
     } catch (error) {
       throw new MastraError(
@@ -574,6 +916,17 @@ export class ExperimentsPG extends ExperimentsStorage {
       if (args.status) {
         conditions.push(`"status" = $${paramIndex++}`);
         queryParams.push(args.status);
+      }
+      if (args.filters) {
+        const { organizationId, projectId } = args.filters;
+        if (organizationId !== undefined) {
+          conditions.push(`"organizationId" = $${paramIndex++}`);
+          queryParams.push(organizationId);
+        }
+        if (projectId !== undefined) {
+          conditions.push(`"projectId" = $${paramIndex++}`);
+          queryParams.push(projectId);
+        }
       }
 
       const whereClause = `WHERE ${conditions.join(' AND ')}`;
@@ -618,9 +971,31 @@ export class ExperimentsPG extends ExperimentsStorage {
     }
   }
 
-  async deleteExperimentResults({ experimentId }: { experimentId: string }): Promise<void> {
+  async deleteExperimentResults({
+    experimentId,
+    filters,
+  }: {
+    experimentId: string;
+    filters?: ExperimentTenancyFilters;
+  }): Promise<void> {
     try {
       const tableName = getTableName({ indexName: TABLE_EXPERIMENT_RESULTS, schemaName: getSchemaName(this.#schema) });
+      const experimentsTable = getTableName({ indexName: TABLE_EXPERIMENTS, schemaName: getSchemaName(this.#schema) });
+
+      // Atomic gate + cascade under SELECT ... FOR UPDATE. Silent no-op on
+      // tenancy mismatch.
+      if (filters?.organizationId !== undefined || filters?.projectId !== undefined) {
+        const { conditions, params } = tenancyWhere(filters, 2);
+        const gateSql = `SELECT "id" FROM ${experimentsTable} WHERE ${['"id" = $1', ...conditions].join(' AND ')} FOR UPDATE`;
+
+        await this.#db.client.tx(async t => {
+          const parent = await t.oneOrNone(gateSql, [experimentId, ...params]);
+          if (!parent) return;
+          await t.none(`DELETE FROM ${tableName} WHERE "experimentId" = $1`, [experimentId]);
+        });
+        return;
+      }
+
       await this.#db.client.none(`DELETE FROM ${tableName} WHERE "experimentId" = $1`, [experimentId]);
     } catch (error) {
       throw new MastraError(

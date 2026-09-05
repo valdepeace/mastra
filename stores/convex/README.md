@@ -1,123 +1,38 @@
 # @mastra/convex
 
-Convex adapters for Mastra:
+`@mastra/convex` provides Convex-backed storage, vector search, and server caching for Mastra applications. It includes development-scale and native vector implementations, along with server-side Convex definitions and handlers.
 
-- `ConvexStore` implements the Mastra storage contract (threads, messages, workflows, scores, resources).
-- `ConvexVector` stores embeddings inside Convex and performs cosine similarity search.
-- `@mastra/convex/server` exposes the required Convex table definitions and storage mutation.
-
-## Quick start
-
-### 1. Install
+## Installation
 
 ```bash
-pnpm add @mastra/convex
+npm install @mastra/convex
 ```
 
-### 2. Set up Convex schema
+## Usage
 
-In `convex/schema.ts`:
+Create a vector store with your Convex deployment URL and an admin auth token. Use `ConvexNativeVector` for production-scale native vector search, or `ConvexVector` for development-scale search implemented by the package.
 
-```ts
-import { defineSchema } from 'convex/server';
-import {
-  mastraThreadsTable,
-  mastraMessagesTable,
-  mastraResourcesTable,
-  mastraWorkflowSnapshotsTable,
-  mastraScoresTable,
-  mastraVectorIndexesTable,
-  mastraVectorsTable,
-  mastraDocumentsTable,
-} from '@mastra/convex/schema';
+```typescript
+import { ConvexNativeVector } from '@mastra/convex';
 
-export default defineSchema({
-  mastra_threads: mastraThreadsTable,
-  mastra_messages: mastraMessagesTable,
-  mastra_resources: mastraResourcesTable,
-  mastra_workflow_snapshots: mastraWorkflowSnapshotsTable,
-  mastra_scorers: mastraScoresTable,
-  mastra_vector_indexes: mastraVectorIndexesTable,
-  mastra_vectors: mastraVectorsTable,
-  mastra_documents: mastraDocumentsTable,
-});
-```
-
-### 3. Create the storage handler
-
-In `convex/mastra/storage.ts`:
-
-```ts
-import { mastraStorage } from '@mastra/convex/server';
-
-export const handle = mastraStorage;
-```
-
-### 4. Deploy to Convex
-
-```bash
-npx convex dev
-# or for production
-npx convex deploy
-```
-
-### 5. Use in Mastra
-
-```ts
-import { ConvexStore } from '@mastra/convex';
-
-const storage = new ConvexStore({
-  id: 'convex',
-  deploymentUrl: process.env.CONVEX_URL!,
-  adminAuthToken: process.env.CONVEX_ADMIN_KEY!,
-  storageFunction: 'mastra/storage:handle', // default
-});
-```
-
-For vectors:
-
-```ts
-import { ConvexVector } from '@mastra/convex';
-
-const vector = new ConvexVector({
+const vectorStore = new ConvexNativeVector({
   id: 'convex-vectors',
   deploymentUrl: process.env.CONVEX_URL!,
   adminAuthToken: process.env.CONVEX_ADMIN_KEY!,
 });
+
+await vectorStore.createIndex({ indexName: 'documents', dimension: 1536 });
 ```
 
-## Architecture
+## Documentation
 
-This adapter uses **typed Convex tables** for each Mastra domain:
+- [Convex integration guide](https://mastra.ai/integrations/databases/convex)
+- [Convex vector reference](https://mastra.ai/reference/vectors/convex)
 
-| Domain         | Convex Table                | Purpose              |
-| -------------- | --------------------------- | -------------------- |
-| Threads        | `mastra_threads`            | Conversation threads |
-| Messages       | `mastra_messages`           | Chat messages        |
-| Resources      | `mastra_resources`          | User working memory  |
-| Workflows      | `mastra_workflow_snapshots` | Workflow state       |
-| Scorers        | `mastra_scorers`            | Evaluation data      |
-| Vector Indexes | `mastra_vector_indexes`     | Index metadata       |
-| Vectors        | `mastra_vectors`            | Embeddings           |
-| Fallback       | `mastra_documents`          | Unknown tables       |
+## Changelog
 
-All typed tables include:
+See the [package changelog](https://github.com/mastra-ai/mastra/blob/main/stores/convex/CHANGELOG.md) for version history and release notes.
 
-- An `id` field for Mastra's record ID (distinct from Convex's auto-generated `_id`)
-- A `by_record_id` index for efficient lookups by Mastra ID
+## Support
 
-## Testing
-
-Set the following environment variables before running tests:
-
-- `CONVEX_TEST_URL` – the Convex deployment URL (e.g., `https://your-name.convex.cloud`)
-- `CONVEX_TEST_ADMIN_KEY` – an admin token for that deployment
-- `CONVEX_TEST_STORAGE_FUNCTION` _(optional)_ – override if you mounted `mastraStorage` elsewhere
-
-```bash
-pnpm --filter @mastra/convex test
-```
-
-## Status
-
-Experimental – expect breaking changes while the adapter matures.
+We have an [open community Discord](https://discord.gg/mastra-ai). Come and say hello and let us know if you have any questions or need any help getting things running.

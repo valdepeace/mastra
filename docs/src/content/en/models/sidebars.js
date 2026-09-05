@@ -10,15 +10,19 @@ const sidebars = {
     'index',
     'embeddings',
     {
+      type: 'doc',
+      id: 'environment-variables',
+      label: 'Environment Variables',
+    },
+    {
       type: 'category',
       label: 'Gateways',
       collapsed: false,
+      link: {
+        type: 'doc',
+        id: 'gateways/index',
+      },
       items: [
-        {
-          type: 'doc',
-          id: 'gateways/index',
-          label: 'Gateways',
-        },
         {
           type: 'doc',
           id: 'gateways/custom-gateways',
@@ -33,6 +37,16 @@ const sidebars = {
           type: 'doc',
           id: 'gateways/mastra',
           label: 'Mastra',
+        },
+        {
+          type: 'doc',
+          id: 'gateways/merge-gateway',
+          label: 'Merge Gateway',
+        },
+        {
+          type: 'doc',
+          id: 'gateways/neon',
+          label: 'Neon',
         },
         {
           type: 'doc',
@@ -55,12 +69,11 @@ const sidebars = {
       type: 'category',
       label: 'Providers',
       collapsed: false,
+      link: {
+        type: 'doc',
+        id: 'providers/index',
+      },
       items: [
-        {
-          type: 'doc',
-          id: 'providers/index',
-          label: 'Providers',
-        },
         {
           type: 'doc',
           id: 'providers/openai',
@@ -113,8 +126,43 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/above',
+          label: 'above.dev',
+        },
+        {
+          type: 'doc',
+          id: 'providers/agentrouter',
+          label: 'AgentRouter',
+        },
+        {
+          type: 'doc',
+          id: 'providers/agnes',
+          label: 'Agnes AI',
+        },
+        {
+          type: 'doc',
+          id: 'providers/ai-router',
+          label: 'AI-ROUTER',
+        },
+        {
+          type: 'doc',
+          id: 'providers/aiand',
+          label: 'ai&',
+        },
+        {
+          type: 'doc',
           id: 'providers/aihubmix',
           label: 'AIHubMix',
+        },
+        {
+          type: 'doc',
+          id: 'providers/aixy',
+          label: 'Aixy',
+        },
+        {
+          type: 'doc',
+          id: 'providers/aki-io',
+          label: 'AKI.IO',
         },
         {
           type: 'doc',
@@ -138,8 +186,48 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/alibaba-token-plan',
+          label: 'Alibaba Token Plan',
+        },
+        {
+          type: 'doc',
+          id: 'providers/alibaba-token-plan-cn',
+          label: 'Alibaba Token Plan (China)',
+        },
+        {
+          type: 'doc',
           id: 'providers/amazon-bedrock',
           label: 'Amazon Bedrock',
+        },
+        {
+          type: 'doc',
+          id: 'providers/ambient',
+          label: 'Ambient',
+        },
+        {
+          type: 'doc',
+          id: 'providers/amd',
+          label: 'AMD',
+        },
+        {
+          type: 'doc',
+          id: 'providers/anyapi',
+          label: 'AnyAPI',
+        },
+        {
+          type: 'doc',
+          id: 'providers/arcee',
+          label: 'Arcee',
+        },
+        {
+          type: 'doc',
+          id: 'providers/atomic-chat',
+          label: 'Atomic Chat',
+        },
+        {
+          type: 'doc',
+          id: 'providers/auriko',
+          label: 'Auriko',
         },
         {
           type: 'doc',
@@ -163,8 +251,23 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/blueclaw',
+          label: 'Blue Claw',
+        },
+        {
+          type: 'doc',
+          id: 'providers/bothub',
+          label: 'Bothub',
+        },
+        {
+          type: 'doc',
           id: 'providers/cerebras',
           label: 'Cerebras',
+        },
+        {
+          type: 'doc',
+          id: 'providers/hyper',
+          label: 'Charm Hyper',
         },
         {
           type: 'doc',
@@ -175,6 +278,16 @@ const sidebars = {
           type: 'doc',
           id: 'providers/clarifai',
           label: 'Clarifai',
+        },
+        {
+          type: 'doc',
+          id: 'providers/claudinio',
+          label: 'Claudinio',
+        },
+        {
+          type: 'doc',
+          id: 'providers/cline-pass',
+          label: 'ClinePass',
         },
         {
           type: 'doc',
@@ -198,8 +311,28 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/coralbricks',
+          label: 'CoralBricks',
+        },
+        {
+          type: 'doc',
           id: 'providers/cortecs',
           label: 'Cortecs',
+        },
+        {
+          type: 'doc',
+          id: 'providers/crof',
+          label: 'CrofAI',
+        },
+        {
+          type: 'doc',
+          id: 'providers/crossmodel',
+          label: 'CrossModel',
+        },
+        {
+          type: 'doc',
+          id: 'providers/crusoe',
+          label: 'Crusoe',
         },
         {
           type: 'doc',
@@ -208,8 +341,23 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/daoxe',
+          label: 'DaoXE',
+        },
+        {
+          type: 'doc',
+          id: 'providers/databricks',
+          label: 'Databricks',
+        },
+        {
+          type: 'doc',
           id: 'providers/deepinfra',
           label: 'Deep Infra',
+        },
+        {
+          type: 'doc',
+          id: 'providers/llmgateway',
+          label: 'DevPass (LLM Gateway)',
         },
         {
           type: 'doc',
@@ -220,6 +368,26 @@ const sidebars = {
           type: 'doc',
           id: 'providers/dinference',
           label: 'DInference',
+        },
+        {
+          type: 'doc',
+          id: 'providers/ebcloud',
+          label: 'EBCloud',
+        },
+        {
+          type: 'doc',
+          id: 'providers/echo',
+          label: 'Echo',
+        },
+        {
+          type: 'doc',
+          id: 'providers/edenai',
+          label: 'Eden AI',
+        },
+        {
+          type: 'doc',
+          id: 'providers/empiriolabs',
+          label: 'EmpirioLabs AI',
         },
         {
           type: 'doc',
@@ -238,6 +406,11 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/freemodel',
+          label: 'FreeModel',
+        },
+        {
+          type: 'doc',
           id: 'providers/friendli',
           label: 'Friendli',
         },
@@ -248,8 +421,8 @@ const sidebars = {
         },
         {
           type: 'doc',
-          id: 'providers/github-models',
-          label: 'GitHub Models',
+          id: 'providers/gmicloud',
+          label: 'GMI Cloud',
         },
         {
           type: 'doc',
@@ -258,8 +431,18 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/greenpt',
+          label: 'GreenPT',
+        },
+        {
+          type: 'doc',
           id: 'providers/helicone',
           label: 'Helicone',
+        },
+        {
+          type: 'doc',
+          id: 'providers/hetzner',
+          label: 'Hetzner',
         },
         {
           type: 'doc',
@@ -278,8 +461,18 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/impossibl',
+          label: 'Impossibl',
+        },
+        {
+          type: 'doc',
           id: 'providers/inception',
           label: 'Inception',
+        },
+        {
+          type: 'doc',
+          id: 'providers/inceptron',
+          label: 'Inceptron',
         },
         {
           type: 'doc',
@@ -288,13 +481,38 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/inferx',
+          label: 'InferX',
+        },
+        {
+          type: 'doc',
+          id: 'providers/infomaniak',
+          label: 'Infomaniak',
+        },
+        {
+          type: 'doc',
           id: 'providers/io-net',
           label: 'IO.NET',
         },
         {
           type: 'doc',
+          id: 'providers/iteracompute',
+          label: 'IteraCompute',
+        },
+        {
+          type: 'doc',
+          id: 'providers/jalapeno',
+          label: 'Jalapeno Cloud',
+        },
+        {
+          type: 'doc',
           id: 'providers/jiekou',
           label: 'Jiekou.AI',
+        },
+        {
+          type: 'doc',
+          id: 'providers/kenari',
+          label: 'Kenari',
         },
         {
           type: 'doc',
@@ -308,8 +526,13 @@ const sidebars = {
         },
         {
           type: 'doc',
-          id: 'providers/kiro',
-          label: 'Kiro',
+          id: 'providers/klokintegration',
+          label: 'klokintegration.se',
+        },
+        {
+          type: 'doc',
+          id: 'providers/kosmik',
+          label: 'Kosmik Compute',
         },
         {
           type: 'doc',
@@ -318,13 +541,28 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/lilac',
+          label: 'Lilac',
+        },
+        {
+          type: 'doc',
           id: 'providers/llama',
           label: 'Llama',
         },
         {
           type: 'doc',
-          id: 'providers/llmgateway',
+          id: 'providers/llmgateway-providers',
           label: 'LLM Gateway',
+        },
+        {
+          type: 'doc',
+          id: 'providers/llmtech',
+          label: 'LLM Tech',
+        },
+        {
+          type: 'doc',
+          id: 'providers/llmtr',
+          label: 'LLMTR',
         },
         {
           type: 'doc',
@@ -333,13 +571,28 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/longcat',
+          label: 'LongCat',
+        },
+        {
+          type: 'doc',
           id: 'providers/lucidquery',
-          label: 'LucidQuery AI',
+          label: 'LucidQuery',
+        },
+        {
+          type: 'doc',
+          id: 'providers/lynkr',
+          label: 'Lynkr',
         },
         {
           type: 'doc',
           id: 'providers/meganova',
           label: 'Meganova',
+        },
+        {
+          type: 'doc',
+          id: 'providers/meta',
+          label: 'Meta',
         },
         {
           type: 'doc',
@@ -354,12 +607,12 @@ const sidebars = {
         {
           type: 'doc',
           id: 'providers/minimax-coding-plan',
-          label: 'MiniMax Coding Plan (minimax.io)',
+          label: 'MiniMax Token Plan (minimax.io)',
         },
         {
           type: 'doc',
           id: 'providers/minimax-cn-coding-plan',
-          label: 'MiniMax Coding Plan (minimaxi.com)',
+          label: 'MiniMax Token Plan (minimaxi.com)',
         },
         {
           type: 'doc',
@@ -370,6 +623,21 @@ const sidebars = {
           type: 'doc',
           id: 'providers/moark',
           label: 'Moark',
+        },
+        {
+          type: 'doc',
+          id: 'providers/modal',
+          label: 'Modal',
+        },
+        {
+          type: 'doc',
+          id: 'providers/model-oracle-ai',
+          label: 'Model Oracle AI',
+        },
+        {
+          type: 'doc',
+          id: 'providers/modelis',
+          label: 'Modelis',
         },
         {
           type: 'doc',
@@ -393,13 +661,28 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/nan',
+          label: 'NaN',
+        },
+        {
+          type: 'doc',
           id: 'providers/nano-gpt',
           label: 'NanoGPT',
         },
         {
           type: 'doc',
+          id: 'providers/nearai',
+          label: 'NEAR AI Cloud',
+        },
+        {
+          type: 'doc',
           id: 'providers/nebius',
           label: 'Nebius Token Factory',
+        },
+        {
+          type: 'doc',
+          id: 'providers/neosmith',
+          label: 'NeoSmith',
         },
         {
           type: 'doc',
@@ -423,6 +706,11 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/ofox',
+          label: 'Ofox',
+        },
+        {
+          type: 'doc',
           id: 'providers/ollama',
           label: 'Ollama',
         },
@@ -443,8 +731,28 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/openreason',
+          label: 'OpenReason',
+        },
+        {
+          type: 'doc',
+          id: 'providers/opper',
+          label: 'Opper',
+        },
+        {
+          type: 'doc',
+          id: 'providers/orcarouter',
+          label: 'OrcaRouter',
+        },
+        {
+          type: 'doc',
           id: 'providers/ovhcloud',
           label: 'OVHcloud AI Endpoints',
+        },
+        {
+          type: 'doc',
+          id: 'providers/pendra',
+          label: 'Pendra',
         },
         {
           type: 'doc',
@@ -458,8 +766,18 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/pioneer',
+          label: 'Pioneer',
+        },
+        {
+          type: 'doc',
           id: 'providers/poe',
           label: 'Poe',
+        },
+        {
+          type: 'doc',
+          id: 'providers/poolside',
+          label: 'Poolside',
         },
         {
           type: 'doc',
@@ -478,6 +796,11 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/qvac',
+          label: 'QVAC',
+        },
+        {
+          type: 'doc',
           id: 'providers/regolo-ai',
           label: 'Regolo AI',
         },
@@ -488,8 +811,43 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/routing-run',
+          label: 'routing.run',
+        },
+        {
+          type: 'doc',
+          id: 'providers/runinfra',
+          label: 'RunInfra',
+        },
+        {
+          type: 'doc',
+          id: 'providers/sakana',
+          label: 'Sakana AI',
+        },
+        {
+          type: 'doc',
+          id: 'providers/sarvam',
+          label: 'Sarvam AI',
+        },
+        {
+          type: 'doc',
           id: 'providers/scaleway',
           label: 'Scaleway',
+        },
+        {
+          type: 'doc',
+          id: 'providers/scnet-token-plan',
+          label: 'SCNet Token Plan',
+        },
+        {
+          type: 'doc',
+          id: 'providers/scx-ai',
+          label: 'SCX.ai',
+        },
+        {
+          type: 'doc',
+          id: 'providers/sensenova',
+          label: 'SenseNova (China)',
         },
         {
           type: 'doc',
@@ -503,13 +861,43 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/snowflake-cortex',
+          label: 'Snowflake Cortex',
+        },
+        {
+          type: 'doc',
           id: 'providers/stackit',
           label: 'STACKIT',
         },
         {
           type: 'doc',
+          id: 'providers/standardcompute',
+          label: 'Standard Compute',
+        },
+        {
+          type: 'doc',
           id: 'providers/stepfun',
-          label: 'StepFun',
+          label: 'StepFun (China)',
+        },
+        {
+          type: 'doc',
+          id: 'providers/stepfun-ai',
+          label: 'StepFun (Global)',
+        },
+        {
+          type: 'doc',
+          id: 'providers/stepfun-step-plan',
+          label: 'StepFun Step Plan (China)',
+        },
+        {
+          type: 'doc',
+          id: 'providers/stepfun-ai-step-plan',
+          label: 'StepFun Step Plan (Global)',
+        },
+        {
+          type: 'doc',
+          id: 'providers/subconscious',
+          label: 'Subconscious',
         },
         {
           type: 'doc',
@@ -528,8 +916,18 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/tencent-token-plan',
+          label: 'Tencent Token Plan',
+        },
+        {
+          type: 'doc',
           id: 'providers/tencent-tokenhub',
           label: 'Tencent TokenHub',
+        },
+        {
+          type: 'doc',
+          id: 'providers/tensorx',
+          label: 'TensorX',
         },
         {
           type: 'doc',
@@ -538,8 +936,48 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/thinkingmachines',
+          label: 'Thinking Machines',
+        },
+        {
+          type: 'doc',
+          id: 'providers/tinfoil',
+          label: 'Tinfoil',
+        },
+        {
+          type: 'doc',
           id: 'providers/togetherai',
           label: 'Together AI',
+        },
+        {
+          type: 'doc',
+          id: 'providers/tokengo',
+          label: 'TokenGo',
+        },
+        {
+          type: 'doc',
+          id: 'providers/tokenrouter',
+          label: 'TokenRouter',
+        },
+        {
+          type: 'doc',
+          id: 'providers/trustedrouter',
+          label: 'TrustedRouter',
+        },
+        {
+          type: 'doc',
+          id: 'providers/umans-ai',
+          label: 'Umans AI',
+        },
+        {
+          type: 'doc',
+          id: 'providers/umans-ai-coding-plan',
+          label: 'Umans AI Coding Plan',
+        },
+        {
+          type: 'doc',
+          id: 'providers/unorouter',
+          label: 'UnoRouter',
         },
         {
           type: 'doc',
@@ -548,8 +986,23 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/vancine',
+          label: 'Vancine',
+        },
+        {
+          type: 'doc',
           id: 'providers/vivgrid',
           label: 'Vivgrid',
+        },
+        {
+          type: 'doc',
+          id: 'providers/volcengine',
+          label: 'Volcengine Ark',
+        },
+        {
+          type: 'doc',
+          id: 'providers/volcengine-coding-plan',
+          label: 'Volcengine Ark Coding Plan',
         },
         {
           type: 'doc',
@@ -588,6 +1041,11 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'providers/xpersona',
+          label: 'Xpersona',
+        },
+        {
+          type: 'doc',
           id: 'providers/zai',
           label: 'Z.AI',
         },
@@ -595,6 +1053,16 @@ const sidebars = {
           type: 'doc',
           id: 'providers/zai-coding-plan',
           label: 'Z.AI Coding Plan',
+        },
+        {
+          type: 'doc',
+          id: 'providers/zeldoc',
+          label: 'Zeldoc',
+        },
+        {
+          type: 'doc',
+          id: 'providers/zenifra',
+          label: 'Zenifra',
         },
         {
           type: 'doc',

@@ -1,6 +1,6 @@
 ---
 title: "Reference: AgentBrowser class | Browser"
-description: "API reference for AgentBrowser, a deterministic browser automation provider using accessibility tree snapshots and element refs."
+description: "The AgentBrowser class provides deterministic browser automation using the agent-browser library."
 packages:
   - "@mastra/agent-browser"
 ---
@@ -28,7 +28,7 @@ export const browserAgent = new Agent({
   name: 'Browser Agent',
   instructions: `You can browse the web. Use browser_snapshot to see the page structure,
 then interact with elements using their refs (e.g., @e5).`,
-  model: 'openai/gpt-5.4',
+  model: '__GATEWAY_OPENAI_MODEL__',
   browser,
 })
 ```
@@ -46,8 +46,8 @@ then interact with elements using their refs (e.g., @e5).`,
   },
   {
     name: 'viewport',
-    type: '{ width: number; height: number }',
-    description: 'Browser viewport dimensions.',
+    type: "{ width: number; height: number } | 'window'",
+    description: "Browser viewport dimensions, or 'window' to match the real browser window instead of a fixed size.",
     isOptional: true,
     defaultValue: '{ width: 1280, height: 720 }',
   },
@@ -90,12 +90,28 @@ then interact with elements using their refs (e.g., @e5).`,
     description: 'Configuration for streaming browser frames to Studio.',
     isOptional: true,
   },
+  {
+    name: 'recording',
+    type: 'BrowserRecordingOptions',
+    description:
+      'Beta option for adding browser recording tools. Provide outputDir to add browser_record and browser_record_caption to the toolset. You can also set maxDurationMs, maxWidth, and maxHeight as defaults for every recording.',
+    isOptional: true,
+  },
+  {
+    name: 'excludeTools',
+    type: 'BrowserToolName[]',
+    description:
+      'Tool names to exclude from the browser toolset. Use this to disable specific tools for models that do not support certain capabilities, such as vision.',
+    isOptional: true,
+  },
 ]}
 />
 
 ## Tools
 
-`AgentBrowser` provides 15 deterministic tools for browser automation. All tools that interact with elements use refs from the accessibility tree snapshot.
+`AgentBrowser` provides 16 deterministic tools for browser automation. All tools that interact with elements use refs from the accessibility tree snapshot.
+
+When `recording` is configured, `AgentBrowser` also adds the Beta `browser_record` and `browser_record_caption` tools. See [Browser recording (Beta)](/docs/browser#record-browser-sessions).
 
 ### Core tools
 
@@ -108,6 +124,7 @@ then interact with elements using their refs (e.g., @e5).`,
 | `browser_press` | Press keyboard keys |
 | `browser_select` | Select option from dropdown |
 | `browser_scroll` | Scroll the page or element |
+| `browser_screenshot` | Capture a screenshot as PNG (viewport by default; set `fullPage: true` for full page) |
 | `browser_close` | Close the browser |
 
 ### Extended tools
@@ -121,6 +138,14 @@ then interact with elements using their refs (e.g., @e5).`,
 | `browser_tabs` | Manage browser tabs (list, new, switch, close) |
 | `browser_drag` | Drag and drop elements |
 | `browser_evaluate` | Execute JavaScript in the page (escape hatch) |
+
+To exclude specific tools, pass `excludeTools` in the constructor:
+
+```typescript
+const browser = new AgentBrowser({
+  excludeTools: ['browser_screenshot'],
+})
+```
 
 ## Tool reference
 
@@ -139,7 +164,7 @@ Navigate to a URL.
 
 | Parameter | Type | Description |
 | - | - | - |
-| `url` | `string` | URL to navigate to |
+| `url` | `string` | URL to open |
 | `waitUntil` | `"load" \| "domcontentloaded" \| "networkidle"` | When to consider navigation complete (optional) |
 | `timeout` | `number` | Navigation timeout in ms (optional) |
 
@@ -388,6 +413,22 @@ Execute JavaScript in the page context. Use as an escape hatch when other tools 
 | `script` | `string` | JavaScript to execute (required) |
 | `returnValue` | `boolean` | Whether to return the result (optional) |
 
+### `browser_screenshot`
+
+Capture a screenshot of the current page as PNG (viewport by default. Set `fullPage: true` for full-page capture). Returns image content that vision-capable models can interpret directly. Use `browser_snapshot` when you only need text or structured data.
+
+```text
+// Viewport only (default)
+{}
+
+// Full scrollable page
+{ "fullPage": true }
+```
+
+| Parameter | Type | Description |
+| - | - | - |
+| `fullPage` | `boolean` | Capture the full scrollable page instead of only the viewport (optional, default: false) |
+
 ### `browser_close`
 
 Close the browser and clean up resources.
@@ -420,5 +461,5 @@ The `browser_snapshot` tool returns an accessibility tree with element refs like
 
 - [MastraBrowser](/reference/browser/mastra-browser): Base class reference
 - [StagehandBrowser](/reference/browser/stagehand-browser): AI-powered alternative
-- [Browser overview](/docs/browser/overview): Conceptual guide
-- [agent-browser guide](/docs/browser/agent-browser): Usage guide
+- [Browser overview](/docs/browser): Conceptual guide
+- [agent-browser guide](/integrations/browsers/agent-browser): Usage guide

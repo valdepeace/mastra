@@ -1,5 +1,6 @@
-import type { CreateStoredAgentParams } from '@mastra/client-js';
-import { toast } from '@mastra/playground-ui';
+import { MastraClientError, type CreateStoredAgentParams } from '@mastra/client-js';
+import type { AgentEditorConfig } from '@mastra/core/agent';
+import { toast } from '@mastra/playground-ui/utils/toast';
 import { useMastraClient } from '@mastra/react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useEffectEvent, useMemo, useState } from 'react';
@@ -16,7 +17,18 @@ import {
 import { collectMCPClientIds } from '../utils/collect-mcp-client-ids';
 import { computeAgentInitialValues } from '../utils/compute-agent-initial-values';
 import type { AgentDataSource } from '../utils/compute-agent-initial-values';
+import { getEditorOwnership } from '../utils/editor-ownership';
+import {
+  EMPTY_RUNTIME_INSTRUCTIONS_MESSAGE,
+  formatUnpublishedPromptBlocksMessage,
+  formatUnknownPromptBlocksMessage,
+  formatUnresolvedPromptBlocksMessage,
+  instructionsResolveEmptyDueToDrafts,
+  type PromptBlockPublicationStatus,
+  type UnresolvedPromptBlock,
+} from '../utils/instruction-blocks-runtime';
 import { useStoredAgentMutations } from './use-stored-agents';
+import { usePlaygroundStore } from '@/store/playground-store';
 
 type CreateOptions = {
   mode: 'create';
@@ -31,6 +43,9 @@ type EditOptions = {
   isCodeAgentOverride?: boolean;
   /** True when a stored override record already exists for this code agent */
   hasStoredOverride?: boolean;
+  /** Editor config from the code agent definition — controls which fields are owned by the user vs code */
+  editorConfig?: AgentEditorConfig;
+  saveSuccessMessage?: string;
   onSuccess: (agentId: string) => void;
 };
 
@@ -39,6 +54,7 @@ export type UseAgentCmsFormOptions = CreateOptions | EditOptions;
 export function useAgentCmsForm(options: UseAgentCmsFormOptions) {
   const client = useMastraClient();
   const queryClient = useQueryClient();
+  const { requestContext } = usePlaygroundStore();
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isSavingDraft, setIsSavingDraft] = useState(false);
 
@@ -46,6 +62,11 @@ export function useAgentCmsForm(options: UseAgentCmsFormOptions) {
   const agentId = isEdit ? options.agentId : undefined;
   const isCodeAgentOverride = isEdit && !!options.isCodeAgentOverride;
   const hasStoredOverride = isEdit && !!options.hasStoredOverride;
+  const editorConfig = isEdit ? options.editorConfig : undefined;
+
+  // Derive which fields are owned by the user (vs by code). See getEditorOwnership for the rules —
+  // they mirror the server's getCodeAgentOwnership, which strips unowned fields on save.
+  const { ownsInstructions, ownsTools, ownsToolDescriptions } = getEditorOwnership(isCodeAgentOverride, editorConfig);
 
   // Track whether we've already created a stored override for a code agent in this session
   const [overrideCreated, setOverrideCreated] = useState(false);
@@ -137,17 +158,30 @@ export function useAgentCmsForm(options: UseAgentCmsFormOptions) {
           }),
         );
 
+        // Only send fields the user actually owns. The server will also strip
+        // unowned fields as a defense-in-depth measure, but doing it here too
+        // avoids sending empty/stale payloads on every save.
         return {
           // name and model are required by the create schema — pass the code agent's values through.
           // applyStoredOverrides will NOT apply these fields for code agent overrides.
           name: values.name,
           model: values.model,
-          // Only send editable fields: instructions, tools, integrationTools, and variables (requestContextSchema)
-          instructions: mapInstructionBlocksToApi(values.instructionBlocks),
-          tools: Object.keys(registryTools).length > 0 ? registryTools : {},
-          integrationTools: transformIntegrationToolsForApi(values.integrationTools),
-          mcpClients: mcpClientsParam,
+          // Variables (requestContextSchema) are always editable for code agents.
           requestContextSchema: values.variables ? Object.fromEntries(Object.entries(values.variables)) : undefined,
+          // Instructions: when the user owns them, send the edited blocks.
+          // When they don't, still send an empty array (CREATE schema requires it),
+          // the server drops it for unowned fields based on editorConfig.
+          instructions: ownsInstructions ? mapInstructionBlocksToApi(values.instructionBlocks) : [],
+          // Tools: send when the user owns membership OR descriptions.
+          // Server enforces what gets persisted (and rejects membership changes
+          // in descriptions-only mode).
+          ...(ownsTools || ownsToolDescriptions
+            ? {
+                tools: Object.keys(registryTools).length > 0 ? registryTools : {},
+                integrationTools: transformIntegrationToolsForApi(values.integrationTools),
+                mcpClients: mcpClientsParam,
+              }
+            : {}),
         };
       }
 
@@ -198,7 +232,7 @@ export function useAgentCmsForm(options: UseAgentCmsFormOptions) {
         requestContextSchema: values.variables ? Object.fromEntries(Object.entries(values.variables)) : undefined,
       };
     },
-    [isEdit, isCodeAgentOverride, client],
+    [isEdit, isCodeAgentOverride, ownsInstructions, ownsTools, ownsToolDescriptions, client],
   );
 
   const buildMemoryParams = useCallback((values: AgentFormValues) => {
@@ -222,6 +256,71 @@ export function useAgentCmsForm(options: UseAgentCmsFormOptions) {
     };
   }, []);
 
+  const blocksWouldPreventSave = useCallback(
+    async (values: AgentFormValues): Promise<boolean> => {
+      if (isCodeAgentOverride && !ownsInstructions) return false;
+
+      const refIds = Array.from(
+        new Set(
+          (values.instructionBlocks ?? [])
+            .filter(block => block.type === 'prompt_block_ref')
+            .map(block => block.promptBlockId.trim())
+            .filter(Boolean),
+        ),
+      );
+      if (refIds.length === 0) return false;
+
+      const publicationStatuses = new Map<string, PromptBlockPublicationStatus>();
+      const unresolvedBlocks: UnresolvedPromptBlock[] = [];
+
+      await Promise.all(
+        refIds.map(async id => {
+          try {
+            const details = await client.getStoredPromptBlock(id).details(requestContext);
+            if (!details) {
+              publicationStatuses.set(id, 'unknown');
+              unresolvedBlocks.push({ id, reason: 'not_found' });
+              return;
+            }
+            publicationStatuses.set(id, details.activeVersionId ? 'published' : 'unpublished');
+          } catch (error) {
+            const status = error instanceof MastraClientError ? error.status : undefined;
+            publicationStatuses.set(id, 'unknown');
+            unresolvedBlocks.push({
+              id,
+              reason: status === 404 ? 'not_found' : status === 403 ? 'forbidden' : 'request_failed',
+            });
+          }
+        }),
+      );
+
+      if (unresolvedBlocks.length > 0) {
+        toast.error(formatUnresolvedPromptBlocksMessage(unresolvedBlocks));
+        return true;
+      }
+
+      const unpublishedIds = refIds.filter(id => publicationStatuses.get(id) === 'unpublished');
+      if (unpublishedIds.length > 0) {
+        toast.error(formatUnpublishedPromptBlocksMessage(unpublishedIds));
+        return true;
+      }
+
+      const runtimeResult = instructionsResolveEmptyDueToDrafts(values.instructionBlocks, publicationStatuses);
+      if (runtimeResult.type === 'unknown') {
+        toast.error(formatUnknownPromptBlocksMessage(runtimeResult.ids));
+        return true;
+      }
+
+      if (runtimeResult.type === 'empty') {
+        toast.error(EMPTY_RUNTIME_INSTRUCTIONS_MESSAGE);
+        return true;
+      }
+
+      return false;
+    },
+    [client, isCodeAgentOverride, ownsInstructions, requestContext],
+  );
+
   const handleSaveDraft = useCallback(
     async (changeMessage?: string) => {
       if (!isEdit) return;
@@ -236,15 +335,24 @@ export function useAgentCmsForm(options: UseAgentCmsFormOptions) {
       setIsSavingDraft(true);
 
       try {
+        if (await blocksWouldPreventSave(values)) return;
+
         const sharedParams = await buildSharedParams(values);
         const editMemory = isCodeAgentOverride ? undefined : buildMemoryParams(values);
 
         if (needsCreate) {
-          // First save for a code agent — create the stored override
+          // First save for a code agent — create the stored override.
+          //
+          // The override is staged as an unpublished draft so the code definition keeps
+          // serving traffic until the user explicitly publishes, matching what every
+          // later save does. Code-source editors have no publish step; the server
+          // publishes there regardless, because the save's whole purpose is the
+          // filesystem write and only published entities reach disk.
           const createParams: CreateStoredAgentParams = {
             id: options.agentId,
             ...sharedParams,
             memory: editMemory,
+            autoPublish: false,
           };
           await createStoredAgent.mutateAsync(createParams);
           setOverrideCreated(true);
@@ -256,12 +364,26 @@ export function useAgentCmsForm(options: UseAgentCmsFormOptions) {
           });
         }
 
-        // Reset form dirty state so publish can detect unsaved changes
-        form.reset(values);
+        // Reset form dirty state so publish can detect unsaved changes.
+        // Pass keepDefaultValues so currently rendered field state (e.g. open tabs,
+        // focused inputs) is preserved — only the dirty flag is cleared.
+        form.reset(values, { keepValues: true });
+        // The version list drives the version dropdown and the published/unpublished
+        // badges, and it is not part of the form dataSource — always refresh it so the
+        // saved version shows up with the right publication state.
         void queryClient.invalidateQueries({ queryKey: ['agent-versions', agentId] });
-        void queryClient.invalidateQueries({ queryKey: ['stored-agent', agentId] });
-        void queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
-        toast.success('Draft saved');
+        // For code-mode overrides we intentionally skip stored-agent / agent query
+        // invalidation: the dataSource reload would cascade through the
+        // resetFormWithData effect and remount the System Prompt tab, which
+        // is jarring. The filesystem write is authoritative for code mode and
+        // the in-memory form already reflects the saved state.
+        if (!isCodeAgentOverride) {
+          void queryClient.invalidateQueries({ queryKey: ['stored-agent', agentId] });
+          void queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
+        }
+        toast.success(
+          options.mode === 'edit' && options.saveSuccessMessage ? options.saveSuccessMessage : 'Draft saved',
+        );
       } catch (error) {
         toast.error(`Failed to save draft: ${error instanceof Error ? error.message : 'Unknown error'}`);
       } finally {
@@ -280,6 +402,7 @@ export function useAgentCmsForm(options: UseAgentCmsFormOptions) {
       createStoredAgent,
       updateStoredAgent,
       queryClient,
+      blocksWouldPreventSave,
     ],
   );
 
@@ -298,6 +421,8 @@ export function useAgentCmsForm(options: UseAgentCmsFormOptions) {
       setIsSubmitting(true);
 
       try {
+        if (!publishVersionId && (await blocksWouldPreventSave(values))) return;
+
         if (isEdit) {
           if (publishVersionId) {
             // Publishing a specific version (e.g. an older read-only version)
@@ -317,7 +442,7 @@ export function useAgentCmsForm(options: UseAgentCmsFormOptions) {
             // Now activate the first version
             const versionsResponse = await client
               .getStoredAgent(options.agentId)
-              .listVersions({ sortDirection: 'DESC', perPage: 1 });
+              .listVersions({ orderBy: { field: 'createdAt', direction: 'DESC' }, perPage: 1 });
             const latestVersion = versionsResponse.versions[0];
             if (latestVersion) {
               await client.getStoredAgent(options.agentId).activateVersion(latestVersion.id);
@@ -326,7 +451,9 @@ export function useAgentCmsForm(options: UseAgentCmsFormOptions) {
             // Check if there's an unpublished draft version to activate
             const [agentDetails, versionsResponse] = await Promise.all([
               client.getStoredAgent(options.agentId).details(),
-              client.getStoredAgent(options.agentId).listVersions({ sortDirection: 'DESC', perPage: 1 }),
+              client
+                .getStoredAgent(options.agentId)
+                .listVersions({ orderBy: { field: 'createdAt', direction: 'DESC' }, perPage: 1 }),
             ]);
 
             const latestVersion = versionsResponse.versions[0];
@@ -388,7 +515,74 @@ export function useAgentCmsForm(options: UseAgentCmsFormOptions) {
       buildSharedParams,
       buildMemoryParams,
       queryClient,
+      blocksWouldPreventSave,
     ],
+  );
+
+  const getAgentExport = useCallback(async () => {
+    if (!isEdit) return;
+
+    const isValid = await form.trigger();
+    if (!isValid) {
+      toast.error('Please fill in all required fields');
+      return;
+    }
+
+    const sharedParams = await buildSharedParams(form.getValues());
+    return client.getStoredAgent(options.agentId).export(sharedParams);
+  }, [buildSharedParams, client, form, isEdit, options]);
+
+  const handleDownloadJson = useCallback(async () => {
+    try {
+      const response = await getAgentExport();
+      if (!response) return;
+
+      const blob = new Blob([response.content], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = response.fileName;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      toast.success('Agent JSON downloaded');
+    } catch (error) {
+      toast.error(`Failed to download JSON: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }, [getAgentExport]);
+
+  const handleOpenPr = useCallback(
+    async ({ platformApiEndpoint, projectId }: { platformApiEndpoint: string; projectId: string }) => {
+      if (!isEdit) return;
+
+      try {
+        const response = await getAgentExport();
+        if (!response) return;
+
+        const apiEndpoint = platformApiEndpoint.replace(/\/$/, '');
+        const prResponse = await fetch(`${apiEndpoint}/v1/server/projects/${projectId}/agent-overrides/pr`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            agentId: response.agentId,
+            fileName: response.fileName,
+            content: response.content,
+          }),
+        });
+
+        if (!prResponse.ok) {
+          const message = await prResponse.text();
+          throw new Error(message || `Request failed with ${prResponse.status}`);
+        }
+
+        const result = (await prResponse.json()) as { url: string };
+        window.open(result.url, '_blank', 'noopener,noreferrer');
+        toast.success('Pull request opened');
+      } catch (error) {
+        toast.error(`Failed to open PR: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    },
+    [getAgentExport, isEdit],
   );
 
   const watched = useWatch({ control: form.control });
@@ -414,5 +608,15 @@ export function useAgentCmsForm(options: UseAgentCmsFormOptions) {
 
   const isDirty = form.formState.isDirty;
 
-  return { form, handlePublish, handleSaveDraft, isSubmitting, isSavingDraft, canPublish, isDirty };
+  return {
+    form,
+    handlePublish,
+    handleSaveDraft,
+    handleDownloadJson,
+    handleOpenPr,
+    isSubmitting,
+    isSavingDraft,
+    canPublish,
+    isDirty,
+  };
 }

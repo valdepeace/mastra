@@ -1,24 +1,57 @@
 import type { DatasetExperiment, DatasetRecord } from '@mastra/client-js';
-import { Badge, EntityList, EntityListSkeleton } from '@mastra/playground-ui';
+import { Badge } from '@mastra/playground-ui/components/Badge';
+import type { BadgeVariant } from '@mastra/playground-ui/components/Badge';
+import { Button } from '@mastra/playground-ui/components/Button';
+import {
+  DataList as EntityList,
+  DataListSkeleton as EntityListSkeleton,
+  useDataListKeyboard,
+} from '@mastra/playground-ui/components/DataList';
+import { AgentIcon } from '@mastra/playground-ui/icons/AgentIcon';
+import { ProcessorIcon } from '@mastra/playground-ui/icons/ProcessorIcon';
+import { ScorersIcon } from '@mastra/playground-ui/icons/ScorersIcon';
+import { WorkflowIcon } from '@mastra/playground-ui/icons/WorkflowIcon';
 import { useMemo } from 'react';
+import type { DatasetTargetType } from '../target-type-options';
+import { getDatasetTargetTypes, matchesDatasetTargetFilter } from './helpers';
 import { useLinkComponent } from '@/lib/framework';
 
 export interface DatasetsListProps {
   datasets: DatasetRecord[];
   experiments: DatasetExperiment[];
-  reviewByDataset?: Map<string, { needsReview: number; complete: number }>;
   isLoading: boolean;
   search?: string;
   targetFilter?: string;
   experimentFilter?: string;
   tagFilter?: string;
-  currentPage?: number;
-  hasMore?: boolean;
-  onNextPage?: () => void;
-  onPrevPage?: () => void;
+  isFetchingNextPage?: boolean;
+  hasNextPage?: boolean;
+  setEndOfListElement?: (element: HTMLDivElement | null) => void;
 }
 
-const COLUMNS = 'auto 1fr auto auto auto auto auto auto';
+const COLUMNS = 'auto 1fr auto 5rem 9rem 10rem 7rem';
+
+function getExperimentsBadgeVariant(successPct: number | null): BadgeVariant {
+  if (successPct !== null && successPct >= 70) return 'green';
+  if (successPct !== null && successPct >= 40) return 'yellow';
+  return 'red';
+}
+
+function TargetTypeIcon({ type }: { type: DatasetTargetType }) {
+  const className = 'size-3.5 shrink-0 text-neutral2';
+  switch (type) {
+    case 'agent':
+      return <AgentIcon className={className} aria-hidden />;
+    case 'workflow':
+      return <WorkflowIcon className={className} aria-hidden />;
+    case 'scorer':
+      return <ScorersIcon className={className} aria-hidden />;
+    case 'processor':
+      return <ProcessorIcon className={className} aria-hidden />;
+    default:
+      return null;
+  }
+}
 
 function formatDate(dateStr: string | Date | undefined | null): string {
   if (!dateStr) return '—';
@@ -29,18 +62,16 @@ function formatDate(dateStr: string | Date | undefined | null): string {
 export function DatasetsList({
   datasets,
   experiments,
-  reviewByDataset,
   isLoading,
   search = '',
   targetFilter = 'all',
   experimentFilter = 'all',
   tagFilter = 'all',
-  currentPage,
-  hasMore,
-  onNextPage,
-  onPrevPage,
+  isFetchingNextPage,
+  hasNextPage,
+  setEndOfListElement,
 }: DatasetsListProps) {
-  const { paths, navigate, Link } = useLinkComponent();
+  const { paths, Link } = useLinkComponent();
 
   const enrichedDatasets = useMemo(() => {
     return datasets.map(ds => {
@@ -48,7 +79,8 @@ export function DatasetsList({
       const completed = dsExperiments.filter(e => e.status === 'completed').length;
       const total = dsExperiments.length;
       const successPct = total > 0 ? Math.round((completed / total) * 100) : null;
-      return { ...ds, experimentCount: total, successPct };
+      const targetTypes = getDatasetTargetTypes(ds.targetType, dsExperiments);
+      return { ...ds, experimentCount: total, successPct, targetTypes };
     });
   }, [datasets, experiments]);
 
@@ -56,7 +88,7 @@ export function DatasetsList({
     const term = search.toLowerCase();
     return enrichedDatasets.filter(ds => {
       const matchesSearch = !term || ds.name.toLowerCase().includes(term);
-      const matchesTarget = targetFilter === 'all' || ds.targetType === targetFilter;
+      const matchesTarget = matchesDatasetTargetFilter(ds.targetTypes, targetFilter);
       const matchesExperiment =
         experimentFilter === 'all' ||
         (experimentFilter === 'with' && ds.experimentCount > 0) ||
@@ -66,103 +98,93 @@ export function DatasetsList({
     });
   }, [enrichedDatasets, search, targetFilter, experimentFilter, tagFilter]);
 
+  const { containerRef, getRowProps } = useDataListKeyboard({ count: filteredData.length });
+
   if (isLoading) {
     return <EntityListSkeleton columns={COLUMNS} />;
   }
 
   return (
-    <EntityList columns={COLUMNS}>
+    <EntityList columns={COLUMNS} scrollRef={containerRef}>
       <EntityList.Top>
         <EntityList.TopCell>Name</EntityList.TopCell>
         <EntityList.TopCell>Description</EntityList.TopCell>
         <EntityList.TopCell>Tags</EntityList.TopCell>
-        <EntityList.TopCell className="text-center">Version</EntityList.TopCell>
+        <EntityList.TopCell>Version</EntityList.TopCell>
         <EntityList.TopCell>Target</EntityList.TopCell>
-        <EntityList.TopCell className="text-center">Experiments</EntityList.TopCell>
-        <EntityList.TopCell className="text-center">Review</EntityList.TopCell>
         <EntityList.TopCell>Last Updated</EntityList.TopCell>
+        <EntityList.TopCell>Experiments</EntityList.TopCell>
       </EntityList.Top>
 
-      {filteredData.map(ds => {
-        const successBadge =
-          ds.experimentCount > 0 ? (
-            <Badge
-              variant={
-                ds.successPct !== null && ds.successPct >= 70
-                  ? 'success'
-                  : ds.successPct !== null && ds.successPct >= 40
-                    ? 'warning'
-                    : 'error'
-              }
-            >
-              {ds.experimentCount} ({ds.successPct ?? 0}%)
-            </Badge>
-          ) : (
-            <span className="text-neutral2">—</span>
-          );
+      {filteredData.map((ds, index) => {
+        const experimentsBadgeVariant = getExperimentsBadgeVariant(ds.successPct);
+        const tags = Array.isArray(ds.tags) ? ds.tags.filter(tag => typeof tag === 'string') : [];
+        const hasExperimentsAction = ds.experimentCount > 0;
 
         return (
-          <EntityList.RowLink key={ds.id} to={paths.datasetLink(ds.id)} LinkComponent={Link}>
-            <EntityList.NameCell>{ds.name}</EntityList.NameCell>
-            <EntityList.DescriptionCell>{ds.description || ''}</EntityList.DescriptionCell>
-            <EntityList.Cell>
-              {Array.isArray(ds.tags) && ds.tags.length > 0 ? (
-                <div
-                  className="flex max-w-48 items-center gap-1 overflow-hidden"
-                  title={(ds.tags as string[]).join(', ')}
-                >
-                  {(ds.tags as string[]).slice(0, 2).map(tag => (
-                    <Badge key={tag} variant="default" className="shrink-0 px-1.5 py-0 text-[10px]">
-                      {tag}
-                    </Badge>
-                  ))}
-                  {ds.tags.length > 2 && (
-                    <span className="shrink-0 text-[10px] text-neutral2">+{ds.tags.length - 2}</span>
-                  )}
-                </div>
-              ) : (
-                <span className="text-neutral2">—</span>
-              )}
-            </EntityList.Cell>
-            <EntityList.TextCell className="text-center">v{ds.version ?? 1}</EntityList.TextCell>
-            <EntityList.Cell>
-              {ds.targetType ? <Badge variant="info">{ds.targetType}</Badge> : <span className="text-neutral2">—</span>}
-            </EntityList.Cell>
-            <EntityList.Cell className="text-center">{successBadge}</EntityList.Cell>
-            <EntityList.Cell className="text-center">
-              {(() => {
-                const review = reviewByDataset?.get(ds.id);
-                if (!review) return <span className="text-neutral2">—</span>;
-                if (review.needsReview > 0) {
-                  return (
-                    <button
-                      type="button"
-                      onClick={e => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        navigate(`${paths.datasetLink(ds.id)}?tab=review`);
-                      }}
-                      className="inline-flex"
-                    >
-                      <Badge variant="warning" className="cursor-pointer transition-opacity hover:opacity-80">
-                        {review.needsReview} pending
+          <EntityList.RowWrapper key={ds.id}>
+            <EntityList.RowLink
+              colEnd={hasExperimentsAction ? -2 : -1}
+              to={paths.datasetLink(ds.id)}
+              LinkComponent={Link}
+              {...getRowProps(index)}
+            >
+              <EntityList.NameCell>{ds.name}</EntityList.NameCell>
+              <EntityList.DescriptionCell>{ds.description}</EntityList.DescriptionCell>
+              <EntityList.Cell>
+                {tags.length > 0 ? (
+                  <div className="flex max-w-48 items-center gap-1 overflow-hidden" title={tags.join(', ')}>
+                    {tags.slice(0, 2).map(tag => (
+                      <Badge key={tag} size="xs" className="shrink-0">
+                        {tag}
                       </Badge>
-                    </button>
-                  );
-                }
-                return <Badge variant="success">{review.complete} reviewed</Badge>;
-              })()}
-            </EntityList.Cell>
-            <EntityList.TextCell>{formatDate(ds.updatedAt)}</EntityList.TextCell>
-          </EntityList.RowLink>
+                    ))}
+                    {tags.length > 2 && <span className="text-neutral2 shrink-0 text-[10px]">+{tags.length - 2}</span>}
+                  </div>
+                ) : (
+                  <span className="text-neutral2">—</span>
+                )}
+              </EntityList.Cell>
+              <EntityList.TextCell>v{ds.version ?? 1}</EntityList.TextCell>
+              <EntityList.Cell className="text-neutral4 text-ui-smd">
+                {ds.targetTypes.length > 0 ? (
+                  <span className="flex min-w-0 items-center gap-2 overflow-hidden">
+                    {ds.targetTypes.map(type => (
+                      <span key={type} className="flex min-w-0 items-center gap-1 capitalize">
+                        <TargetTypeIcon type={type} />
+                        <span className="truncate">{type}</span>
+                      </span>
+                    ))}
+                  </span>
+                ) : (
+                  <span className="text-neutral2">—</span>
+                )}
+              </EntityList.Cell>
+              <EntityList.TextCell>{formatDate(ds.updatedAt)}</EntityList.TextCell>
+              {hasExperimentsAction ? null : <EntityList.Cell className="justify-center" />}
+            </EntityList.RowLink>
+
+            {hasExperimentsAction ? (
+              <Button
+                as={Link}
+                to={`/experiments?dataset=${ds.id}`}
+                variant="ghost"
+                size="sm"
+                className="h-full w-full rounded-lg p-0!"
+              >
+                <Badge variant={experimentsBadgeVariant} size="sm">
+                  {ds.experimentCount} ({ds.successPct ?? 0}%)
+                </Badge>
+              </Button>
+            ) : null}
+          </EntityList.RowWrapper>
         );
       })}
 
-      <EntityList.Pagination
-        currentPage={currentPage}
-        hasMore={hasMore}
-        onNextPage={onNextPage}
-        onPrevPage={onPrevPage}
+      <EntityList.NextPageLoading
+        isLoading={isFetchingNextPage}
+        hasMore={hasNextPage}
+        setEndOfListElement={setEndOfListElement}
       />
     </EntityList>
   );

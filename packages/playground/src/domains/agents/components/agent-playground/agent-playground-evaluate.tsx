@@ -1,31 +1,19 @@
 import type { DatasetRecord } from '@mastra/client-js';
-import {
-  Badge,
-  Button,
-  Column,
-  Columns,
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogBody,
-  EmptyState,
-  EntityList,
-  EntityListSkeleton,
-  Searchbar,
-  Spinner,
-  StatusBadge,
-  Tabs,
-  TabContent,
-  TabList,
-  Tab,
-  Txt,
-  Icon,
-  toast,
-} from '@mastra/playground-ui';
-import { Database, GaugeIcon, FlaskConical, ChevronLeft, Plus, Paperclip } from 'lucide-react';
+import { Badge } from '@mastra/playground-ui/components/Badge';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { Column, Columns } from '@mastra/playground-ui/components/Columns';
+import { DataList, DataListSkeleton, useDataListKeyboard } from '@mastra/playground-ui/components/DataList';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogBody } from '@mastra/playground-ui/components/Dialog';
+import { EmptyState } from '@mastra/playground-ui/components/EmptyState';
+import { InputGroup, InputGroupAddon, InputGroupInput } from '@mastra/playground-ui/components/InputGroup';
+import { Spinner } from '@mastra/playground-ui/components/Spinner';
+import { Tabs, TabContent, TabList, Tab } from '@mastra/playground-ui/components/Tabs';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { toast } from '@mastra/playground-ui/utils/toast';
+import { Database, GaugeIcon, FlaskConical, ChevronLeft, Plus, Paperclip, SearchIcon } from 'lucide-react';
 import { useState, useMemo, useCallback, useEffect } from 'react';
 import { useWatch } from 'react-hook-form';
+import { useNavigate } from 'react-router';
 import { useAgentEditFormContext } from '../../context/agent-edit-form-context';
 import { useReviewQueue } from '../../context/review-queue-context';
 import { useAgentExperiments } from '../../hooks/use-agent-experiments';
@@ -37,11 +25,11 @@ import { DatasetDetailView } from './dataset-detail-view';
 import { formatVersionLabel } from './format-version-label';
 import { ScorerDetailView } from './scorer-detail-view';
 import { ScorerMiniEditor } from './scorer-mini-editor';
-import { CreateDatasetDialog } from '@/domains/datasets/components/create-dataset-dialog';
 import { GenerateConfigDialog, GenerateReviewDialog } from '@/domains/datasets/components/generate-items-dialog';
 import { useGenerationTasks } from '@/domains/datasets/context/generation-context';
 import { useDatasetMutations } from '@/domains/datasets/hooks/use-dataset-mutations';
 import { useDatasets } from '@/domains/datasets/hooks/use-datasets';
+import { STATUS_LABEL, STATUS_VARIANT } from '@/domains/experiments/components/experiment-columns';
 import { useScorers } from '@/domains/scores/hooks/use-scorers';
 
 type AgentEvalTab = 'experiments' | 'datasets' | 'scorers';
@@ -84,12 +72,10 @@ function formatDate(dateStr: string | Date | undefined | null): string {
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-const STATUS_VARIANT: Record<string, 'success' | 'warning' | 'error' | 'neutral'> = {
-  completed: 'success',
-  running: 'warning',
-  failed: 'error',
-  pending: 'neutral',
-};
+function getExperimentStartedAtTime(startedAt: AgentExperiment['startedAt']): number {
+  if (!startedAt) return 0;
+  return startedAt instanceof Date ? startedAt.getTime() : new Date(startedAt).getTime();
+}
 
 export function AgentPlaygroundEvaluate({
   agentId,
@@ -97,9 +83,9 @@ export function AgentPlaygroundEvaluate({
   pendingScorerItems,
   onPendingScorerItemsConsumed,
 }: AgentPlaygroundEvaluateProps) {
+  const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<AgentEvalTab>('experiments');
   const [detailView, setDetailView] = useState<DetailView>(null);
-  const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [showAttachDialog, setShowAttachDialog] = useState(false);
   const [attachDatasetSearch, setAttachDatasetSearch] = useState('');
   const [showAttachScorerDialog, setShowAttachScorerDialog] = useState(false);
@@ -175,7 +161,8 @@ export function AgentPlaygroundEvaluate({
   });
 
   const datasetExperimentMap = (experiments || []).reduce<Record<string, AgentExperiment>>((acc, exp) => {
-    if (!acc[exp.datasetId] || new Date(exp.startedAt) > new Date(acc[exp.datasetId]!.startedAt)) {
+    const current = acc[exp.datasetId];
+    if (!current || getExperimentStartedAtTime(exp.startedAt) > getExperimentStartedAtTime(current.startedAt)) {
       acc[exp.datasetId] = exp;
     }
     return acc;
@@ -313,8 +300,8 @@ export function AgentPlaygroundEvaluate({
 
   const filteredExperiments = useMemo(() => {
     const exps = [...(experiments || [])].sort((a, b) => {
-      const da = a.startedAt ? new Date(a.startedAt as string).getTime() : 0;
-      const db = b.startedAt ? new Date(b.startedAt as string).getTime() : 0;
+      const da = getExperimentStartedAtTime(a.startedAt);
+      const db = getExperimentStartedAtTime(b.startedAt);
       return db - da;
     });
     if (!experimentsSearch) return exps;
@@ -346,6 +333,16 @@ export function AgentPlaygroundEvaluate({
     });
   }, [attachedScorers, scorersSearch]);
 
+  const { containerRef: experimentsContainerRef, getRowProps: getExperimentRowProps } = useDataListKeyboard({
+    count: filteredExperiments.length,
+  });
+  const { containerRef: datasetsContainerRef, getRowProps: getDatasetRowProps } = useDataListKeyboard({
+    count: filteredDatasets.length,
+  });
+  const { containerRef: scorersContainerRef, getRowProps: getScorerRowProps } = useDataListKeyboard({
+    count: filteredScorers.length,
+  });
+
   // Close detail view when switching tabs
   const handleTabChange = useCallback((tab: AgentEvalTab) => {
     setActiveTab(tab);
@@ -358,7 +355,7 @@ export function AgentPlaygroundEvaluate({
     if (!detailView) return null;
 
     const backButton = (label: string, onClick: () => void) => (
-      <div className="flex items-center gap-2 px-4 py-2 border-b border-border1">
+      <div className="border-border1 flex items-center gap-2 border-b px-4 py-2">
         <Button variant="ghost" size="sm" onClick={onClick}>
           <ChevronLeft className="size-4" />
           {label}
@@ -464,7 +461,7 @@ export function AgentPlaygroundEvaluate({
           <Column withLeftSeparator>
             {backButton('Back to Experiments', () => setDetailView(null))}
             <Column.Content>
-              <div className="p-4 text-neutral3">Experiment not found</div>
+              <div className="text-neutral3 p-4">Experiment not found</div>
             </Column.Content>
           </Column>
         );
@@ -491,14 +488,14 @@ export function AgentPlaygroundEvaluate({
 
   function renderExperimentsTab() {
     if (isLoadingExperiments) {
-      return <EntityListSkeleton columns="auto 1fr auto auto auto auto auto" />;
+      return <DataListSkeleton columns="auto minmax(15rem,1fr) auto auto auto auto auto" />;
     }
 
     if (!experiments?.length) {
       return (
         <div className="flex h-full items-center justify-center py-20">
           <EmptyState
-            iconSlot={<FlaskConical className="size-10 text-neutral3" />}
+            iconSlot={<FlaskConical className="text-neutral3 size-10" />}
             titleSlot="No Experiments Yet"
             descriptionSlot="Run experiments against your datasets to see results here."
           />
@@ -507,65 +504,68 @@ export function AgentPlaygroundEvaluate({
     }
 
     return (
-      <EntityList columns="auto 1fr auto auto auto auto auto">
-        <EntityList.Top>
-          <EntityList.TopCell>Experiment</EntityList.TopCell>
-          <EntityList.TopCell>Dataset</EntityList.TopCell>
-          <EntityList.TopCell>Status</EntityList.TopCell>
-          <EntityList.TopCell className="text-center">Items</EntityList.TopCell>
-          <EntityList.TopCell className="text-center">Succeeded</EntityList.TopCell>
-          <EntityList.TopCell className="text-center">Failed</EntityList.TopCell>
-          <EntityList.TopCell>Date</EntityList.TopCell>
-        </EntityList.Top>
+      <DataList
+        columns="auto minmax(15rem,1fr) auto auto auto auto auto"
+        className="min-w-0"
+        scrollRef={experimentsContainerRef}
+      >
+        <DataList.Top>
+          <DataList.TopCell>Experiment</DataList.TopCell>
+          <DataList.TopCell>Dataset</DataList.TopCell>
+          <DataList.TopCell>Status</DataList.TopCell>
+          <DataList.TopCell className="text-center">Items</DataList.TopCell>
+          <DataList.TopCell className="text-center">Processed</DataList.TopCell>
+          <DataList.TopCell className="text-center">Errored</DataList.TopCell>
+          <DataList.TopCell>Date</DataList.TopCell>
+        </DataList.Top>
 
-        {filteredExperiments.map(exp => {
+        {filteredExperiments.map((exp, index) => {
           const dsName = datasetMap.get(exp.datasetId)?.name ?? exp.datasetId.slice(0, 8);
           const status = exp.status ?? 'pending';
           const succeeded = exp.succeededCount ?? 0;
           const failed = exp.failedCount ?? 0;
           const total = exp.totalItems ?? 0;
-          const successPct = total > 0 ? Math.round((succeeded / total) * 100) : 0;
+          const isFeatured = detailView?.type === 'experiment' && detailView.id === exp.id;
 
           return (
-            <EntityList.Row
+            <DataList.RowButton
               key={exp.id}
-              selected={detailView?.type === 'experiment' && detailView.id === exp.id}
+              featured={isFeatured}
               onClick={() => setDetailView({ type: 'experiment', id: exp.id, datasetId: exp.datasetId })}
+              {...getExperimentRowProps(index)}
             >
-              <EntityList.NameCell className="font-mono">{exp.id.slice(0, 8)}</EntityList.NameCell>
-              <EntityList.TextCell>{dsName}</EntityList.TextCell>
-              <EntityList.Cell>
-                <StatusBadge variant={STATUS_VARIANT[status] ?? 'neutral'} withDot>
-                  {status}
-                </StatusBadge>
-              </EntityList.Cell>
-              <EntityList.TextCell className="text-center">{total}</EntityList.TextCell>
-              <EntityList.TextCell className="text-center">
-                <span className={succeeded > 0 ? 'text-accent1' : ''}>
-                  {succeeded} ({successPct}%)
-                </span>
-              </EntityList.TextCell>
-              <EntityList.TextCell className="text-center">
+              <DataList.IdCell id={exp.id} />
+              <DataList.Cell className="min-w-0">
+                <span className="block truncate">{dsName}</span>
+              </DataList.Cell>
+              <DataList.Cell>
+                <Badge variant={STATUS_VARIANT[status] ?? 'neutral'} indicator="dot">
+                  {STATUS_LABEL[status] ?? status}
+                </Badge>
+              </DataList.Cell>
+              <DataList.Cell className="text-center">{total}</DataList.Cell>
+              <DataList.Cell className="text-center">{succeeded}</DataList.Cell>
+              <DataList.Cell className="text-center">
                 <span className={failed > 0 ? 'text-accent2' : ''}>{failed}</span>
-              </EntityList.TextCell>
-              <EntityList.TextCell>{formatDate(exp.startedAt)}</EntityList.TextCell>
-            </EntityList.Row>
+              </DataList.Cell>
+              <DataList.Cell>{formatDate(exp.startedAt)}</DataList.Cell>
+            </DataList.RowButton>
           );
         })}
-      </EntityList>
+      </DataList>
     );
   }
 
   function renderDatasetsTab() {
     if (isLoadingDatasets) {
-      return <EntityListSkeleton columns="auto 1fr auto auto auto" />;
+      return <DataListSkeleton columns="minmax(10rem,1fr) auto auto auto auto" />;
     }
 
     if (!datasets.length) {
       return (
         <div className="flex h-full items-center justify-center py-20">
           <EmptyState
-            iconSlot={<Database className="size-10 text-neutral3" />}
+            iconSlot={<Database className="text-neutral3 size-10" />}
             titleSlot="No Datasets"
             descriptionSlot="Create or attach a dataset to begin testing your agent."
           />
@@ -574,45 +574,47 @@ export function AgentPlaygroundEvaluate({
     }
 
     return (
-      <EntityList columns="auto 1fr auto auto auto">
-        <EntityList.Top>
-          <EntityList.TopCell>Name</EntityList.TopCell>
-          <EntityList.TopCell>Tags</EntityList.TopCell>
-          <EntityList.TopCell>Latest Experiment</EntityList.TopCell>
-          <EntityList.TopCell>Status</EntityList.TopCell>
-          <EntityList.TopCell>Updated</EntityList.TopCell>
-        </EntityList.Top>
+      <DataList columns="minmax(10rem,1fr) auto auto auto auto" className="min-w-0" scrollRef={datasetsContainerRef}>
+        <DataList.Top>
+          <DataList.TopCell>Name</DataList.TopCell>
+          <DataList.TopCell>Tags</DataList.TopCell>
+          <DataList.TopCell>Latest Experiment</DataList.TopCell>
+          <DataList.TopCell>Status</DataList.TopCell>
+          <DataList.TopCell>Updated</DataList.TopCell>
+        </DataList.Top>
 
-        {filteredDatasets.map(ds => {
+        {filteredDatasets.map((ds, index) => {
           const exp = datasetExperimentMap[ds.id];
           const genTask = generationTasks[ds.id];
           const isGenerating = genTask?.status === 'generating';
+          const isFeatured = detailView?.type === 'dataset' && detailView.id === ds.id;
 
           return (
-            <EntityList.Row
+            <DataList.RowButton
               key={ds.id}
-              selected={detailView?.type === 'dataset' && detailView.id === ds.id}
+              featured={isFeatured}
               onClick={() => setDetailView({ type: 'dataset', id: ds.id })}
+              {...getDatasetRowProps(index)}
             >
-              <EntityList.NameCell>{ds.name}</EntityList.NameCell>
-              <EntityList.Cell>
+              <DataList.Cell className="text-neutral4 min-w-0">
+                <span className="block truncate">{ds.name}</span>
+              </DataList.Cell>
+              <DataList.Cell>
                 {ds.tags?.length ? (
                   <div className="flex gap-1">
                     {ds.tags.slice(0, 2).map(tag => (
-                      <Badge key={tag} variant="default">
-                        {tag}
-                      </Badge>
+                      <Badge key={tag}>{tag}</Badge>
                     ))}
-                    {ds.tags.length > 2 && <Badge variant="default">+{ds.tags.length - 2}</Badge>}
+                    {ds.tags.length > 2 && <Badge>+{ds.tags.length - 2}</Badge>}
                   </div>
                 ) : (
                   <span className="text-neutral2">—</span>
                 )}
-              </EntityList.Cell>
-              <EntityList.Cell>
+              </DataList.Cell>
+              <DataList.Cell>
                 {exp ? <ExperimentBadge experiment={exp} /> : <span className="text-neutral2">No experiments</span>}
-              </EntityList.Cell>
-              <EntityList.Cell>
+              </DataList.Cell>
+              <DataList.Cell>
                 {isGenerating ? (
                   <div className="flex items-center gap-1">
                     <Spinner className="size-3" />
@@ -627,25 +629,25 @@ export function AgentPlaygroundEvaluate({
                 ) : (
                   <span className="text-neutral2">—</span>
                 )}
-              </EntityList.Cell>
-              <EntityList.TextCell>{formatDate(ds.updatedAt)}</EntityList.TextCell>
-            </EntityList.Row>
+              </DataList.Cell>
+              <DataList.Cell>{formatDate(ds.updatedAt)}</DataList.Cell>
+            </DataList.RowButton>
           );
         })}
-      </EntityList>
+      </DataList>
     );
   }
 
   function renderScorersTab() {
     if (isLoadingScorers) {
-      return <EntityListSkeleton columns="auto 1fr auto auto" />;
+      return <DataListSkeleton columns="minmax(10rem,1fr) auto auto auto" />;
     }
 
     if (!attachedScorers.length) {
       return (
         <div className="flex h-full items-center justify-center py-20">
           <EmptyState
-            iconSlot={<GaugeIcon className="size-10 text-neutral3" />}
+            iconSlot={<GaugeIcon className="text-neutral3 size-10" />}
             titleSlot="No Scorers Attached"
             descriptionSlot="Attach or create a scorer to evaluate your agent's performance."
           />
@@ -654,15 +656,15 @@ export function AgentPlaygroundEvaluate({
     }
 
     return (
-      <EntityList columns="auto 1fr auto auto">
-        <EntityList.Top>
-          <EntityList.TopCell>Name</EntityList.TopCell>
-          <EntityList.TopCell>Source</EntityList.TopCell>
-          <EntityList.TopCell>Description</EntityList.TopCell>
-          <EntityList.TopCell>Datasets</EntityList.TopCell>
-        </EntityList.Top>
+      <DataList columns="minmax(10rem,1fr) auto auto auto" className="min-w-0" scrollRef={scorersContainerRef}>
+        <DataList.Top>
+          <DataList.TopCell>Name</DataList.TopCell>
+          <DataList.TopCell>Source</DataList.TopCell>
+          <DataList.TopCell>Description</DataList.TopCell>
+          <DataList.TopCell>Datasets</DataList.TopCell>
+        </DataList.Top>
 
-        {filteredScorers.map(([id, scorer]) => {
+        {filteredScorers.map(([id, scorer], index) => {
           const name = scorer.scorer?.name || id;
           const description = scorer.scorer?.description || '';
           const source = scorer.source ?? 'stored';
@@ -670,41 +672,39 @@ export function AgentPlaygroundEvaluate({
             const scorerIds = ds.scorerIds ?? [];
             return scorerIds.includes(id);
           }).length;
+          const isFeatured = detailView?.type === 'scorer' && detailView.id === id;
 
           return (
-            <EntityList.Row
+            <DataList.RowButton
               key={id}
-              selected={detailView?.type === 'scorer' && detailView.id === id}
+              featured={isFeatured}
               onClick={() => setDetailView({ type: 'scorer', id })}
+              {...getScorerRowProps(index)}
             >
-              <EntityList.NameCell>
-                <Icon size="sm" className="text-neutral3 mr-1.5">
-                  <GaugeIcon />
-                </Icon>
-                {name}
-              </EntityList.NameCell>
-              <EntityList.Cell>
-                <Badge variant={source === 'code' ? 'default' : 'success'}>{source}</Badge>
-              </EntityList.Cell>
-              <EntityList.TextCell className="truncate max-w-[200px]">
-                {description || <span className="text-neutral2">—</span>}
-              </EntityList.TextCell>
-              <EntityList.TextCell>
+              <DataList.Cell className="text-neutral4 min-w-0">
+                <span className="block truncate">{name}</span>
+              </DataList.Cell>
+              <DataList.Cell>
+                <Badge variant={source === 'code' ? 'neutral' : 'green'}>{source}</Badge>
+              </DataList.Cell>
+              <DataList.Cell className="min-w-0">
+                <span className="block max-w-[200px] truncate">
+                  {description || <span className="text-neutral2">—</span>}
+                </span>
+              </DataList.Cell>
+              <DataList.Cell>
                 {linkedCount > 0 ? `${linkedCount} dataset${linkedCount > 1 ? 's' : ''}` : '—'}
-              </EntityList.TextCell>
-            </EntityList.Row>
+              </DataList.Cell>
+            </DataList.RowButton>
           );
         })}
-      </EntityList>
+      </DataList>
     );
   }
 
   function renderDialogs() {
     return (
       <>
-        {/* Create Dataset Dialog */}
-        <CreateDatasetDialog open={showCreateDialog} onOpenChange={setShowCreateDialog} targetIds={[agentId]} />
-
         {/* Generate Config Dialog */}
         {generateDatasetId && (
           <GenerateConfigDialog
@@ -733,18 +733,30 @@ export function AgentPlaygroundEvaluate({
               <DialogTitle>Attach Existing Dataset</DialogTitle>
             </DialogHeader>
             <DialogBody className="max-h-[50vh] overflow-y-auto">
-              <Searchbar onSearch={setAttachDatasetSearch} label="Search datasets" placeholder="Search datasets..." />
+              <InputGroup variant="outline">
+                <InputGroupAddon align="inline-start">
+                  <SearchIcon />
+                </InputGroupAddon>
+                <InputGroupInput
+                  type="search"
+                  aria-label="Search datasets"
+                  placeholder="Search datasets..."
+                  onChange={event => setAttachDatasetSearch(event.target.value)}
+                />
+              </InputGroup>
               {unattachedDatasets
                 .filter(ds => !attachDatasetSearch || ds.name.toLowerCase().includes(attachDatasetSearch.toLowerCase()))
                 .map(ds => (
                   <button
                     key={ds.id}
                     type="button"
-                    className="w-full text-left px-3 py-2 hover:bg-surface3 rounded-md transition-colors flex items-center justify-between"
+                    className="hover:bg-surface3 flex w-full items-center justify-between rounded-md px-3 py-2 text-left transition-colors"
                     onClick={async () => {
                       try {
                         await updateDataset.mutateAsync({
                           datasetId: ds.id,
+                          // Classify legacy/untyped datasets without overwriting existing target types.
+                          targetType: ds.targetType ?? 'agent',
                           targetIds: [...parseIdList(ds.targetIds), agentId],
                         });
                         toast.success(`Dataset "${ds.name}" attached`);
@@ -769,7 +781,7 @@ export function AgentPlaygroundEvaluate({
               {unattachedDatasets.filter(
                 ds => !attachDatasetSearch || ds.name.toLowerCase().includes(attachDatasetSearch.toLowerCase()),
               ).length === 0 && (
-                <Txt variant="ui-sm" className="text-neutral3 text-center py-4 block">
+                <Txt variant="ui-sm" className="text-neutral3 block py-4 text-center">
                   No datasets available to attach
                 </Txt>
               )}
@@ -784,7 +796,17 @@ export function AgentPlaygroundEvaluate({
               <DialogTitle>Attach Existing Scorer</DialogTitle>
             </DialogHeader>
             <DialogBody className="max-h-[50vh] overflow-y-auto">
-              <Searchbar onSearch={setAttachScorerSearch} label="Search scorers" placeholder="Search scorers..." />
+              <InputGroup variant="outline">
+                <InputGroupAddon align="inline-start">
+                  <SearchIcon />
+                </InputGroupAddon>
+                <InputGroupInput
+                  type="search"
+                  aria-label="Search scorers"
+                  placeholder="Search scorers..."
+                  onChange={event => setAttachScorerSearch(event.target.value)}
+                />
+              </InputGroup>
               {unattachedScorers
                 .filter(([id, scorer]) => {
                   if (!attachScorerSearch) return true;
@@ -795,7 +817,7 @@ export function AgentPlaygroundEvaluate({
                   <button
                     key={id}
                     type="button"
-                    className="w-full text-left px-3 py-2 hover:bg-surface3 rounded-md transition-colors flex items-center justify-between"
+                    className="hover:bg-surface3 flex w-full items-center justify-between rounded-md px-3 py-2 text-left transition-colors"
                     onClick={async () => {
                       try {
                         await attachScorer(id, scorer);
@@ -823,7 +845,7 @@ export function AgentPlaygroundEvaluate({
                 const name = scorer.scorer?.name || id;
                 return name.toLowerCase().includes(attachScorerSearch.toLowerCase());
               }).length === 0 && (
-                <Txt variant="ui-sm" className="text-neutral3 text-center py-4 block">
+                <Txt variant="ui-sm" className="text-neutral3 block py-4 text-center">
                   No scorers available to attach
                 </Txt>
               )}
@@ -842,9 +864,9 @@ export function AgentPlaygroundEvaluate({
         defaultTab="experiments"
         value={activeTab}
         onValueChange={handleTabChange}
-        className="flex flex-col h-full overflow-hidden"
+        className="flex h-full flex-col overflow-hidden"
       >
-        <div className="flex items-center justify-between border-b border-border1">
+        <div className="border-border1 flex items-center justify-between border-b">
           <TabList className="border-b-0">
             <Tab value="experiments">Experiments</Tab>
             <Tab value="datasets">Datasets</Tab>
@@ -857,12 +879,18 @@ export function AgentPlaygroundEvaluate({
               <>
                 {unattachedDatasets.length > 0 && (
                   <Button variant="ghost" size="sm" onClick={() => setShowAttachDialog(true)}>
-                    <Paperclip className="size-3.5 mr-1" />
+                    <Paperclip className="mr-1 size-3.5" />
                     Attach
                   </Button>
                 )}
-                <Button variant="ghost" size="sm" onClick={() => setShowCreateDialog(true)}>
-                  <Plus className="size-3.5 mr-1" />
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() =>
+                    void navigate(`/datasets/new?targetType=agent&targetIds=${encodeURIComponent(agentId)}`)
+                  }
+                >
+                  <Plus className="mr-1 size-3.5" />
                   Create
                 </Button>
               </>
@@ -871,12 +899,12 @@ export function AgentPlaygroundEvaluate({
               <>
                 {unattachedScorers.length > 0 && (
                   <Button variant="ghost" size="sm" onClick={() => setShowAttachScorerDialog(true)}>
-                    <Paperclip className="size-3.5 mr-1" />
+                    <Paperclip className="mr-1 size-3.5" />
                     Attach
                   </Button>
                 )}
                 <Button variant="ghost" size="sm" onClick={() => setDetailView({ type: 'new-scorer' })}>
-                  <Plus className="size-3.5 mr-1" />
+                  <Plus className="mr-1 size-3.5" />
                   New
                 </Button>
               </>
@@ -885,15 +913,45 @@ export function AgentPlaygroundEvaluate({
         </div>
 
         {/* Search bar below tabs */}
-        <div className="py-2 border-b border-border1">
+        <div className="border-border1 border-b py-2">
           {activeTab === 'experiments' && (
-            <Searchbar onSearch={setExperimentsSearch} label="Search experiments" placeholder="Search experiments..." />
+            <InputGroup variant="outline">
+              <InputGroupAddon align="inline-start">
+                <SearchIcon />
+              </InputGroupAddon>
+              <InputGroupInput
+                type="search"
+                aria-label="Search experiments"
+                placeholder="Search experiments..."
+                onChange={event => setExperimentsSearch(event.target.value)}
+              />
+            </InputGroup>
           )}
           {activeTab === 'datasets' && (
-            <Searchbar onSearch={setDatasetsSearch} label="Search datasets" placeholder="Search datasets..." />
+            <InputGroup variant="outline">
+              <InputGroupAddon align="inline-start">
+                <SearchIcon />
+              </InputGroupAddon>
+              <InputGroupInput
+                type="search"
+                aria-label="Search datasets"
+                placeholder="Search datasets..."
+                onChange={event => setDatasetsSearch(event.target.value)}
+              />
+            </InputGroup>
           )}
           {activeTab === 'scorers' && (
-            <Searchbar onSearch={setScorersSearch} label="Search scorers" placeholder="Search scorers..." />
+            <InputGroup variant="outline">
+              <InputGroupAddon align="inline-start">
+                <SearchIcon />
+              </InputGroupAddon>
+              <InputGroupInput
+                type="search"
+                aria-label="Search scorers"
+                placeholder="Search scorers..."
+                onChange={event => setScorersSearch(event.target.value)}
+              />
+            </InputGroup>
           )}
         </div>
 
@@ -947,7 +1005,7 @@ export function AgentPlaygroundEvaluate({
 // --- Sub-components ---
 
 function ExperimentBadge({ experiment }: { experiment: AgentExperiment }) {
-  const { status, succeededCount, totalItems } = experiment;
+  const { status, failedCount, totalItems } = experiment;
 
   const versionTags = [
     experiment.datasetVersion != null ? formatVersionLabel('Dataset', experiment.datasetVersion) : null,
@@ -983,13 +1041,11 @@ function ExperimentBadge({ experiment }: { experiment: AgentExperiment }) {
     );
   }
 
-  const passRate = succeededCount / totalItems;
-  const colorClass = passRate >= 0.8 ? 'text-positive1' : passRate >= 0.5 ? 'text-warning1' : 'text-negative1';
-
   return (
     <div className="flex flex-col">
-      <Txt variant="ui-xs" className={colorClass}>
-        {succeededCount}/{totalItems} passed
+      <Txt variant="ui-xs" className="text-neutral3">
+        {totalItems} items
+        {failedCount > 0 && <span className="text-error"> · {failedCount} errored</span>}
       </Txt>
       {versionLine}
     </div>

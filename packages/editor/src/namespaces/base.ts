@@ -115,6 +115,10 @@ export abstract class CrudEditorNamespace<
   async getById(id: string, options?: GetByIdOptions): Promise<THydrated | null> {
     this.ensureRegistered();
 
+    if (options?.versionId && options.versionNumber !== undefined) {
+      throw new Error('versionId and versionNumber cannot be used together');
+    }
+
     // Only use the cache for default version requests (no specific version or status override)
     const isVersionRequest = options?.versionId || options?.versionNumber || options?.status;
     if (!isVersionRequest) {
@@ -180,11 +184,11 @@ export abstract class CrudEditorNamespace<
    */
   clearCache(id?: string): void {
     if (id) {
-      const wasCached = this._cache.has(id);
       this._cache.delete(id);
-      if (wasCached) {
-        this.onCacheEvict(id);
-      }
+      // Always notify subclasses so they can clean up runtime registries
+      // (e.g. remove the agent from mastra.#agents), even if the entity
+      // wasn't in the editor cache (version-specific lookups skip caching).
+      this.onCacheEvict(id);
       this.logger?.debug(`[clearCache] Cleared cache for "${id}"`);
     } else {
       for (const cachedId of Array.from(this._cache.keys())) {

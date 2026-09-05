@@ -1,11 +1,31 @@
-import { ScrollArea, Txt, cn } from '@mastra/playground-ui';
+import { ScrollArea } from '@mastra/playground-ui/components/ScrollArea';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { cn } from '@mastra/playground-ui/utils/cn';
 import { Check } from 'lucide-react';
+import { useMemo } from 'react';
 
 import { useAgentEditFormContext } from '../../context/agent-edit-form-context';
 import { isActive } from './agent-cms-is-active';
-import { AGENT_CMS_SECTIONS, CODE_AGENT_OVERRIDE_SECTIONS } from './agent-cms-sections';
+import { AGENT_CMS_SECTIONS, getCodeAgentOverrideSections } from './agent-cms-sections';
+import type { AgentCmsSection } from './agent-cms-sections';
 import { useSidebarDescriptions } from './use-sidebar-descriptions';
+import { useBuilderAgentFeatures } from '@/domains/agent-builder/hooks/use-builder-agent-features';
 import { useLinkComponent } from '@/lib/framework';
+
+/** Maps section names to builder feature keys. Sections without a mapping are always shown. */
+const SECTION_FEATURE_GATE: Record<string, keyof ReturnType<typeof useBuilderAgentFeatures>> = {
+  Skills: 'skills',
+};
+
+function filterByFeatures(
+  sections: AgentCmsSection[],
+  features: ReturnType<typeof useBuilderAgentFeatures>,
+): AgentCmsSection[] {
+  return sections.filter(s => {
+    const featureKey = SECTION_FEATURE_GATE[s.name];
+    return featureKey == null || features[featureKey];
+  });
+}
 
 interface AgentCmsSidebarProps {
   basePath: string;
@@ -14,13 +34,17 @@ interface AgentCmsSidebarProps {
 }
 
 export function AgentCmsSidebar({ basePath, currentPath, versionId }: AgentCmsSidebarProps) {
-  const { form, isCodeAgentOverride } = useAgentEditFormContext();
+  const { form, isCodeAgentOverride, editorConfig } = useAgentEditFormContext();
   const descriptions = useSidebarDescriptions(form.control);
-  const sections = isCodeAgentOverride ? CODE_AGENT_OVERRIDE_SECTIONS : AGENT_CMS_SECTIONS;
+  const features = useBuilderAgentFeatures();
+  const sections = useMemo(() => {
+    const base = isCodeAgentOverride ? getCodeAgentOverrideSections(editorConfig) : AGENT_CMS_SECTIONS;
+    return filterByFeatures(base, features);
+  }, [isCodeAgentOverride, editorConfig, features]);
 
   return (
-    <div className="h-full flex flex-col">
-      <ScrollArea className="flex-1 min-h-0">
+    <div className="flex h-full flex-col">
+      <ScrollArea className="min-h-0 flex-1">
         <nav className="py-4">
           <ul className="flex flex-col gap-0">
             {sections.map((section, index) => (
@@ -80,12 +104,12 @@ const SidebarLink = ({
         )}
       >
         {done ? (
-          <div className="size-6 rounded-full bg-accent1 flex items-center justify-center shrink-0">
+          <div className="bg-accent1 flex size-6 shrink-0 items-center justify-center rounded-full">
             <Check className="size-3.5 text-white" />
           </div>
         ) : (
           <Txt
-            className="size-6 rounded-full border border-neutral2 flex items-center justify-center text-neutral2 font-mono shrink-0"
+            className="border-neutral2 text-neutral2 flex size-6 shrink-0 items-center justify-center rounded-full border font-mono"
             variant="ui-sm"
           >
             {index + 1}
@@ -103,7 +127,7 @@ const SidebarLink = ({
         </div>
       </Link>
 
-      {!isLast && <div className="bg-surface3 w-0.5 h-2 inline-block ml-6" />}
+      {!isLast && <div className="bg-surface3 ml-6 inline-block h-2 w-0.5" />}
     </li>
   );
 };

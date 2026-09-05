@@ -11,7 +11,14 @@ import { Mastra } from '@mastra/core';
 import type { MastraAuthProvider, MastraServerConfig } from '@mastra/core/server';
 import { describe, it, expect, vi } from 'vitest';
 
-import { GET_AUTH_CAPABILITIES_ROUTE, GET_SSO_LOGIN_ROUTE, GET_SSO_CALLBACK_ROUTE } from './auth';
+import { MASTRA_USER_PERMISSIONS_KEY } from '../constants';
+import {
+  GET_AUTH_CAPABILITIES_ROUTE,
+  GET_PERMISSION_PATTERNS_ROUTE,
+  GET_ROLE_PERMISSIONS_ROUTE,
+  GET_SSO_LOGIN_ROUTE,
+  GET_SSO_CALLBACK_ROUTE,
+} from './auth';
 import { createTestServerContext } from './test-utils';
 
 // =============================================================================
@@ -155,6 +162,83 @@ describe('GET /auth/sso/login — callback URI prefix', () => {
 });
 
 // =============================================================================
+// Public host behind a gateway that rewrites X-Forwarded-Host
+// =============================================================================
+
+describe('GET /auth/sso/login — public host behind a rewriting gateway', () => {
+  // Railway's gateway overwrites X-Forwarded-Host with its own internal domain,
+  // so the edge in front of it forwards the browser-facing host in
+  // X-Mastra-Public-Host. Resolving the origin from X-Forwarded-Host instead
+  // produced an internal *.up.railway.app callback that the platform's OAuth
+  // redirect_uri allowlist rejected outright.
+  const gatewayHeaders = {
+    'x-mastra-public-host': 'my-project--qa.studio.example.com',
+    'x-forwarded-host': 'my-project-qa-qa.up.railway.app',
+  };
+
+  it('should build the OAuth callback URI from the public host, not the gateway host', async () => {
+    const mockAuth = createMockSSOProvider();
+    const mastra = createMastraWithAuth(mockAuth);
+
+    const request = new Request('http://internal-hostname:8080/api/auth/sso/login', {
+      headers: new Headers(gatewayHeaders),
+    });
+    const ctx = {
+      ...createTestServerContext({ mastra }),
+      request,
+      redirect_uri: undefined,
+    };
+
+    await GET_SSO_LOGIN_ROUTE.handler(ctx as any);
+
+    const callbackUri = (mockAuth.getLoginUrl as any).mock.calls[0][0];
+    expect(callbackUri).toBe('https://my-project--qa.studio.example.com/api/auth/sso/callback');
+  });
+
+  it('should treat the public host as same-origin when validating the post-login redirect', async () => {
+    const mockAuth = createMockSSOProvider();
+    const mastra = createMastraWithAuth(mockAuth);
+
+    const request = new Request('http://internal-hostname:8080/api/auth/sso/login', {
+      headers: new Headers(gatewayHeaders),
+    });
+    const ctx = {
+      ...createTestServerContext({ mastra }),
+      request,
+      redirect_uri: 'https://my-project--qa.studio.example.com/agents',
+    };
+
+    await GET_SSO_LOGIN_ROUTE.handler(ctx as any);
+
+    // Resolving the origin as the gateway host makes this fail the same-origin
+    // check and silently collapse to '/', dropping the user's landing page.
+    const stateArg = (mockAuth.getLoginUrl as any).mock.calls[0][1] as string;
+    const [, encodedRedirect] = stateArg.split('|', 2);
+    expect(decodeURIComponent(encodedRedirect)).toBe('https://my-project--qa.studio.example.com/agents');
+  });
+
+  it('should still reject an external redirect_uri when a public host is set', async () => {
+    const mockAuth = createMockSSOProvider();
+    const mastra = createMastraWithAuth(mockAuth);
+
+    const request = new Request('http://internal-hostname:8080/api/auth/sso/login', {
+      headers: new Headers(gatewayHeaders),
+    });
+    const ctx = {
+      ...createTestServerContext({ mastra }),
+      request,
+      redirect_uri: 'https://evil.com/phish',
+    };
+
+    await GET_SSO_LOGIN_ROUTE.handler(ctx as any);
+
+    const stateArg = (mockAuth.getLoginUrl as any).mock.calls[0][1] as string;
+    const [, encodedRedirect] = stateArg.split('|', 2);
+    expect(decodeURIComponent(encodedRedirect)).toBe('/');
+  });
+});
+
+// =============================================================================
 // Issue #4: SSO callback rejects cross-origin post-login redirects
 // =============================================================================
 
@@ -291,5 +375,98 @@ describe('GET /auth/capabilities — no auth provider', () => {
     } as any);
 
     expect(result).toEqual({ enabled: false, login: null });
+  });
+});
+
+// =============================================================================
+// GET /auth/roles/:roleId/permissions
+// =============================================================================
+
+describe('GET /auth/roles/:roleId/permissions', () => {
+  function createMastraWithRBAC(rbac: any) {
+    const mockAuth = createMockSSOProvider();
+    const mastra = new Mastra({ logger: false });
+    const originalGetServer = mastra.getServer.bind(mastra);
+    vi.spyOn(mastra, 'getServer').mockImplementation(() => {
+      const server = originalGetServer() || ({} as any);
+      return { ...server, auth: mockAuth, rbac } as any;
+    });
+    return mastra;
+  }
+
+  it('should return permissions for a valid role when caller is admin', async () => {
+    const rbac = {
+      getPermissionsForRole: vi.fn().mockResolvedValue(['*:read', '*:execute']),
+    };
+    const mastra = createMastraWithRBAC(rbac);
+
+    const requestContext = new Map([[MASTRA_USER_PERMISSIONS_KEY, ['*']]]);
+    const ctx = {
+      ...createTestServerContext({ mastra }),
+      requestContext,
+      roleId: 'member',
+    };
+
+    const result = (await GET_ROLE_PERMISSIONS_ROUTE.handler(ctx as any)) as any;
+    expect(result).toEqual({ roleId: 'member', permissions: ['*:read', '*:execute'] });
+    expect(rbac.getPermissionsForRole).toHaveBeenCalledWith('member');
+  });
+
+  it('should throw 403 when caller is not admin', async () => {
+    const rbac = {
+      getPermissionsForRole: vi.fn().mockResolvedValue([]),
+    };
+    const mastra = createMastraWithRBAC(rbac);
+
+    const requestContext = new Map([[MASTRA_USER_PERMISSIONS_KEY, ['*:read']]]);
+    const ctx = {
+      ...createTestServerContext({ mastra }),
+      requestContext,
+      roleId: 'viewer',
+    };
+
+    await expect(GET_ROLE_PERMISSIONS_ROUTE.handler(ctx as any)).rejects.toThrow('Admin access required');
+    expect(rbac.getPermissionsForRole).not.toHaveBeenCalled();
+  });
+
+  it('should throw 404 when RBAC provider lacks getPermissionsForRole', async () => {
+    const rbac = {}; // No getPermissionsForRole
+    const mastra = createMastraWithRBAC(rbac);
+
+    const requestContext = new Map([[MASTRA_USER_PERMISSIONS_KEY, ['*']]]);
+    const ctx = {
+      ...createTestServerContext({ mastra }),
+      requestContext,
+      roleId: 'member',
+    };
+
+    await expect(GET_ROLE_PERMISSIONS_ROUTE.handler(ctx as any)).rejects.toThrow(
+      'RBAC provider does not support role permission resolution',
+    );
+  });
+});
+
+describe('GET /auth/permission-patterns', () => {
+  it('returns the authoritative permission-pattern strings from core', async () => {
+    const result = (await GET_PERMISSION_PATTERNS_ROUTE.handler({} as any)) as { patterns: string[] };
+
+    expect(Array.isArray(result.patterns)).toBe(true);
+    expect(result.patterns.length).toBeGreaterThan(0);
+    // Patterns are the keys of core's PERMISSION_PATTERNS; sanity-check a couple
+    // of well-known entries and the wildcard.
+    expect(result.patterns).toContain('*');
+    expect(result.patterns).toContain('agents:read');
+    // Every entry is a plain string (resource:action or wildcard).
+    expect(result.patterns.every(p => typeof p === 'string')).toBe(true);
+  });
+
+  it('requires authentication but no specific permission', () => {
+    expect(GET_PERMISSION_PATTERNS_ROUTE.requiresAuth).toBe(true);
+    expect(GET_PERMISSION_PATTERNS_ROUTE.requiresPermission).toBeUndefined();
+  });
+
+  it('has correct path and method', () => {
+    expect(GET_PERMISSION_PATTERNS_ROUTE.path).toBe('/auth/permission-patterns');
+    expect(GET_PERMISSION_PATTERNS_ROUTE.method).toBe('GET');
   });
 });

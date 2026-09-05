@@ -1,6 +1,6 @@
 ---
 title: "Reference: Server routes | Server"
-description: "API reference for HTTP routes registered by Mastra server adapters."
+description: "Server adapters register these routes when you call server.init(). All routes are prefixed with the prefix option if configured."
 packages:
   - "@mastra/server"
 ---
@@ -17,6 +17,11 @@ Server adapters register these routes when you call `server.init()`. All routes 
 | `GET` | `/api/agents/:agentId` | Get agent by ID (supports version query params) |
 | `POST` | `/api/agents/:agentId/generate` | Generate agent response |
 | `POST` | `/api/agents/:agentId/stream` | Stream agent response |
+| `POST` | `/api/agents/:agentId/send-message` | Send a user message to an active or idle thread |
+| `POST` | `/api/agents/:agentId/queue-message` | Queue a user message for the next thread turn |
+| `POST` | `/api/agents/:agentId/signals` | Send a lower-level signal to an active or idle thread |
+| `POST` | `/api/agents/:agentId/threads/subscribe` | Subscribe to a thread stream |
+| `POST` | `/api/agents/:agentId/send-tool-approval` | Approve or decline a tool call and resume through a thread subscription |
 | `POST` | `/api/agents/:agentId/resume-stream` | Resume a suspended agent stream with custom data |
 | `GET` | `/api/agents/:agentId/tools` | List agent tools |
 | `POST` | `/api/agents/:agentId/tools/:toolId/execute` | Execute agent tool |
@@ -27,15 +32,15 @@ Server adapters register these routes when you call `server.init()`. All routes 
 
 | Parameter | Type | Default | Description |
 | - | - | - | - |
-| `status` | `'draft' \| 'published'` | `'draft'` | Which stored version to resolve. `draft` returns the latest version, `published` returns the active published version. |
-| `versionId` | `string` | — | A specific version ID to resolve. Takes precedence over `status`. |
+| `status` | `'draft' \| 'published'` | `'published'` | Which stored version to resolve. `draft` returns the latest version, and `published` returns the active version. |
+| `versionId` | `string` | None | A specific version ID to resolve. Takes precedence over `status`. |
 
 ```bash
-# Get agent with latest draft overrides (default)
+# Get agent with active published overrides (default)
 GET /api/agents/my-agent
 
-# Get agent with published overrides
-GET /api/agents/my-agent?status=published
+# Get agent with latest draft overrides
+GET /api/agents/my-agent?status=draft
 
 # Get agent with a specific version's overrides
 GET /api/agents/my-agent?versionId=abc123
@@ -43,7 +48,7 @@ GET /api/agents/my-agent?versionId=abc123
 
 ### Generate request body
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   messages: CoreMessage[] | string;       // Required
   instructions?: string;                   // System instructions
@@ -63,7 +68,7 @@ GET /api/agents/my-agent?versionId=abc123
 
 ### Generate response
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   text: string;
   toolCalls?: ToolCall[];
@@ -75,11 +80,106 @@ GET /api/agents/my-agent?versionId=abc123
 }
 ```
 
+### Agent message routes
+
+Use `POST /api/agents/:agentId/send-message` to send a user message to the active agent loop or wake an idle thread. Use `POST /api/agents/:agentId/queue-message` when the active run should finish before Mastra starts a follow-up run.
+
+Both routes accept the same request body:
+
+```typescript oxfmt:false
+{
+  message: string | Array<TextPart | FilePart> | {
+    contents: string | Array<TextPart | FilePart>;
+    attributes?: Record<string, JSONValue>;
+    metadata?: Record<string, unknown>;
+    providerOptions?: ProviderMetadata;
+  };
+  runId?: string;
+  resourceId?: string;
+  threadId?: string;
+  ifActive?: {
+    behavior?: 'deliver' | 'persist' | 'discard';
+    attributes?: Record<string, string | number | boolean>;
+  };
+  ifIdle?: {
+    behavior?: 'wake' | 'persist' | 'discard';
+    streamOptions?: Omit<AgentExecutionOptions, 'messages'>;
+    attributes?: Record<string, string | number | boolean>;
+  };
+}
+```
+
+When `runId` is omitted, `resourceId` and `threadId` are required. `ifIdle` only applies to thread-targeted requests, not run-targeted requests.
+
+#### Send a message
+
+```bash
+curl -X POST http://localhost:4111/api/agents/supportAgent/send-message \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "message": {
+      "contents": "Show the shorter version.",
+      "attributes": { "sentFrom": "web" }
+    },
+    "resourceId": "user_123",
+    "threadId": "thread_456"
+  }'
+```
+
+#### Queue a message
+
+```bash
+curl -X POST http://localhost:4111/api/agents/supportAgent/queue-message \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "message": "Also check whether the tests need updates.",
+    "resourceId": "user_123",
+    "threadId": "thread_456"
+  }'
+```
+
+Both routes return:
+
+```typescript oxfmt:false
+{
+  accepted: true;
+  runId: string;
+  signal?: CreatedAgentSignal;
+}
+```
+
+### Subscription tool approval routes
+
+Use `POST /api/agents/:agentId/send-tool-approval` when the client already has an active thread subscription. The route resumes the run and returns a JSON acknowledgement. Resumed stream chunks are delivered through `POST /api/agents/:agentId/threads/subscribe`.
+
+The route accepts this request body:
+
+```typescript oxfmt:false
+{
+  resourceId: string;
+  threadId: string;
+  toolCallId: string;
+  approved: boolean;
+  requestContext?: Record<string, unknown>;
+}
+```
+
+The route returns:
+
+```typescript oxfmt:false
+{
+  accepted: true;
+  runId: string;
+  toolCallId?: string;
+}
+```
+
 ## Workflows
 
 | Method | Path | Description |
 | - | - | - |
 | `GET` | `/api/workflows` | List all workflows |
+| `GET` | `/api/workflows/run-counts` | Get per-workflow counts of running and suspended runs |
 | `GET` | `/api/workflows/:workflowId` | Get workflow by ID |
 | `POST` | `/api/workflows/:workflowId/create-run` | Create a new workflow run |
 | `POST` | `/api/workflows/:workflowId/start-async` | Start workflow and await result |
@@ -89,9 +189,35 @@ GET /api/agents/my-agent?versionId=abc123
 | `GET` | `/api/workflows/:workflowId/runs` | List workflow runs |
 | `GET` | `/api/workflows/:workflowId/runs/:runId` | Get specific run |
 
+### Run counts response
+
+The `/api/workflows/run-counts` endpoint returns counts of `running` and [`suspended`](/docs/workflows/suspend-and-resume) runs for every registered workflow. The record is keyed by the workflow's registry key from the Mastra config, and the server may cache the response for a few seconds:
+
+```typescript oxfmt:false
+{
+  [workflowRegistryKey: string]: {
+    running: number;
+    suspended: number;
+  };
+}
+```
+
+### Dynamic workflows
+
+Dynamic workflow definitions (beta) are workflows expressed as JSON, persisted through the `workflowDefinitions` storage domain, and live-registered on the running instance. See [Dynamic workflows](/docs/workflows/dynamic-workflows).
+
+| Method | Path | Description |
+| - | - | - |
+| `GET` | `/api/stored/workflows` | List dynamic workflow definitions, filterable by `status` and `authorId` |
+| `GET` | `/api/stored/workflows/:dynamicWorkflowId` | Get a dynamic workflow definition by ID |
+| `POST` | `/api/stored/workflows` | Upsert a definition (plus optional helper `dependencies`) and live-register it |
+| `DELETE` | `/api/stored/workflows/:dynamicWorkflowId` | Delete a dynamic workflow definition and unregister the live workflow |
+
+On authenticated servers, the read routes require the `stored-workflows:read` permission and the write routes require `stored-workflows:write`. Registered dynamic workflows are executed through the ordinary `/api/workflows/:workflowId` routes above.
+
 ### Create run request body
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   resourceId?: string;     // Associate run with a resource (e.g., user ID)
   disableScorers?: boolean; // Disable scorers for this run
@@ -100,7 +226,7 @@ GET /api/agents/my-agent?versionId=abc123
 
 ### Request body for `/start-async`
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   resourceId?: string;     // Associate run with a resource (e.g., user ID)
   inputData?: unknown;
@@ -115,7 +241,7 @@ GET /api/agents/my-agent?versionId=abc123
 
 ### Stream workflow request body
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   resourceId?: string;     // Associate run with a resource (e.g., user ID)
   inputData?: unknown;
@@ -127,7 +253,7 @@ GET /api/agents/my-agent?versionId=abc123
 
 ### Resume request body
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   step?: string | string[];
   resumeData?: unknown;
@@ -145,7 +271,7 @@ GET /api/agents/my-agent?versionId=abc123
 
 ### Execute tool request body
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   data: unknown;  // Tool input data
   requestContext?: Record<string, unknown>;
@@ -166,7 +292,7 @@ GET /api/agents/my-agent?versionId=abc123
 
 ### Create thread request body
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   resourceId: string;
   title?: string;
@@ -176,7 +302,7 @@ GET /api/agents/my-agent?versionId=abc123
 
 ### Clone thread request body
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   newThreadId?: string;           // Custom ID for cloned thread
   resourceId?: string;            // Override resource ID
@@ -195,7 +321,7 @@ GET /api/agents/my-agent?versionId=abc123
 
 ### Clone thread response
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   thread: {
     id: string;
@@ -238,7 +364,7 @@ GET /api/agents/my-agent?versionId=abc123
 
 ### Query request body
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   vector: number[];
   topK?: number;
@@ -246,6 +372,118 @@ GET /api/agents/my-agent?versionId=abc123
   includeMetadata?: boolean;
 }
 ```
+
+## Datasets and experiments
+
+| Method | Path | Description |
+| - | - | - |
+| `GET` | `/api/datasets` | List datasets |
+| `POST` | `/api/datasets` | Create a dataset |
+| `GET` | `/api/datasets/:datasetId` | Get dataset by ID |
+| `PATCH` | `/api/datasets/:datasetId` | Update a dataset |
+| `DELETE` | `/api/datasets/:datasetId` | Delete a dataset |
+| `GET` | `/api/datasets/:datasetId/items` | List dataset items |
+| `POST` | `/api/datasets/:datasetId/items` | Add a dataset item |
+| `GET` | `/api/experiments` | List experiments across datasets |
+| `GET` | `/api/datasets/:datasetId/experiments` | List experiments for a dataset |
+| `POST` | `/api/datasets/:datasetId/experiments` | Trigger an experiment, or create one without starting it (`start: false`) |
+| `POST` | `/api/datasets/:datasetId/experiments/:experimentId/items/:itemId/run` | Execute one experiment item server-side |
+| `POST` | `/api/datasets/:datasetId/experiments/:experimentId/results` | Submit an externally computed item result |
+| `POST` | `/api/datasets/:datasetId/experiments/:experimentId/finalize` | Finalize a caller-driven experiment |
+| `GET` | `/api/datasets/:datasetId/experiments/:experimentId` | Get experiment by ID |
+| `PATCH` | `/api/datasets/:datasetId/experiments/:experimentId` | Update an experiment's name, description or metadata |
+| `GET` | `/api/datasets/:datasetId/experiments/:experimentId/results` | List experiment results |
+| `POST` | `/api/datasets/:datasetId/compare` | Compare two experiments |
+
+### Caller-driven experiment routes
+
+Use these routes when your own orchestrator (for example a Temporal workflow) owns the experiment loop and Mastra acts as the system of record. Item runs, result submission, and finalization are safe to retry. Creation is safe to retry only when the request includes a caller-supplied `id`; without one, each retry creates a new experiment. Item runs and result submissions upsert on `(experimentId, itemId, attempt)`. Finalize returns the stored record if the experiment is already completed.
+
+#### Create experiment request body
+
+Post to `/api/datasets/:datasetId/experiments` with `start: false` to create the experiment without running it. Include `targetType` and `targetId` when Mastra should execute items via the run-item route. Omit both for pure ingestion via the results route.
+
+```typescript oxfmt:false
+{
+  start?: boolean;              // false creates the experiment without running it. Defaults to true.
+  id?: string;                  // Caller-supplied experiment id (e.g. a workflow run id) for idempotent creates
+  targetType?: 'agent' | 'workflow' | 'scorer'; // Provide with targetId, or omit both
+  targetId?: string;
+  scorerIds?: string[];         // Run-level scorer ids, resolved server-side. Requires a target when start is false.
+  name?: string;
+  description?: string;
+  metadata?: Record<string, unknown>;
+  version?: number;             // Pin to a specific dataset version (defaults to latest)
+  provenance?: {
+    source?: string;
+    sourceId?: string;
+    sourceVersion?: string;
+    metadata?: Record<string, unknown>;
+  };
+  grouping?: {                  // Stable grouping dimensions for comparisons and repeated trials
+    experimentSetId?: string;
+    comparisonId?: string;
+    variantId?: string;
+    trialIndex?: number;
+  };
+}
+```
+
+Returns `{ experimentId, status, totalItems, datasetVersion }` when `start` is `false`.
+
+#### Run experiment item request body
+
+`POST /api/datasets/:datasetId/experiments/:experimentId/items/:itemId/run` executes the experiment's target against one item and runs the resolved scorers, then upserts the result. Requires an experiment created with a target.
+
+```typescript oxfmt:false
+{
+  attempt?: number;             // Zero-based repetition index. Defaults to 0.
+  requestContext?: Record<string, unknown>; // Merged with the item's own request context (item wins)
+}
+```
+
+Returns `{ result, scores }` with the persisted result row and the scores produced for the item.
+
+#### Submit experiment result request body
+
+```typescript oxfmt:false
+{
+  itemId: string;               // Dataset item this result belongs to
+  attempt?: number;             // Zero-based repetition index. Defaults to 0.
+  input?: unknown;              // Defaults to the dataset item input
+  output?: unknown;             // Output produced by the external runner
+  groundTruth?: unknown;        // Defaults to the dataset item groundTruth
+  error?: {                     // Failure info when the item run failed
+    message: string;
+    stack?: string;
+    code?: string;
+  } | null;
+  startedAt?: string;           // ISO date
+  completedAt?: string;         // ISO date
+  traceId?: string;
+  scores?: Array<{              // Externally computed scores, persisted keyed by runId = experimentId
+    scorerId: string;
+    scorerName?: string;
+    score: number;
+    reason?: string;
+    metadata?: Record<string, unknown>;
+  }>;
+}
+```
+
+Returns the persisted experiment result row.
+
+#### Finalize experiment
+
+`POST /api/datasets/:datasetId/experiments/:experimentId/finalize` takes no body. The server computes per-item counts from the persisted result rows and marks the experiment `completed`: `succeededCount` (at least one attempt without an error), `failedCount` (every attempt errored), and `skippedCount` (never submitted). Returns the updated experiment record.
+
+#### Caller-driven experiment error responses
+
+| Status | Condition |
+| - | - |
+| `400` | Result submitted to an experiment that has a target (`EXPERIMENT_HAS_TARGET`), item run requested on a target-less experiment (`EXPERIMENT_HAS_NO_TARGET`), `targetType` and `targetId` weren't provided together (`EXPERIMENT_INVALID_TARGET`), or the dataset has no items at the pinned version (`EXPERIMENT_NO_ITEMS`) |
+| `404` | Dataset, experiment, dataset item, or target not found (`EXPERIMENT_TARGET_NOT_FOUND`) |
+| `409` | Caller-supplied experiment `id` already exists for a different dataset or target (`EXPERIMENT_ID_CONFLICT`), or a call arrived after finalization (`EXPERIMENT_ALREADY_FINALIZED`) |
 
 ## MCP
 
@@ -286,7 +524,7 @@ For the full request and response contract, see the [Conversations API reference
 
 ### Query parameters
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   page?: number;
   perPage?: number;
@@ -308,7 +546,7 @@ For the full request and response contract, see the [Conversations API reference
 
 Most list endpoints support:
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   page?: number;   // Page number (0-indexed)
   perPage?: number; // Items per page (default: 10)
@@ -319,7 +557,7 @@ Most list endpoints support:
 
 Workflow runs support:
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   fromDate?: string;  // ISO date string
   toDate?: string;    // ISO date string
@@ -332,7 +570,7 @@ Workflow runs support:
 
 All routes return errors in this format:
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   error: string;      // Error message
   details?: unknown;  // Additional details

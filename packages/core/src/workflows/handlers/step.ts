@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import type { ActorSignal } from '../../auth/ee';
 import type { RequestContext } from '../../di';
 import { MastraError, ErrorDomain, ErrorCategory, getErrorFromUnknown } from '../../error';
 import type { MastraScorers } from '../../evals';
@@ -31,6 +32,7 @@ import type {
 import {
   validateStepInput,
   createDeprecationProxy,
+  omitPriorCompletionFields,
   runCountDeprecationMessage,
   validateStepResumeData,
   validateStepSuspendData,
@@ -57,6 +59,7 @@ export interface ExecuteStepParams extends ObservabilityContext {
   pubsub: PubSub;
   abortController: AbortController;
   requestContext: RequestContext;
+  actor?: ActorSignal;
   skipEmits?: boolean;
   outputWriter?: OutputWriter;
   disableScorers?: boolean;
@@ -83,7 +86,8 @@ export async function executeStep(
     pubsub,
     abortController,
     requestContext,
-    skipEmits = false,
+    actor,
+    skipEmits: skipEmitsParam = false,
     outputWriter,
     disableScorers,
     serializedStepGraph,
@@ -91,9 +95,12 @@ export async function executeStep(
     perStep,
     ...rest
   } = params;
+  const skipEmits = skipEmitsParam || engine.options.emitStepEvents === false;
   const observabilityContext = resolveObservabilityContext(rest);
 
   const stepCallId = randomUUID();
+  const nestedRunId =
+    step.component === 'WORKFLOW' && executionContext.foreachIndex !== undefined ? randomUUID() : undefined;
 
   const { inputData, validationError: inputValidationError } = await validateStepInput({
     prevOutput,
@@ -132,6 +139,18 @@ export async function executeStep(
   let suspendDataToUse =
     stepResults[step.id]?.status === 'suspended' ? stepResults[step.id]?.suspendPayload : undefined;
 
+  // A suspended foreach step's step-level suspendPayload only carries the FIRST suspended
+  // iteration's payload. When resuming a specific iteration, use that iteration's own payload
+  // from `__workflow_meta.foreachOutput` so parallel suspensions don't read a sibling's data
+  // (e.g. another tool call's suspended run id).
+  const foreachIndex = executionContext.foreachIndex;
+  if (suspendDataToUse && foreachIndex !== undefined) {
+    const iterationResult = suspendDataToUse.__workflow_meta?.foreachOutput?.[foreachIndex];
+    if (iterationResult?.status === 'suspended' && iterationResult.suspendPayload) {
+      suspendDataToUse = iterationResult.suspendPayload;
+    }
+  }
+
   // Filter out internal workflow metadata before exposing to step code
   if (suspendDataToUse && '__workflow_meta' in suspendDataToUse) {
     const { __workflow_meta, ...userSuspendData } = suspendDataToUse;
@@ -142,7 +161,9 @@ export async function executeStep(
   const resumeTime = resumeDataToUse ? Date.now() : undefined;
 
   const stepInfo = {
-    ...stepResults[step.id],
+    // Drop prior completion/suspend fields so they cannot linger across re-entry
+    // (e.g. suspendPayload/suspendedAt after resume, or startedAt > suspendedAt on loops).
+    ...omitPriorCompletionFields((stepResults[step.id] ?? {}) as Record<string, unknown>),
     ...(resumeDataToUse ? { resumePayload: resumeDataToUse } : { payload: inputData }),
     ...(startTime ? { startedAt: startTime } : {}),
     ...(resumeTime ? { resumedAt: resumeTime } : {}),
@@ -192,6 +213,7 @@ export async function executeStep(
     executionContext,
     workflowStatus: 'running',
     requestContext,
+    phase: 'start',
   });
 
   // Check if this is a nested workflow that requires special handling
@@ -208,6 +230,7 @@ export async function executeStep(
       startedAt: startTime ?? Date.now(),
       abortController,
       requestContext,
+      actor,
       ...observabilityContext,
       outputWriter,
       stepSpan: stepSpan as Span<SpanType.WORKFLOW_STEP> | undefined,
@@ -245,12 +268,20 @@ export async function executeStep(
         }
       }
 
-      const stepResult = { ...stepInfo, ...workflowResult } as StepResult<any, any, any, any>;
+      const stepResult = {
+        ...omitPriorCompletionFields(stepInfo),
+        ...workflowResult,
+      } as StepResult<any, any, any, any>;
       return {
         result: stepResult,
         stepResults: { [step.id]: stepResult },
         mutableContext: engine.buildMutableContext(executionContext),
-        requestContext: engine.serializeRequestContext(requestContext),
+        // Serialize requestContext only for engines that restore it from
+        // serialized results (Inngest memoization); the default engine keeps
+        // the original reference and never reads this field.
+        requestContext: engine.requiresDurableContextSerialization()
+          ? engine.serializeRequestContext(requestContext)
+          : undefined,
       };
     }
   }
@@ -313,11 +344,12 @@ export async function executeStep(
         : undefined;
 
       const output = await runStep({
-        runId,
+        runId: nestedRunId ?? runId,
         resourceId,
         workflowId,
         mastra: mastraForStep,
         requestContext,
+        actor,
         inputData,
         state: executionContext.state,
         setState: async (state: any) => {
@@ -493,7 +525,9 @@ export async function executeStep(
       await emitStepResultEvents({
         stepId: step.id,
         stepCallId,
-        execResults: { ...stepInfo, ...execResults } as StepResult<any, any, any, any>,
+        // Emit uses the same omit+merge as the persisted stepResult below so
+        // watch events and snapshots agree on cleared prior completion fields.
+        execResults: { ...omitPriorCompletionFields(stepInfo), ...execResults } as StepResult<any, any, any, any>,
         pubsub,
         runId,
       });
@@ -513,7 +547,14 @@ export async function executeStep(
     });
   }
 
-  const stepResult = { ...stepInfo, ...execResults } as StepResult<any, any, any, any>;
+  if (nestedRunId) {
+    execResults.metadata = { ...execResults.metadata, nestedRunId };
+  }
+
+  const stepResult = {
+    ...omitPriorCompletionFields(stepInfo),
+    ...execResults,
+  } as StepResult<any, any, any, any>;
 
   return {
     result: stepResult,
@@ -524,7 +565,13 @@ export async function executeStep(
         ? (stepRetryResult.result.contextMutations.stateUpdate ?? executionContext.state)
         : executionContext.state,
     }),
-    requestContext: engine.serializeRequestContext(requestContext),
+    // Serialize requestContext only for engines that restore it from
+    // serialized results (Inngest memoization); the default engine keeps
+    // the original reference and never reads this field, so serializing
+    // here would probe every stored value with JSON.stringify on every step.
+    requestContext: engine.requiresDurableContextSerialization()
+      ? engine.serializeRequestContext(requestContext)
+      : undefined,
   };
 }
 
@@ -572,8 +619,13 @@ export async function runScorersForStep(params: RunScorersParams): Promise<void>
 
   if (!disableScorers && scorersToUse && Object.keys(scorersToUse || {}).length > 0) {
     for (const [_id, scorerObject] of Object.entries(scorersToUse || {})) {
+      if (engine.mastra) {
+        scorerObject.scorer.__registerMastra(engine.mastra);
+        engine.mastra.addScorer(scorerObject.scorer, undefined, { source: 'code' });
+      }
       runScorer({
-        scorerId: scorerObject.name,
+        mastra: engine.mastra,
+        scorerId: scorerObject.scorer.id,
         scorerObject: scorerObject,
         runId: runId,
         input: input,

@@ -15,10 +15,12 @@ import type { ToolExecutionContext } from '@mastra/core/tools';
 import { Tool, createTool } from '@mastra/core/tools';
 import type { DynamicArgument } from '@mastra/core/types';
 import type { Step, AgentStepOptions, StepParams, ToolStep, StepMetadata } from '@mastra/core/workflows';
-import { Workflow } from '@mastra/core/workflows';
-import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '@mastra/core/workflows/_constants';
+import {
+  Workflow,
+  createStepFromAgent as coreCreateStepFromAgent,
+  createStepFromTool as coreCreateStepFromTool,
+} from '@mastra/core/workflows';
 import type { Inngest } from 'inngest';
-import { z } from 'zod';
 import type { InngestEngineType, InngestWorkflowConfig } from './types';
 import { InngestWorkflow } from './workflow';
 
@@ -27,8 +29,19 @@ export * from './execution-engine';
 export * from './pubsub';
 export * from './run';
 export * from './serve';
+export * from './connect';
 export * from './types';
 export * from './durable-agent';
+
+type InngestSubAgent<TId extends string = string> = {
+  id: TId;
+  name?: string;
+  getDescription: () => string;
+  getModel: () => Promise<{ specificationVersion: string }> | { specificationVersion: string };
+  generate: (...args: any[]) => Promise<any>;
+  stream: (...args: any[]) => Promise<{ fullStream: ReadableStream<any> }>;
+  streamLegacy?: (...args: any[]) => Promise<{ fullStream: ReadableStream<any> }>;
+};
 
 // ============================================
 // Type Guards
@@ -38,8 +51,22 @@ function isInngestWorkflow(input: unknown): input is InngestWorkflow<any, any, a
   return input instanceof InngestWorkflow;
 }
 
-function isAgent<TStepId extends string>(input: unknown): input is Agent<TStepId, any> {
-  return input instanceof Agent;
+/**
+ * copied from @mastra/core/agent/subagent.ts for compatible
+ */
+function isAgentCompatible<TId extends string>(input: unknown): input is InngestSubAgent<TId> {
+  return (
+    typeof input === 'object' &&
+    input !== null &&
+    'generate' in input &&
+    typeof input.generate === 'function' &&
+    'stream' in input &&
+    typeof input.stream === 'function' &&
+    'getDescription' in input &&
+    typeof input.getDescription === 'function' &&
+    'getModel' in input &&
+    typeof input.getModel === 'function'
+  );
 }
 
 function isToolStep(input: unknown): input is ToolStep<any, any, any, any, any> {
@@ -116,7 +143,7 @@ export function createStep<
  * Creates a step from an agent with structured output
  */
 export function createStep<TStepId extends string, TStepOutput>(
-  agent: Agent<TStepId, any>,
+  agent: InngestSubAgent<TStepId> | Agent<TStepId, any>,
   agentOptions: AgentStepOptions<TStepOutput> & {
     structuredOutput: { schema: StandardSchemaWithJSON<TStepOutput> };
     retries?: number;
@@ -135,7 +162,7 @@ export function createStep<
   TResume,
   TSuspend,
 >(
-  agent: Agent<TStepId, any>,
+  agent: InngestSubAgent<TStepId> | Agent<TStepId, any>,
   agentOptions?: AgentStepOptions<TStepOutput> & {
     retries?: number;
     scorers?: DynamicArgument<MastraScorers>;
@@ -218,7 +245,7 @@ export function createStep(params: any, agentOrToolOptions?: any): Step<any, any
     return params;
   }
 
-  if (isAgent(params)) {
+  if (isAgentCompatible(params)) {
     return createStepFromAgent(params, agentOrToolOptions);
   }
 
@@ -288,209 +315,40 @@ function createStepFromParams<
 }
 
 function createStepFromAgent<TStepId extends string, TStepOutput>(
-  params: Agent<TStepId, any>,
+  params: InngestSubAgent<TStepId> | Agent<TStepId, any>,
   agentOrToolOptions?: Record<string, unknown>,
 ): Step<TStepId, any, any, TStepOutput, unknown, unknown, InngestEngineType> {
-  const options = (agentOrToolOptions ?? {}) as
-    | (AgentStepOptions<TStepOutput> & {
-        retries?: number;
-        scorers?: DynamicArgument<MastraScorers>;
-        metadata?: StepMetadata;
-      })
-    | undefined;
-  // Determine output schema based on structuredOutput option
-  const outputSchema = (options?.structuredOutput?.schema ??
-    z.object({ text: z.string() })) as unknown as PublicSchema<TStepOutput>;
-  const { retries, scorers, metadata, ...agentOptions } =
-    options ??
-    ({} as AgentStepOptions<TStepOutput> & {
-      retries?: number;
-      scorers?: DynamicArgument<MastraScorers>;
-      metadata?: StepMetadata;
-    });
-
-  return {
-    id: params.name as TStepId,
-    description: params.getDescription(),
-    inputSchema: toStandardSchema(
-      z.object({
-        prompt: z.string(),
-      }),
-    ),
-    outputSchema: toStandardSchema(outputSchema),
-    retries,
-    scorers,
-    metadata,
-    execute: async ({
-      inputData,
-      runId,
-      [PUBSUB_SYMBOL]: pubsub,
-      [STREAM_FORMAT_SYMBOL]: streamFormat,
-      requestContext,
-      tracingContext,
-      abortSignal,
-      abort,
-      writer,
-    }) => {
-      let streamPromise = {} as {
-        promise: Promise<string>;
-        resolve: (value: string) => void;
-        reject: (reason?: any) => void;
-      };
-
-      streamPromise.promise = new Promise((resolve, reject) => {
-        streamPromise.resolve = resolve;
-        streamPromise.reject = reject;
-      });
-
-      // Track structured output result
-      let structuredResult: any = null;
-
-      const toolData = {
-        name: params.name,
-        args: inputData,
-      };
-
-      let stream: ReadableStream<any>;
-
-      if ((await params.getModel()).specificationVersion === 'v1') {
-        const { fullStream } = await params.streamLegacy((inputData as { prompt: string }).prompt, {
-          ...(agentOptions ?? {}),
-          requestContext,
-          tracingContext,
-          onFinish: result => {
-            // Capture structured output if available
-            const resultWithObject = result as typeof result & { object?: unknown };
-            if (agentOptions?.structuredOutput?.schema && resultWithObject.object) {
-              structuredResult = resultWithObject.object;
-            }
-            streamPromise.resolve(result.text);
-            void agentOptions?.onFinish?.(result);
-          },
-          abortSignal,
-        });
-        stream = fullStream as any;
-      } else {
-        const { structuredOutput, ...restAgentOptions } = agentOptions ?? {};
-        const baseOptions = {
-          ...restAgentOptions,
-          requestContext,
-          tracingContext,
-          onFinish: (result: any) => {
-            // Capture structured output if available
-            const resultWithObject = result as typeof result & { object?: unknown };
-            if (structuredOutput?.schema && resultWithObject.object) {
-              structuredResult = resultWithObject.object;
-            }
-            streamPromise.resolve(result.text);
-            void agentOptions?.onFinish?.(result);
-          },
-          abortSignal,
-        };
-
-        const modelOutput = structuredOutput
-          ? await params.stream<any>((inputData as { prompt: string }).prompt, {
-              ...baseOptions,
-              structuredOutput,
-            } as any)
-          : await params.stream<any>((inputData as { prompt: string }).prompt, baseOptions as any);
-
-        stream = modelOutput.fullStream;
-      }
-
-      if (streamFormat === 'legacy') {
-        await pubsub.publish(`workflow.events.v2.${runId}`, {
-          type: 'watch',
-          runId,
-          data: { type: 'tool-call-streaming-start', ...(toolData ?? {}) },
-        });
-        for await (const chunk of stream) {
-          if (chunk.type === 'text-delta') {
-            await pubsub.publish(`workflow.events.v2.${runId}`, {
-              type: 'watch',
-              runId,
-              data: { type: 'tool-call-delta', ...(toolData ?? {}), argsTextDelta: chunk.textDelta },
-            });
-          }
-        }
-        await pubsub.publish(`workflow.events.v2.${runId}`, {
-          type: 'watch',
-          runId,
-          data: { type: 'tool-call-streaming-finish', ...(toolData ?? {}) },
-        });
-      } else {
-        for await (const chunk of stream) {
-          await writer.write(chunk as any);
-        }
-      }
-
-      if (abortSignal.aborted) {
-        return abort() as TStepOutput;
-      }
-
-      // Return structured output if available, otherwise default text
-      if (structuredResult !== null) {
-        return structuredResult;
-      }
-      return {
-        text: await streamPromise.promise,
-      } as TStepOutput;
-    },
-    component: params.component,
-  };
+  // Delegates to core's factory: the run logic lives in the shared entry
+  // executors (`runAgentEntry`), which is also what the inherited
+  // `DefaultExecutionEngine.executeAgent` runs for declarative graph entries.
+  // The engine generic is phantom (executors never read `ctx.engine`), so the
+  // cast only re-brands the step for Inngest consumers.
+  return coreCreateStepFromAgent(params as any, agentOrToolOptions as any) as unknown as Step<
+    TStepId,
+    any,
+    any,
+    TStepOutput,
+    unknown,
+    unknown,
+    InngestEngineType
+  >;
 }
 
 function createStepFromTool<TStepInput, TSuspend, TResume, TStepOutput>(
   params: ToolStep<TStepInput, TSuspend, TResume, TStepOutput, any>,
   agentOrToolOptions?: Record<string, unknown>,
 ): Step<string, any, TStepInput, TStepOutput, TResume, TSuspend, InngestEngineType> {
-  const toolOpts = agentOrToolOptions as
-    | { retries?: number; scorers?: DynamicArgument<MastraScorers>; metadata?: StepMetadata }
-    | undefined;
-  if (!params.inputSchema || !params.outputSchema) {
-    throw new Error('Tool must have input and output schemas defined');
-  }
-
-  return {
-    id: params.id,
-    description: params.description,
-    inputSchema: params.inputSchema,
-    outputSchema: params.outputSchema,
-    resumeSchema: params.resumeSchema,
-    suspendSchema: params.suspendSchema,
-    retries: toolOpts?.retries,
-    scorers: toolOpts?.scorers,
-    metadata: toolOpts?.metadata,
-    execute: async ({
-      inputData,
-      mastra,
-      requestContext,
-      tracingContext,
-      suspend,
-      resumeData,
-      runId,
-      workflowId,
-      state,
-      setState,
-    }) => {
-      // BREAKING CHANGE v1.0: Pass raw input as first arg, context as second
-      const toolContext = {
-        mastra,
-        requestContext,
-        tracingContext,
-        workflow: {
-          runId,
-          resumeData,
-          suspend,
-          workflowId,
-          state,
-          setState,
-        },
-      };
-      return params.execute(inputData, toolContext) as TStepOutput;
-    },
-    component: 'TOOL',
-  };
+  // Delegates to core's factory (shared `runToolEntry` executor); see
+  // `createStepFromAgent` above for why the engine re-brand cast is safe.
+  return coreCreateStepFromTool(params as any, agentOrToolOptions as any) as unknown as Step<
+    string,
+    any,
+    TStepInput,
+    TStepOutput,
+    TResume,
+    TSuspend,
+    InngestEngineType
+  >;
 }
 
 function createStepFromProcessor<TProcessorId extends string>(
@@ -730,7 +588,7 @@ function createStepFromProcessor<TProcessorId extends string>(
                 return {
                   ...passThrough,
                   messages: result.get.all.db(),
-                  systemMessages: result.getAllSystemMessages(),
+                  systemMessages: result.getSystemMessages(),
                 };
               } else if (Array.isArray(result)) {
                 // Processor returned an array of messages
@@ -756,7 +614,7 @@ function createStepFromProcessor<TProcessorId extends string>(
                 return {
                   ...passThrough,
                   messages: typedResult.messages,
-                  systemMessages: typedResult.systemMessages,
+                  systemMessages: passThrough.messageList.getSystemMessages(),
                 };
               }
               return { ...passThrough, messages };
@@ -818,7 +676,12 @@ function createStepFromProcessor<TProcessorId extends string>(
 
               // Preserve messages in return - passThrough doesn't include messages,
               // so we must explicitly include it to avoid losing it for subsequent steps
-              return { ...passThrough, messages, ...validatedResult };
+              return {
+                ...passThrough,
+                messages,
+                ...validatedResult,
+                systemMessages: passThrough.messageList!.getSystemMessages(),
+              };
             }
             return { ...passThrough, messages };
           }
@@ -941,7 +804,7 @@ function createStepFromProcessor<TProcessorId extends string>(
                 return {
                   ...passThrough,
                   messages: processResult.get.all.db(),
-                  systemMessages: processResult.getAllSystemMessages(),
+                  systemMessages: processResult.getSystemMessages(),
                 };
               } else if (Array.isArray(processResult)) {
                 // Processor returned an array of messages
@@ -967,7 +830,7 @@ function createStepFromProcessor<TProcessorId extends string>(
                 return {
                   ...passThrough,
                   messages: typedResult.messages,
-                  systemMessages: typedResult.systemMessages,
+                  systemMessages: passThrough.messageList.getSystemMessages(),
                 };
               }
               return { ...passThrough, messages };
@@ -1022,7 +885,7 @@ function createStepFromProcessor<TProcessorId extends string>(
                 return {
                   ...passThrough,
                   messages: result.get.all.db(),
-                  systemMessages: result.getAllSystemMessages(),
+                  systemMessages: result.getSystemMessages(),
                 };
               } else if (Array.isArray(result)) {
                 // Processor returned an array of messages
@@ -1048,7 +911,7 @@ function createStepFromProcessor<TProcessorId extends string>(
                 return {
                   ...passThrough,
                   messages: typedResult.messages,
-                  systemMessages: typedResult.systemMessages,
+                  systemMessages: passThrough.messageList.getSystemMessages(),
                 };
               }
               return { ...passThrough, messages };
@@ -1065,7 +928,7 @@ function createStepFromProcessor<TProcessorId extends string>(
   };
 }
 
-export function init(inngest: Inngest) {
+export function init<TRequestContext = unknown>(inngest: Inngest) {
   return {
     createTool,
     createWorkflow<
@@ -1082,11 +945,17 @@ export function init(inngest: Inngest) {
         any,
         InngestEngineType
       >[],
-    >(params: InngestWorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps>) {
-      return new InngestWorkflow<InngestEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TInput>(
-        params,
-        inngest,
-      );
+    >(params: InngestWorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps, TRequestContext>) {
+      return new InngestWorkflow<
+        InngestEngineType,
+        TSteps,
+        TWorkflowId,
+        TState,
+        TInput,
+        TOutput,
+        TInput,
+        TRequestContext
+      >(params, inngest);
     },
     createStep,
     cloneStep<TStepId extends string>(

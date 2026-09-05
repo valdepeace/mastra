@@ -1,6 +1,6 @@
 ---
 title: "Reference: Agent.network() | Agents"
-description: "Documentation for the `Agent.network()` method in Mastra agents, which enables multi-agent collaboration and routing."
+description: "The .network() method enables multi-agent collaboration and routing. This method accepts messages and optional execution options."
 packages:
   - "@mastra/core"
 ---
@@ -13,7 +13,7 @@ The `.network()` method enables multi-agent collaboration and routing. This meth
 
 :::warning[Deprecated]
 
-The `.network()` primitive has been deprecated and will be removed in a future major release. Use [supervisor agents](/docs/agents/supervisor-agents) with `agent.stream()` or `agent.generate()` instead. See the [migration guide](/guides/migrations/network-to-supervisor) to upgrade.
+The `.network()` primitive has been deprecated and will be removed in a future major release. Use [supervisor agents](/docs/subagents) with `agent.stream()` or `agent.generate()` instead. See the [migration guide](/reference/migrations/network-to-supervisor) to upgrade.
 
 :::
 
@@ -29,7 +29,7 @@ const agent = new Agent({
   id: 'network-agent',
   name: 'Network Agent',
   instructions: 'You are a network agent that can help users with a variety of tasks.',
-  model: 'openai/gpt-5.4',
+  model: '__GATEWAY_OPENAI_MODEL__',
   agents: {
     agent1,
     agent2,

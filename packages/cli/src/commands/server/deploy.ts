@@ -4,13 +4,25 @@ import { mkdir, rm, stat, access, readFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import * as p from '@clack/prompts';
-import archiver from 'archiver';
+import { ZipArchive } from 'archiver';
+import { config } from 'dotenv';
+
+import { bucketApiHost, getAnalytics } from '../../analytics/index.js';
+import type { CLI_ORIGIN } from '../../analytics/index.js';
 import { runBuild } from '../../utils/run-build.js';
+import { checkBuildStaleness } from '../../utils/source-hash.js';
 import { fetchOrgs } from '../auth/api.js';
-import { MASTRA_STUDIO_URL } from '../auth/client.js';
+import { MASTRA_STUDIO_URL, MASTRA_PLATFORM_API_URL } from '../auth/client.js';
 import { getToken, getCurrentOrgId } from '../auth/credentials.js';
+import { mergePreflightEnvVars, preflightBuildOutput, printPreflightIssues } from '../deploy-preflight.js';
 import { getProjectConfigToSave, loadProjectConfig, saveProjectConfig } from '../studio/project-config.js';
-import { fetchServerProjects, createServerProject, uploadServerDeploy, pollServerDeploy } from './platform-api.js';
+import {
+  fetchServerProjects,
+  createServerProject,
+  uploadServerDeploy,
+  pollServerDeploy,
+  getServerProjectEnv,
+} from './platform-api.js';
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                           */
@@ -37,14 +49,16 @@ async function zipOutput(projectDir: string): Promise<string> {
 
   return new Promise((resolvePromise, reject) => {
     const output = createWriteStream(zipPath);
-    const archive = archiver('zip', { zlib: { level: 6 } });
+    const archive = new ZipArchive({ zlib: { level: 6 } });
 
     output.on('close', () => resolvePromise(zipPath));
     archive.on('error', reject);
 
     archive.pipe(output);
-    // Ship only the pre-built .mastra/output + package.json for dependency metadata
-    archive.glob('**', { cwd: outputDir, ignore: ['node_modules/**'] }, { prefix: '.mastra/output' });
+    // Ship only the pre-built .mastra/output + package.json for dependency metadata.
+    // `dot` keeps the .npmrc that the build copies into the output so
+    // private-registry installs work remotely (`**` skips dotfiles by default).
+    archive.glob('**', { cwd: outputDir, ignore: ['node_modules/**'], dot: true }, { prefix: '.mastra/output' });
     archive.file(join(projectDir, 'package.json'), { name: 'package.json' });
     void archive.finalize();
   });
@@ -66,6 +80,19 @@ export function parseEnvFile(content: string): Record<string, string> {
     if (key) vars[key] = value;
   }
   return vars;
+}
+
+/**
+ * Loads MASTRA_PROJECT_ID and MASTRA_ORG_ID from the project's .env files
+ * into process.env so deploys auto-link to the project that `mastra init --observability`
+ * provisioned. Uses dotenv with override: false (the default), so any
+ * existing process.env value (e.g. from CI) always wins.
+ */
+export function loadDeployEnvFromDotenv(projectDir: string): void {
+  config({
+    path: [join(projectDir, '.env'), join(projectDir, '.env.local'), join(projectDir, '.env.production')],
+    quiet: true,
+  });
 }
 
 async function getDeployEnvFiles(projectDir: string): Promise<string[]> {
@@ -209,6 +236,7 @@ async function resolveProject(
   projectConfig: { projectId?: string; projectName?: string; projectSlug?: string; organizationId?: string } | null,
   flagProject?: string,
   defaultName?: string | null,
+  autoAccept?: boolean,
 ): Promise<{ projectId: string; projectName: string; projectSlug: string }> {
   const envProjectId = process.env.MASTRA_PROJECT_ID;
   if (envProjectId) {
@@ -217,11 +245,34 @@ async function resolveProject(
 
   if (flagProject) {
     const projects = await fetchServerProjects(token, orgId);
-    const match = projects.find(proj => proj.slug === flagProject || proj.id === flagProject);
+    const byId = projects.find(proj => proj.id === flagProject);
+    const bySlug = projects.find(proj => proj.slug === flagProject);
+    const byName = projects.filter(proj => proj.name === flagProject);
+    if (!byId && !bySlug && byName.length > 1) {
+      p.cancel(
+        `Multiple projects are named "${flagProject}". Pass --project with the project id or slug to disambiguate.`,
+      );
+      process.exit(1);
+    }
+    const match = byId ?? bySlug ?? (byName.length === 1 ? byName[0] : undefined);
     if (match) {
       return { projectId: match.id, projectName: match.name, projectSlug: match.slug ?? match.name };
     }
-    return { projectId: flagProject, projectName: flagProject, projectSlug: flagProject };
+
+    // No match — create a new project with the flag value as its name.
+    if (!autoAccept) {
+      const confirmed = await p.confirm({
+        message: `No project named "${flagProject}" found. Create it?`,
+      });
+      if (p.isCancel(confirmed) || !confirmed) {
+        p.cancel('Deploy cancelled.');
+        process.exit(0);
+      }
+    }
+
+    const created = await createServerProject(token, orgId, flagProject);
+    p.log.success(`Created project "${created.name}"`);
+    return { projectId: created.id, projectName: created.name, projectSlug: created.slug ?? created.name };
   }
 
   if (projectConfig?.projectId && projectConfig.organizationId === orgId) {
@@ -232,16 +283,46 @@ async function resolveProject(
     };
   }
 
-  // Check if a project already exists matching the package name before creating
   const name = defaultName;
   if (!name) {
     throw new Error('Could not determine project name from package.json. Use --project to specify one.');
   }
 
   const existing = await fetchServerProjects(token, orgId);
-  const match = existing.find(proj => proj.name === name || proj.slug === name);
-  if (match) {
-    return { projectId: match.id, projectName: match.name, projectSlug: match.slug ?? match.name };
+  const nameMatches = existing.filter(proj => proj.name === name || proj.slug === name);
+
+  if (existing.length > 0) {
+    if (autoAccept) {
+      // Non-interactive: only safe to auto-pick when exactly one project matches by name/slug.
+      if (nameMatches.length === 1) {
+        const m = nameMatches[0]!;
+        return { projectId: m.id, projectName: m.name, projectSlug: m.slug ?? m.name };
+      }
+      throw new Error(
+        `Found ${existing.length} existing project(s) in this organization. Pass --project <id-or-slug> to select one, or re-run without --yes to choose interactively.`,
+      );
+    }
+
+    const CREATE_NEW = '__create_new__';
+    const initialValue = nameMatches.length === 1 ? nameMatches[0]!.id : existing[0]!.id;
+    const selected = await p.select({
+      message: 'Select a project to deploy to',
+      initialValue,
+      options: [
+        ...existing.map(proj => ({ value: proj.id, label: `${proj.name} (${proj.id})` })),
+        { value: CREATE_NEW, label: `＋ Create new project "${name}"` },
+      ],
+    });
+
+    if (p.isCancel(selected)) {
+      p.cancel('Deploy cancelled.');
+      process.exit(0);
+    }
+
+    if (selected !== CREATE_NEW) {
+      const match = existing.find(proj => proj.id === selected)!;
+      return { projectId: match.id, projectName: match.name, projectSlug: match.slug ?? match.name };
+    }
   }
 
   const project = await createServerProject(token, orgId, name);
@@ -252,21 +333,49 @@ async function resolveProject(
 /*  Main deploy action                                                */
 /* ------------------------------------------------------------------ */
 
-export async function serverDeployAction(
-  dir: string | undefined,
-  opts: {
-    org?: string;
-    project?: string;
-    yes?: boolean;
-    config?: string;
-    skipBuild?: boolean;
-    debug?: boolean;
-    envFile?: string;
-  },
-) {
+type ServerDeployOptions = {
+  org?: string;
+  project?: string;
+  yes?: boolean;
+  config?: string;
+  skipBuild?: boolean;
+  skipPreflight?: boolean;
+  debug?: boolean;
+  envFile?: string;
+};
+
+export async function serverDeployAction(dir: string | undefined, opts: ServerDeployOptions) {
+  const analytics = getAnalytics();
+  if (!analytics) {
+    return runServerDeploy(dir, opts);
+  }
+  return analytics.trackCommandExecution({
+    command: 'mastra server deploy',
+    args: {
+      yes: Boolean(opts.yes),
+      skipBuild: Boolean(opts.skipBuild),
+      skipPreflight: Boolean(opts.skipPreflight),
+      hasOrg: Boolean(opts.org),
+      hasProject: Boolean(opts.project),
+      hasEnvFile: Boolean(opts.envFile),
+      hasConfig: Boolean(opts.config),
+      debug: Boolean(opts.debug),
+      headless: Boolean(process.env.MASTRA_API_TOKEN),
+      targetApi: bucketApiHost(MASTRA_PLATFORM_API_URL),
+    },
+    execution: () => runServerDeploy(dir, opts),
+    origin: process.env.MASTRA_ANALYTICS_ORIGIN as CLI_ORIGIN | undefined,
+  });
+}
+
+async function runServerDeploy(dir: string | undefined, opts: ServerDeployOptions) {
   const targetDir = resolve(dir || process.cwd());
+  // Seed MASTRA_PROJECT_ID / MASTRA_ORG_ID from the project's .env so deploys
+  // auto-link to the project that `mastra init --observability` provisioned.
+  loadDeployEnvFromDotenv(targetDir);
   const isHeadless = Boolean(process.env.MASTRA_API_TOKEN);
   const autoAccept = opts.yes ?? isHeadless;
+  const skipPreflight = opts.skipPreflight || process.env.MASTRA_SKIP_PREFLIGHT === '1';
 
   p.intro('mastra server deploy');
 
@@ -302,6 +411,7 @@ export async function serverDeployAction(
     projectConfig,
     opts.project,
     packageName,
+    autoAccept,
   );
 
   // Step 5: Confirmation
@@ -338,10 +448,30 @@ export async function serverDeployAction(
   // Step 6: Build + Zip + Upload + Poll
   const s = p.spinner();
 
+  // Check build staleness to determine if we need to rebuild
+  const mastraDir = join(targetDir, 'src', 'mastra');
+  const outputDirectory = join(targetDir, '.mastra');
+  const staleness = await checkBuildStaleness(targetDir, mastraDir, outputDirectory);
+
   if (opts.skipBuild) {
+    if (staleness.isStale && staleness.reason !== 'no-build') {
+      // User explicitly skipped build, but sources have changed — warn them
+      if (staleness.reason === 'hash-mismatch') {
+        p.log.warn('Source files have changed since last build. Deploy may not reflect latest changes.');
+      } else if (staleness.reason === 'no-manifest') {
+        p.log.warn('No build manifest found. Cannot verify if build is up-to-date.');
+      }
+    }
     p.log.step('Skipping build (--skip-build)');
-  } else {
+  } else if (staleness.isStale) {
+    // Build is stale or doesn't exist — rebuild
+    if (staleness.reason === 'hash-mismatch') {
+      p.log.step('Source files changed, rebuilding...');
+    }
     await runBuild(targetDir, { debug: opts.debug });
+  } else {
+    // Build is up-to-date — skip rebuild
+    p.log.step('Build is up-to-date, skipping rebuild');
   }
 
   // Verify build output exists
@@ -352,20 +482,62 @@ export async function serverDeployAction(
     throw new Error('.mastra/output/index.mjs not found — did the build succeed?');
   }
 
+  // If the user didn't pass --env-file and no ambient .env* file exists,
+  // skip the local env-var upload entirely and let the platform use the
+  // env vars stored on the project. The server-side deploy handler merges
+  // request envVars over the stored vars, so an empty (absent) envVars
+  // payload cleanly falls back to what's already stored.
+  let envVars: Record<string, string> = {};
+  const hasEnvFile = opts.envFile ? true : (await getDeployEnvFiles(targetDir)).length > 0;
+  if (hasEnvFile) {
+    envVars = await readEnvVars(targetDir, { autoAccept, envFile: opts.envFile });
+  }
+  const envCount = Object.keys(envVars).length;
+  if (envCount > 0) {
+    p.log.step(`Found ${envCount} env var(s)`);
+  } else if (hasEnvFile) {
+    p.log.step('No env vars found in selected env file');
+  } else {
+    p.log.step('No local env file — using env vars stored on the project');
+  }
+
+  // Pre-upload validation — catch USER-attributable errors before zipping/shipping.
+  // Preflight sees the same env picture the platform applies at deploy time:
+  // uploaded env vars merged over the project's stored vars (upload wins), so
+  // vars stored only on the platform don't false-alarm.
+  if (!skipPreflight) {
+    let storedEnvVars: Record<string, string> | undefined;
+    try {
+      storedEnvVars = await getServerProjectEnv(token, orgId, projectId);
+    } catch {
+      // Stored env unavailable (older platform, network hiccup) — preflight
+      // proceeds with the local env picture only.
+    }
+    // `managedEnvVarNames: null` — the server-project env endpoint doesn't
+    // expose managed-database var names yet, so the env picture is incomplete
+    // and guarded local paths soften to warnings instead of hard errors.
+    // TODO(managed-env-names): pass real names once the endpoint exposes them.
+    const issues = await preflightBuildOutput(targetDir, mergePreflightEnvVars(storedEnvVars, envVars), {
+      hasEnvFile,
+      managedEnvVarNames: null,
+    });
+    const outcome = await printPreflightIssues(issues, { autoAccept });
+    if (outcome === 'blocked') {
+      p.cancel('Deploy blocked by preflight errors.');
+      process.exit(1);
+    }
+    if (outcome === 'cancelled') {
+      p.cancel('Deploy cancelled.');
+      process.exit(0);
+    }
+  }
+
   s.start('Zipping build artifact...');
   const zipPath = await zipOutput(targetDir);
   const zipStat = await stat(zipPath);
   const sizeKB = zipStat.size / 1024;
   const sizeLabel = sizeKB > 1024 ? `${(sizeKB / 1024).toFixed(1)}MB` : `${sizeKB.toFixed(1)}KB`;
   s.stop(`Created ${sizeLabel} archive`);
-
-  const envVars = await readEnvVars(targetDir, { autoAccept, envFile: opts.envFile });
-  const envCount = Object.keys(envVars).length;
-  if (envCount > 0) {
-    p.log.step(`Found ${envCount} env var(s)`);
-  } else {
-    p.log.step('No env vars found in selected env file');
-  }
 
   s.start('Uploading...');
   const zipBuffer = await readFile(zipPath);

@@ -1,10 +1,10 @@
 import type { CoreMessage as CoreMessageV4 } from '@internal/ai-sdk-v4';
-import type { Tiktoken, TiktokenBPE } from 'js-tiktoken/lite';
+import { estimateTokenCount, sliceByTokens } from 'tokenx';
 import type { MastraDBMessage } from '../../agent/message-list';
+import { parseDataUri, resolveFilePartMediaTypeAndData } from '../../agent/message-list/prompt/image-utils';
 import { TripWire } from '../../agent/trip-wire';
 import type { ChunkType } from '../../stream';
-import { getTiktoken } from '../../utils/tiktoken';
-import type { ProcessInputStepArgs, Processor } from '../index';
+import type { ProcessInputStepArgs, ProcessOutputStreamArgs, Processor } from '../index';
 
 /**
  * Configuration options for TokenLimiter processor
@@ -12,8 +12,11 @@ import type { ProcessInputStepArgs, Processor } from '../index';
 export interface TokenLimiterOptions {
   /** Maximum number of tokens to allow */
   limit: number;
-  /** Optional encoding to use (defaults to o200k_base which is used by gpt-4o) */
-  encoding?: TiktokenBPE;
+  /**
+   * @deprecated Token counts are now estimated using `tokenx` (no BPE encoder required).
+   * This option is accepted for backwards compatibility but is ignored.
+   */
+  encoding?: unknown;
   /**
    * Strategy when token limit is reached:
    * - 'truncate': Stop emitting chunks (default)
@@ -43,11 +46,59 @@ type TokenLimiterTripWireMetadata = {
   messageCount?: number;
 };
 
+/**
+ * Flat estimate for an image payload. Providers bill images at a near-flat
+ * per-image cost, so the encoded size is a poor predictor of the real cost.
+ */
+const TOKENS_PER_IMAGE = 765;
+
+/** Estimate used when a media payload's decoded size cannot be determined. */
+const TOKENS_PER_MEDIA_FALLBACK = 258;
+
+/** Rough bytes-per-token ratio for non-image media, which is usually text-like once decoded. */
+const BYTES_PER_TOKEN = 4;
+
+type MediaPayload = { data: string; mediaType?: string; mimeType?: string };
+
+/**
+ * Detects the `{ data, mediaType | mimeType }` shape that tools return for images
+ * and file attachments, so the payload is estimated rather than tokenized as text.
+ */
+function isMediaPayload(value: unknown): value is MediaPayload {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  if (typeof candidate.data !== 'string') return false;
+  return typeof candidate.mediaType === 'string' || typeof candidate.mimeType === 'string';
+}
+
+/**
+ * Estimate the token cost of a media payload without tokenizing its encoded bytes.
+ * A base64 image is tens of thousands of characters but costs a small, near-flat
+ * number of tokens, so stringifying it would inflate the count by an order of magnitude.
+ */
+function estimateMediaTokens(data: unknown, mediaType?: string): number {
+  if (mediaType?.startsWith('image/')) return TOKENS_PER_IMAGE;
+
+  let byteLength: number | undefined;
+
+  if (typeof data === 'string') {
+    const { isDataUri, base64Content } = parseDataUri(data);
+    // Remote URLs and provider file ids carry no locally knowable size.
+    if (isDataUri || !/^[a-z][a-z0-9+.-]*:/i.test(data)) {
+      byteLength = Math.floor((base64Content.length * 3) / 4);
+    }
+  } else if (data instanceof Uint8Array) {
+    byteLength = data.byteLength;
+  }
+
+  if (byteLength === undefined) return TOKENS_PER_MEDIA_FALLBACK;
+
+  return Math.max(1, Math.floor(byteLength / BYTES_PER_TOKEN));
+}
+
 export class TokenLimiterProcessor implements Processor<'token-limiter', TokenLimiterTripWireMetadata> {
   public readonly id = 'token-limiter';
   public readonly name = 'Token Limiter';
-  private encoderPromise: Promise<Tiktoken> | undefined;
-  private customEncoding: TiktokenBPE | undefined;
   private maxTokens: number;
   private strategy: 'truncate' | 'abort';
   private countMode: 'cumulative' | 'part';
@@ -56,6 +107,14 @@ export class TokenLimiterProcessor implements Processor<'token-limiter', TokenLi
   // Token counting constants for input processing
   private static readonly TOKENS_PER_MESSAGE = 3.8;
   private static readonly TOKENS_PER_CONVERSATION = 24;
+
+  /**
+   * Chunk types carrying generated output visible to the caller. Only these are
+   * counted against the limit, and only these are withheld once it is reached.
+   * Lifecycle chunks (`step-start`, response metadata), reasoning deltas and
+   * tool traffic are neither counted nor withheld.
+   */
+  private static readonly OUTPUT_CHUNK_TYPES = new Set<ChunkType['type']>(['text-delta', 'object']);
 
   constructor(options: number | TokenLimiterOptions) {
     if (typeof options === 'number') {
@@ -67,30 +126,14 @@ export class TokenLimiterProcessor implements Processor<'token-limiter', TokenLi
     } else {
       // Object format with all options
       this.maxTokens = options.limit;
-      this.customEncoding = options.encoding;
       this.strategy = options.strategy || 'truncate';
       this.countMode = options.countMode || 'cumulative';
       this.trimMode = options.trimMode || 'best-fit';
     }
   }
 
-  /**
-   * Get the Tiktoken encoder, using the shared global singleton when no custom encoding is provided.
-   * The encoder is lazily initialized on first use and cached for subsequent calls.
-   */
-  private getEncoder(): Promise<Tiktoken> {
-    if (!this.encoderPromise) {
-      if (this.customEncoding) {
-        // Custom encoding: create a dedicated instance (can't use the shared singleton)
-        this.encoderPromise = import('js-tiktoken/lite').then(({ Tiktoken: TiktokenClass }) => {
-          return new TiktokenClass(this.customEncoding!);
-        });
-      } else {
-        // Default encoding: use the shared global singleton (~80-120MB saved per instance)
-        this.encoderPromise = getTiktoken();
-      }
-    }
-    return this.encoderPromise;
+  private countTokens(text: string): number {
+    return estimateTokenCount(text);
   }
 
   /**
@@ -102,7 +145,7 @@ export class TokenLimiterProcessor implements Processor<'token-limiter', TokenLi
    * within the token budget.
    */
   async processInputStep(args: ProcessInputStepArgs): Promise<void> {
-    const { messageList, systemMessages: coreSystemMessages } = args;
+    const { messageList } = args;
 
     if (!messageList) return;
 
@@ -115,12 +158,12 @@ export class TokenLimiterProcessor implements Processor<'token-limiter', TokenLi
       });
     }
 
-    // Calculate token count for system messages (always included, never filtered)
+    // Budget against the full system message set that will reach the model
+    // (untagged + tagged buckets), not just the untagged view exposed via args.
+    const allSystemMessages = messageList.getAllSystemMessages();
     let systemTokens = 0;
-    if (coreSystemMessages && coreSystemMessages.length > 0) {
-      for (const msg of coreSystemMessages) {
-        systemTokens += await this.countCoreSystemMessageTokens(msg);
-      }
+    for (const msg of allSystemMessages) {
+      systemTokens += await this.countCoreSystemMessageTokens(msg);
     }
 
     const limit = this.maxTokens;
@@ -178,8 +221,8 @@ export class TokenLimiterProcessor implements Processor<'token-limiter', TokenLi
   }
 
   /**
-   * Count tokens for a system message (CoreMessageV4 from args.systemMessages).
-   * This method only accepts system messages with string content and will throw otherwise.
+   * Count tokens for a system message. Accepts both untagged and tagged system messages
+   * read from `messageList.getAllSystemMessages()`. Only string content is supported.
    */
   private async countCoreSystemMessageTokens(message: CoreMessageV4): Promise<number> {
     if (message.role !== 'system') {
@@ -192,19 +235,19 @@ export class TokenLimiterProcessor implements Processor<'token-limiter', TokenLi
       throw new Error('countCoreSystemMessageTokens: System message content must be a string');
     }
 
-    const encoder = await this.getEncoder();
     const tokenString = message.role + message.content;
 
-    return encoder.encode(tokenString).length + TokenLimiterProcessor.TOKENS_PER_MESSAGE;
+    return this.countTokens(tokenString) + TokenLimiterProcessor.TOKENS_PER_MESSAGE;
   }
 
   /**
    * Count tokens for an input message, including overhead for message structure
    */
   private async countInputMessageTokens(message: MastraDBMessage): Promise<number> {
-    const encoder = await this.getEncoder();
     let tokenString = message.role;
     let overhead = 0;
+    // Media is estimated rather than tokenized, so it is accumulated separately.
+    let mediaTokens = 0;
 
     // Handle content based on MastraMessageV2 structure
     let toolResultCount = 0; // Track tool results that will become separate messages
@@ -244,12 +287,31 @@ export class TokenLimiterProcessor implements Processor<'token-limiter', TokenLi
               if (invocation.result !== undefined) {
                 if (typeof invocation.result === 'string') {
                   tokenString += invocation.result;
+                } else if (isMediaPayload(invocation.result)) {
+                  const { data, ...rest } = invocation.result;
+                  mediaTokens += estimateMediaTokens(data, invocation.result.mediaType ?? invocation.result.mimeType);
+                  tokenString += JSON.stringify(rest);
+                  overhead -= 12;
+                } else if (
+                  Array.isArray(invocation.result) &&
+                  invocation.result.length > 0 &&
+                  invocation.result.every(isMediaPayload)
+                ) {
+                  for (const entry of invocation.result as MediaPayload[]) {
+                    const { data, ...rest } = entry;
+                    mediaTokens += estimateMediaTokens(data, entry.mediaType ?? entry.mimeType);
+                    tokenString += JSON.stringify(rest);
+                  }
+                  overhead -= 12;
                 } else {
                   tokenString += JSON.stringify(invocation.result);
                   overhead -= 12;
                 }
               }
             }
+          } else if (part.type === 'file') {
+            const { data, mediaType } = resolveFilePartMediaTypeAndData(part);
+            mediaTokens += estimateMediaTokens(data, mediaType);
           } else {
             tokenString += JSON.stringify(part);
           }
@@ -266,43 +328,49 @@ export class TokenLimiterProcessor implements Processor<'token-limiter', TokenLi
       overhead += toolResultCount * TokenLimiterProcessor.TOKENS_PER_MESSAGE;
     }
 
-    const tokenCount = encoder.encode(tokenString).length;
-    const total = tokenCount + overhead;
+    const tokenCount = this.countTokens(tokenString);
+    const total = tokenCount + overhead + mediaTokens;
     return total;
   }
 
-  async processOutputStream(args: {
-    part: ChunkType;
-    streamParts: ChunkType[];
-    state: Record<string, any>;
-    abort: (reason?: string) => never;
-  }): Promise<ChunkType | null> {
+  async processOutputStream(args: ProcessOutputStreamArgs<TokenLimiterTripWireMetadata>): Promise<ChunkType | null> {
     // Always process output streams (this is the main/original functionality)
-    const { part, state, abort } = args;
+    const { part, state, abort, writer } = args;
     const limit = this.maxTokens;
 
-    // Initialize currentTokens in state if not present
-    if (state.currentTokens === undefined) {
-      state.currentTokens = 0;
+    // Chunks that don't carry generated output pass through untouched: counting
+    // them would spend the budget on payloads the caller never sees (a single
+    // `step-start` embeds the whole request body), and withholding them breaks
+    // the run (a withheld `tool-call` is never executed by the agentic loop).
+    if (!TokenLimiterProcessor.OUTPUT_CHUNK_TYPES.has(part.type)) {
+      return part;
     }
 
     // Count tokens in the current part
     const chunkTokens = await this.countTokensInChunk(part);
-
-    if (this.countMode === 'cumulative') {
-      // Add to cumulative count
-      state.currentTokens += chunkTokens;
-    } else {
-      // Only check the current part
-      state.currentTokens = chunkTokens;
-    }
+    const previousTokens = typeof state.currentTokens === 'number' ? state.currentTokens : 0;
+    const currentTokens = this.countMode === 'cumulative' ? previousTokens + chunkTokens : chunkTokens;
+    state.currentTokens = currentTokens;
 
     // Check if we've exceeded the limit
-    if (state.currentTokens > limit) {
+    if (currentTokens > limit) {
       if (this.strategy === 'abort') {
-        abort(`Token limit of ${limit} exceeded (current: ${state.currentTokens})`);
+        abort(`Token limit of ${limit} exceeded (current: ${currentTokens})`);
       } else {
-        // truncate strategy - don't emit this part
+        // truncate strategy - don't emit this part, but tell the caller once that
+        // output is being withheld so truncation isn't silent
+        if (!state.limitReachedNotified) {
+          state.limitReachedNotified = true;
+          try {
+            await writer?.custom({
+              type: 'data-token-limit-reached',
+              data: { processorId: this.id, limit, tokens: currentTokens },
+              transient: true,
+            });
+          } catch {
+            // never let the notification break the stream
+          }
+        }
         // If we're in part mode, reset the count for next part
         if (this.countMode === 'part') {
           state.currentTokens = 0;
@@ -323,41 +391,18 @@ export class TokenLimiterProcessor implements Processor<'token-limiter', TokenLi
   }
 
   private async countTokensInChunk(part: ChunkType): Promise<number> {
-    const encoder = await this.getEncoder();
     if (part.type === 'text-delta') {
       // For text chunks, count the text content directly
-      return encoder.encode(part.payload.text).length;
+      return this.countTokens(part.payload.text);
     } else if (part.type === 'object') {
       // For object chunks, count the JSON representation
       // This is similar to how the memory processor handles object content
       const objectString = JSON.stringify(part.object);
-      return encoder.encode(objectString).length;
-    } else if (part.type === 'tool-call') {
-      // For tool-call chunks, count tool name and args
-      let tokenString = part.payload.toolName;
-      if (part.payload.args) {
-        if (typeof part.payload.args === 'string') {
-          tokenString += part.payload.args;
-        } else {
-          tokenString += JSON.stringify(part.payload.args);
-        }
-      }
-      return encoder.encode(tokenString).length;
-    } else if (part.type === 'tool-result') {
-      // For tool-result chunks, count the result
-      let tokenString = '';
-      if (part.payload.result !== undefined) {
-        if (typeof part.payload.result === 'string') {
-          tokenString += part.payload.result;
-        } else {
-          tokenString += JSON.stringify(part.payload.result);
-        }
-      }
-      return encoder.encode(tokenString).length;
-    } else {
-      // For other part types, count the JSON representation
-      return encoder.encode(JSON.stringify(part)).length;
+      return this.countTokens(objectString);
     }
+
+    // Anything else carries no generated output and is not counted
+    return 0;
   }
 
   /**
@@ -371,7 +416,6 @@ export class TokenLimiterProcessor implements Processor<'token-limiter', TokenLi
     // Always process output results (this is the main/original functionality)
     const { messages, abort } = args;
     const limit = this.maxTokens;
-    const encoder = await this.getEncoder();
 
     // Use a local variable to track tokens within this single result processing
     let cumulativeTokens = 0;
@@ -384,7 +428,7 @@ export class TokenLimiterProcessor implements Processor<'token-limiter', TokenLi
       const processedParts = message.content.parts.map(part => {
         if (part.type === 'text') {
           const textContent = part.text;
-          const tokens = encoder.encode(textContent).length;
+          const tokens = this.countTokens(textContent);
 
           // Check if adding this part's tokens would exceed the cumulative limit
           if (cumulativeTokens + tokens <= limit) {
@@ -395,36 +439,9 @@ export class TokenLimiterProcessor implements Processor<'token-limiter', TokenLi
               abort(`Token limit of ${limit} exceeded (current: ${cumulativeTokens + tokens})`);
             } else {
               // Truncate the text to fit within the remaining token limit
-              let truncatedText = '';
-              let currentTokens = 0;
-              const remainingTokens = limit - cumulativeTokens;
-
-              // Find the cutoff point that fits within the remaining limit using binary search
-              let left = 0;
-              let right = textContent.length;
-              let bestLength = 0;
-              let bestTokens = 0;
-
-              while (left <= right) {
-                const mid = Math.floor((left + right) / 2);
-                const testText = textContent.slice(0, mid);
-                const testTokens = encoder.encode(testText).length;
-
-                if (testTokens <= remainingTokens) {
-                  // This length fits, try to find a longer one
-                  bestLength = mid;
-                  bestTokens = testTokens;
-                  left = mid + 1;
-                } else {
-                  // This length is too long, try a shorter one
-                  right = mid - 1;
-                }
-              }
-
-              truncatedText = textContent.slice(0, bestLength);
-              currentTokens = bestTokens;
-
-              cumulativeTokens += currentTokens;
+              const remainingTokens = Math.max(0, limit - cumulativeTokens);
+              const truncatedText = remainingTokens > 0 ? sliceByTokens(textContent, 0, remainingTokens) : '';
+              cumulativeTokens += this.countTokens(truncatedText);
 
               return {
                 ...part,

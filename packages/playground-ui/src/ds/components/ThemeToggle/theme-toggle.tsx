@@ -1,4 +1,5 @@
-import * as RadioGroupPrimitive from '@radix-ui/react-radio-group';
+import { Radio as RadioPrimitive } from '@base-ui/react/radio';
+import { RadioGroup as RadioGroupPrimitive } from '@base-ui/react/radio-group';
 import { Monitor, Moon, Sun } from 'lucide-react';
 
 import { useTheme } from '../ThemeProvider';
@@ -18,25 +19,50 @@ const DEFAULT_OPTIONS: ReadonlyArray<ThemeToggleOption> = [
   { value: 'dark', label: 'Dark', icon: <Moon /> },
 ];
 
-const ITEM_WIDTH = 28;
-const ITEM_GAP = 2;
+const SIZE_CONFIG = {
+  md: {
+    itemGap: 2,
+    itemWidth: 28,
+    root: 'gap-0.5 p-0.5',
+    indicator: 'inset-y-0.5 left-0.5',
+    item: 'h-6 [&_svg]:size-3.5',
+  },
+  xs: {
+    itemGap: 1,
+    itemWidth: 20,
+    root: 'gap-px p-px',
+    indicator: 'inset-y-px left-px',
+    item: 'h-4 [&_svg]:h-icon-sm [&_svg]:w-icon-sm',
+  },
+  sm: {
+    itemGap: 1,
+    itemWidth: 24,
+    root: 'gap-px p-px',
+    indicator: 'inset-y-px left-px',
+    item: 'h-5 [&_svg]:h-icon-sm [&_svg]:w-icon-sm',
+  },
+} as const;
 
 type RadioRootProps = Omit<
-  React.ComponentPropsWithoutRef<typeof RadioGroupPrimitive.Root>,
-  'value' | 'onChange' | 'onValueChange' | 'orientation' | 'defaultValue'
->;
+  RadioGroupPrimitive.Props,
+  'value' | 'onChange' | 'onValueChange' | 'defaultValue' | 'className'
+> & {
+  className?: string;
+};
 
 type ControlledProps = { value: Theme; onChange: (next: Theme) => void };
 type UncontrolledProps = { value?: undefined; onChange?: undefined };
 
 export type ThemeToggleProps = RadioRootProps & {
   options?: ReadonlyArray<ThemeToggleOption>;
+  size?: keyof typeof SIZE_CONFIG;
 } & (ControlledProps | UncontrolledProps);
 
 export const ThemeToggle = ({
   value,
   onChange,
   options = DEFAULT_OPTIONS,
+  size = 'md',
   className,
   'aria-label': ariaLabel = 'Theme',
   ...rest
@@ -46,7 +72,7 @@ export const ThemeToggle = ({
   const commit = onChange ?? setTheme;
   const effectiveCurrent = options.some(option => option.value === current) ? current : (options[0]?.value ?? 'system');
 
-  const handleChange = (next: string) => {
+  const handleChange = (next: unknown) => {
     const match = options.find(opt => opt.value === next);
     if (match) commit(match.value);
   };
@@ -55,37 +81,41 @@ export const ThemeToggle = ({
     0,
     options.findIndex(option => option.value === effectiveCurrent),
   );
-  const indicatorOffset = activeIndex * (ITEM_WIDTH + ITEM_GAP);
+  const sizeConfig = SIZE_CONFIG[size];
+  const indicatorOffset = activeIndex * (sizeConfig.itemWidth + sizeConfig.itemGap);
 
   return (
-    <RadioGroupPrimitive.Root
+    <RadioGroupPrimitive
       {...rest}
       value={effectiveCurrent}
       onValueChange={handleChange}
-      orientation="horizontal"
       aria-label={ariaLabel}
       className={cn(
-        'relative inline-flex w-fit items-center gap-0.5 rounded-full border border-border1 bg-surface3 p-0.5',
+        'relative inline-flex w-fit items-center rounded-full border border-border1 bg-surface3',
+        sizeConfig.root,
         className,
       )}
     >
       <span
         aria-hidden="true"
         className={cn(
-          'pointer-events-none absolute inset-y-0.5 left-0.5 rounded-full bg-surface5 motion-reduce:transition-none',
+          'pointer-events-none absolute rounded-full bg-surface5 motion-reduce:transition-none',
           transitions.transform,
+          sizeConfig.indicator,
         )}
-        style={{ width: ITEM_WIDTH, transform: `translateX(${indicatorOffset}px)` }}
+        style={{ width: sizeConfig.itemWidth, transform: `translateX(${indicatorOffset}px)` }}
       />
       {options.map(option => (
-        <RadioGroupPrimitive.Item
+        <RadioPrimitive.Root
           key={option.value}
           value={option.value}
           aria-label={option.label}
-          style={{ width: ITEM_WIDTH }}
+          style={{ width: sizeConfig.itemWidth }}
           className={cn(
-            'relative inline-flex h-6 cursor-pointer items-center justify-center rounded-full',
-            '[&_svg]:size-3.5 text-icon3 hover:text-icon6 data-[state=checked]:text-icon6',
+            'relative inline-flex cursor-pointer items-center justify-center rounded-full',
+            // Base UI exposes `data-checked` instead of Radix's `data-state="checked"`.
+            'text-icon3 hover:text-icon6 data-[checked]:text-icon6',
+            sizeConfig.item,
             'focus-visible:outline-hidden',
             'active:scale-90 motion-reduce:transition-none',
             transitions.colors,
@@ -95,8 +125,8 @@ export const ThemeToggle = ({
           <span aria-hidden="true" className="pointer-events-none inline-flex items-center justify-center">
             {option.icon}
           </span>
-        </RadioGroupPrimitive.Item>
+        </RadioPrimitive.Root>
       ))}
-    </RadioGroupPrimitive.Root>
+    </RadioGroupPrimitive>
   );
 };

@@ -1,6 +1,6 @@
 # @mastra/braintrust
 
-Braintrust AI Observability exporter for Mastra applications.
+Export Mastra traces to Braintrust for LLM evaluation and monitoring with zero-config environment variables or explicit project configuration.
 
 ## Installation
 
@@ -10,77 +10,31 @@ npm install @mastra/braintrust
 
 ## Usage
 
-### Zero-Config Setup
-
-The exporter automatically reads credentials from environment variables:
-
-```bash
-# Required
-BRAINTRUST_API_KEY=sk-...
-
-# Optional
-BRAINTRUST_ENDPOINT=https://api.braintrust.dev
-```
-
 ```typescript
+import { Mastra } from '@mastra/core/mastra';
+import { Observability } from '@mastra/observability';
 import { BraintrustExporter } from '@mastra/braintrust';
 
-const mastra = new Mastra({
-  ...,
-  observability: {
+export const mastra = new Mastra({
+  observability: new Observability({
     configs: {
       braintrust: {
         serviceName: 'my-service',
         exporters: [new BraintrustExporter()],
       },
     },
-  },
+  }),
 });
 ```
 
-### Explicit Configuration
+## Documentation
 
-You can also pass credentials directly:
+- [Braintrust](https://mastra.ai/integrations/observability/braintrust)
 
-```typescript
-import { BraintrustExporter } from '@mastra/braintrust';
+## Changelog
 
-const mastra = new Mastra({
-  ...,
-  observability: {
-    configs: {
-      braintrust: {
-        serviceName: 'my-service',
-        exporters: [
-          new BraintrustExporter({
-            apiKey: 'sk-...',
-            projectName: 'mastra-tracing', // Optional, defaults to 'mastra-tracing'
-            endpoint: 'https://api.braintrust.dev', // Optional
-          }),
-        ],
-      },
-    },
-  },
-});
-```
+See the [package changelog](https://github.com/mastra-ai/mastra/blob/main/observability/braintrust/CHANGELOG.md) for version history and release notes.
 
-### Configuration Options
+## Support
 
-| Option             | Type                 | Description                                                    |
-| ------------------ | -------------------- | -------------------------------------------------------------- |
-| `apiKey`           | `string`             | Braintrust API key. Defaults to `BRAINTRUST_API_KEY` env var   |
-| `endpoint`         | `string`             | Custom endpoint URL. Defaults to `BRAINTRUST_ENDPOINT` env var |
-| `projectName`      | `string`             | Project name. Defaults to `'mastra-tracing'`                   |
-| `braintrustLogger` | `Logger<true>`       | Optional Braintrust logger instance for context integration    |
-| `tuningParameters` | `Record<string,any>` | Support tuning parameters                                      |
-
-## Features
-
-### Tracing
-
-- **Automatic span mapping**: Root spans become Braintrust traces
-- **Type-specific metadata**: Extracts relevant metadata for each span type (agents, tools, workflows)
-- **Error tracking**: Automatic error status and message tracking
-- **Hierarchical traces**: Maintains parent-child relationships
-- **Event span support**: Zero-duration spans for event-type traces
-- **Context integration**: Attach to existing Braintrust spans from `logger.traced()` or `Eval()`
+We have an [open community Discord](https://discord.gg/mastra-ai). Come and say hello and let us know if you have any questions or need any help getting things running.

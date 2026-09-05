@@ -7,6 +7,7 @@
  */
 
 import type {
+  LightSpanRecord,
   SpanRecord,
   CreateSpanRecord,
   LogRecord,
@@ -18,7 +19,8 @@ import type {
   FeedbackRecord,
   CreateFeedbackRecord,
 } from '@mastra/core/storage';
-import { EntityType } from '@mastra/core/storage';
+import { buildInputPreview, computeTraceStatus, EntityType } from '@mastra/core/storage';
+import { coerceFeedbackReviewStatus } from './review-status';
 
 // ---------------------------------------------------------------------------
 // ClickHouse query settings
@@ -198,6 +200,34 @@ export function rowToSpanRecord(row: Record<string, any>): SpanRecord {
 
 export function rowsToSpanRecords(rows: Record<string, any>[]): SpanRecord[] {
   return rows.map(rowToSpanRecord);
+}
+
+export function rowToLightSpanRecord(row: Record<string, any>): LightSpanRecord {
+  const startedAt = toDate(row.startedAt);
+  const endedAt = row.isEvent ? startedAt : toDateOrNull(row.endedAt);
+  const error = parseJson(row.error) ?? undefined;
+
+  return {
+    traceId: row.traceId,
+    spanId: row.spanId,
+    parentSpanId: nullableString(row.parentSpanId),
+    name: row.name,
+    spanType: row.spanType,
+    isEvent: Boolean(row.isEvent),
+    startedAt,
+    endedAt,
+    entityType: nullableEntityType(row.entityType),
+    entityId: nullableString(row.entityId),
+    entityName: nullableString(row.entityName),
+    error,
+    status: computeTraceStatus({ error, endedAt }),
+    metadata: (parseJson(row.metadataRaw) as Record<string, unknown> | null) ?? undefined,
+    // Derived at read time from the raw `input` column; buildInputPreview parses
+    // internally and previews an unparseable document as empty.
+    inputPreview: buildInputPreview(row.input ?? null),
+    createdAt: startedAt,
+    updatedAt: null,
+  };
 }
 
 export function spanRecordToRow(span: CreateSpanRecord): Record<string, unknown> {
@@ -533,6 +563,7 @@ export function rowToFeedbackRecord(row: Record<string, any>): FeedbackRecord {
     serviceName: nullableString(row.serviceName),
     feedbackUserId,
     sourceId: nullableString(row.sourceId),
+    reviewStatus: coerceFeedbackReviewStatus(row.reviewStatus),
     feedbackSource,
     feedbackType: row.feedbackType,
     value: hasNumber ? Number(row.valueNumber) : (nullableString(row.valueString) ?? ''),
@@ -578,6 +609,7 @@ export function feedbackRecordToRow(feedback: CreateFeedbackRecord): Record<stri
     serviceName: feedback.serviceName ?? null,
     feedbackUserId,
     sourceId: feedback.sourceId ?? null,
+    reviewStatus: feedback.reviewStatus ?? 'needs-review',
     feedbackSource,
     feedbackType: feedback.feedbackType,
     valueString: typeof feedback.value === 'string' ? feedback.value : null,

@@ -152,6 +152,189 @@ describe('MessageList AI SDK v6 support', () => {
     ]);
   });
 
+  it('preserves plain dynamic-tool parts with input-streaming state', () => {
+    const list = new MessageList().add(
+      [
+        {
+          id: 'assistant-dynamic-tool-streaming',
+          role: 'assistant',
+          parts: [
+            {
+              type: 'dynamic-tool',
+              toolName: 'search',
+              toolCallId: 'call-1',
+              state: 'input-streaming',
+              input: { query: 'weath' },
+            },
+          ],
+        },
+      ] satisfies UIMessageV6[],
+      'memory',
+    );
+
+    expect(list.get.all.db()[0]?.content.parts).toMatchObject([
+      {
+        type: 'tool-invocation',
+        toolInvocation: {
+          toolName: 'search',
+          toolCallId: 'call-1',
+          state: 'partial-call',
+          args: { query: 'weath' },
+        },
+      },
+    ]);
+  });
+
+  it('preserves plain dynamic-tool parts with input-available state', () => {
+    const list = new MessageList().add(
+      [
+        {
+          id: 'assistant-dynamic-tool-input',
+          role: 'assistant',
+          parts: [
+            {
+              type: 'dynamic-tool',
+              toolName: 'search',
+              toolCallId: 'call-1',
+              state: 'input-available',
+              input: { query: 'weather' },
+            },
+          ],
+        },
+      ] satisfies UIMessageV6[],
+      'memory',
+    );
+
+    expect(list.get.all.db()[0]?.content.parts).toMatchObject([
+      {
+        type: 'tool-invocation',
+        toolInvocation: {
+          toolName: 'search',
+          toolCallId: 'call-1',
+          state: 'call',
+          args: { query: 'weather' },
+        },
+      },
+    ]);
+    expect(list.get.all.db()[0]?.content.toolInvocations).toMatchObject([
+      {
+        toolName: 'search',
+        toolCallId: 'call-1',
+        state: 'call',
+        args: { query: 'weather' },
+      },
+    ]);
+  });
+
+  it('preserves plain dynamic-tool parts with output-available state', () => {
+    const list = new MessageList().add(
+      [
+        {
+          id: 'assistant-dynamic-tool-output',
+          role: 'assistant',
+          parts: [
+            {
+              type: 'dynamic-tool',
+              toolName: 'search',
+              toolCallId: 'call-1',
+              state: 'output-available',
+              input: { query: 'weather' },
+              output: { forecast: 'sunny' },
+            },
+          ],
+        },
+      ] satisfies UIMessageV6[],
+      'memory',
+    );
+
+    expect(list.get.all.db()[0]?.content.parts).toMatchObject([
+      {
+        type: 'tool-invocation',
+        toolInvocation: {
+          toolName: 'search',
+          toolCallId: 'call-1',
+          state: 'result',
+          args: { query: 'weather' },
+          result: { forecast: 'sunny' },
+        },
+      },
+    ]);
+  });
+
+  it('preserves plain dynamic-tool parts with output-error state', () => {
+    const list = new MessageList().add(
+      [
+        {
+          id: 'assistant-dynamic-tool-error',
+          role: 'assistant',
+          parts: [
+            {
+              type: 'dynamic-tool',
+              toolName: 'search',
+              toolCallId: 'call-1',
+              state: 'output-error',
+              input: { query: 'weather' },
+              errorText: 'Search failed',
+              rawInput: '{"query":"weather"}',
+            },
+          ],
+        },
+      ] satisfies UIMessageV6[],
+      'memory',
+    );
+
+    expect(list.get.all.db()[0]?.content.parts).toMatchObject([
+      {
+        type: 'tool-invocation',
+        toolInvocation: {
+          toolName: 'search',
+          toolCallId: 'call-1',
+          state: 'output-error',
+          args: { query: 'weather' },
+          errorText: 'Search failed',
+          rawInput: '{"query":"weather"}',
+        },
+      },
+    ]);
+  });
+
+  it('preserves plain dynamic-tool parts mixed with custom data parts', () => {
+    const list = new MessageList().add(
+      [
+        {
+          id: 'assistant-dynamic-tool-data',
+          role: 'assistant',
+          parts: [
+            { type: 'data-progress', data: { step: 1 } } as any,
+            {
+              type: 'dynamic-tool',
+              toolName: 'search',
+              toolCallId: 'call-1',
+              state: 'input-available',
+              input: { query: 'weather' },
+            },
+            { type: 'data-custom', data: { foo: 'bar' } } as any,
+          ],
+        },
+      ] satisfies UIMessageV6[],
+      'memory',
+    );
+
+    expect(list.get.all.db()[0]?.content.parts).toMatchObject([
+      { type: 'data-progress', data: { step: 1 } },
+      {
+        type: 'tool-invocation',
+        toolInvocation: {
+          toolName: 'search',
+          toolCallId: 'call-1',
+          state: 'call',
+          args: { query: 'weather' },
+        },
+      },
+      { type: 'data-custom', data: { foo: 'bar' } },
+    ]);
+  });
+
   it('supports AIV6.UI in convertMessages()', () => {
     const messages: UIMessageV6[] = [
       {
@@ -255,6 +438,228 @@ describe('MessageList AI SDK v6 support', () => {
       state: 'approval-responded',
       input: { query: 'weather' },
       approval: { id: 'approval-1', approved: false, reason: 'needs human review' },
+    });
+  });
+
+  it('preserves stored toModelOutput metadata across db to v6 ui to db round-trips', () => {
+    const toolResultMessage: MastraDBMessage = {
+      id: 'msg-model-output',
+      role: 'assistant',
+      createdAt: new Date(),
+      content: {
+        format: 2,
+        parts: [
+          {
+            type: 'tool-invocation',
+            toolInvocation: {
+              toolCallId: 'call-1',
+              toolName: 'screenshotTool',
+              state: 'result',
+              args: { url: 'https://example.com' },
+              result: { ok: true, _b64: 'base64imagedata' },
+            },
+            providerMetadata: {
+              mastra: {
+                modelOutput: {
+                  type: 'content',
+                  value: [{ type: 'media', data: 'base64imagedata', mediaType: 'image/jpeg' }],
+                },
+              },
+            },
+          },
+        ],
+      },
+    };
+
+    const uiMessage = new MessageList().add([toolResultMessage], 'memory').get.all.aiV6.ui()[0]!;
+    const toolUIPart = uiMessage.parts.find(part => AIV6.isToolUIPart(part)) as any;
+
+    // Stored modelOutput travels on the v6 UI part as callProviderMetadata
+    expect(toolUIPart?.callProviderMetadata?.mastra?.modelOutput).toEqual({
+      type: 'content',
+      value: [{ type: 'media', data: 'base64imagedata', mediaType: 'image/jpeg' }],
+    });
+
+    // And survives ingestion back into a db message
+    const roundTripped = new MessageList().add([uiMessage], 'memory').get.all.db()[0]!;
+    const roundTrippedPart = roundTripped.content.parts.find(part => part.type === 'tool-invocation') as any;
+    expect(roundTrippedPart?.toolInvocation?.result).toEqual({ ok: true, _b64: 'base64imagedata' });
+    expect(roundTrippedPart?.providerMetadata?.mastra?.modelOutput).toEqual({
+      type: 'content',
+      value: [{ type: 'media', data: 'base64imagedata', mediaType: 'image/jpeg' }],
+    });
+  });
+
+  it('rehydrates persisted pending tool approvals into v6 approval-requested tool parts on reload', () => {
+    const messages: MastraDBMessage[] = [
+      {
+        id: 'msg-pending-approval',
+        role: 'assistant',
+        createdAt: new Date('2024-01-01'),
+        content: {
+          format: 2,
+          parts: [
+            {
+              type: 'tool-invocation',
+              providerMetadata: {
+                mastra: {
+                  display: {
+                    input: { approvedPath: '/tmp/test.txt' },
+                  },
+                },
+              },
+              providerExecuted: true,
+              title: 'Delete file',
+              toolInvocation: {
+                toolCallId: 'tc-2',
+                toolName: 'delete-file',
+                args: { path: '/tmp/test.txt' },
+                state: 'call',
+              },
+            },
+            {
+              type: 'data-tool-call-approval',
+              data: {
+                toolCallId: 'tc-2',
+                toolName: 'delete-file',
+                type: 'approval',
+                runId: 'run-2',
+              },
+            } as any,
+            { type: 'text', text: 'Waiting for approval.' },
+          ],
+          metadata: {
+            pendingToolApprovals: {
+              'delete-file': {
+                toolCallId: 'tc-2',
+                toolName: 'delete-file',
+                args: { path: '/tmp/test.txt' },
+                type: 'approval',
+                runId: 'run-2',
+              },
+            },
+          },
+        },
+      },
+    ];
+
+    const result = new MessageList().add(messages, 'memory').get.all.aiV6.ui();
+    const toolParts = result[0]?.parts.filter(part => AIV6.isToolUIPart(part)) ?? [];
+
+    expect(toolParts).toHaveLength(1);
+    expect(toolParts[0]).toMatchObject({
+      type: 'tool-delete-file',
+      toolCallId: 'tc-2',
+      state: 'approval-requested',
+      input: { path: '/tmp/test.txt' },
+      approval: { id: 'run-2::tc-2' },
+      callProviderMetadata: {
+        mastra: {
+          display: {
+            input: { approvedPath: '/tmp/test.txt' },
+          },
+        },
+      },
+      providerExecuted: true,
+      title: 'Delete file',
+    });
+
+    expect(result[0]?.parts.filter(part => part.type === 'data-tool-call-approval')).toHaveLength(1);
+  });
+
+  it('adds v6 tool approval responses after reloading a metadata-backed pending approval', () => {
+    const list = new MessageList().add(
+      [
+        {
+          id: 'msg-pending-approval',
+          role: 'assistant',
+          createdAt: new Date('2024-01-01'),
+          content: {
+            format: 2,
+            parts: [
+              {
+                type: 'tool-invocation',
+                providerMetadata: {
+                  mastra: {
+                    display: {
+                      input: { approvedPath: '/tmp/test.txt' },
+                    },
+                  },
+                },
+                providerExecuted: true,
+                title: 'Delete file',
+                toolInvocation: {
+                  toolCallId: 'tc-2',
+                  toolName: 'delete-file',
+                  args: { path: '/tmp/test.txt' },
+                  state: 'call',
+                },
+              },
+              {
+                type: 'data-tool-call-approval',
+                data: {
+                  toolCallId: 'tc-2',
+                  toolName: 'delete-file',
+                  type: 'approval',
+                  runId: 'run-2',
+                },
+              } as any,
+              { type: 'text', text: 'Waiting for approval.' },
+            ],
+            metadata: {
+              pendingToolApprovals: {
+                'delete-file': {
+                  toolCallId: 'tc-2',
+                  toolName: 'delete-file',
+                  args: { path: '/tmp/test.txt' },
+                  type: 'approval',
+                  runId: 'run-2',
+                },
+              },
+            },
+          },
+        },
+      ] satisfies MastraDBMessage[],
+      'memory',
+    );
+
+    list.add(
+      [
+        {
+          role: 'tool',
+          content: [
+            {
+              type: 'tool-approval-response',
+              approvalId: 'run-2::tc-2',
+              approved: false,
+              reason: 'needs human review',
+            },
+          ],
+        },
+      ] satisfies ModelMessageV6[],
+      'response',
+    );
+
+    const approvalResponsePart = list.get.all.aiV6
+      .ui()
+      .flatMap(message => message.parts)
+      .find(part => AIV6.isToolUIPart(part) && part.state === 'approval-responded');
+
+    expect(approvalResponsePart).toMatchObject({
+      type: 'tool-delete-file',
+      toolCallId: 'tc-2',
+      state: 'approval-responded',
+      input: { path: '/tmp/test.txt' },
+      approval: { id: 'run-2::tc-2', approved: false, reason: 'needs human review' },
+      callProviderMetadata: {
+        mastra: {
+          display: {
+            input: { approvedPath: '/tmp/test.txt' },
+          },
+        },
+      },
+      providerExecuted: true,
+      title: 'Delete file',
     });
   });
 

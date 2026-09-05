@@ -1,9 +1,12 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
+import type { ProviderDefinedTool } from '@internal/external-types';
 import { assertType, describe, expectTypeOf, it } from 'vitest';
 import { z } from 'zod/v4';
 import type { RequestContext } from '../request-context';
 import type { PublicSchema } from '../schema';
-import type { AgentExecutionOptions } from './agent.types';
+import { createTool, webSearchTool } from '../tools';
+import { Agent } from './agent';
+import type { AgentExecutionOptions, PublicAgentExecutionOptions } from './agent.types';
 import type { AgentConfig } from './types';
 
 /**
@@ -149,6 +152,282 @@ describe('Agent Type Tests', () => {
       };
 
       expectTypeOf(config.id).toEqualTypeOf<'test-agent'>();
+    });
+
+    it('should type requestContext in skills function based on requestContextSchema', () => {
+      // No explicit TRequestContext generic — the type must be inferred from
+      // requestContextSchema so a regression to RequestContext<unknown> fails.
+      new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        model: {} as any,
+        requestContextSchema: z.object({
+          documentId: z.string(),
+          userId: z.string(),
+        }),
+        instructions: 'You are a helpful assistant',
+        skills: ({ requestContext }) => {
+          // Verify requestContext is typed
+          expectTypeOf(requestContext).toEqualTypeOf<RequestContext<{ documentId: string; userId: string }>>();
+
+          // Verify get() returns the correct type
+          const documentId = requestContext.get('documentId');
+          expectTypeOf(documentId).toEqualTypeOf<string>();
+
+          // Verify unknown keys are rejected on the strict API
+          // @ts-expect-error - key does not exist in the request context schema
+          requestContext.get('nonexistentKey');
+
+          // Runtime-only keys are available through the open-map escape hatch
+          const raw = requestContext.getRaw('nonexistentKey');
+          expectTypeOf(raw).toEqualTypeOf<unknown>();
+
+          return [];
+        },
+      });
+    });
+
+    it('should keep a schema-typed agent assignable to Agent (issue #21286)', () => {
+      const schemaAgent = new Agent({
+        id: 'schema-agent',
+        name: 'Schema Agent',
+        model: {} as any,
+        instructions: 'You are a helpful assistant',
+        requestContextSchema: z.object({
+          tenantTier: z.enum(['free', 'pro']).optional(),
+          verbose: z.boolean().optional(),
+        }),
+      });
+
+      // Generic helpers typed as bare `Agent` must accept schema-narrowed agents.
+      expectTypeOf(schemaAgent).toExtend<Agent>();
+
+      const driveAgent = (_agent: Agent): Promise<void> => Promise.resolve();
+      void driveAgent(schemaAgent);
+    });
+  });
+
+  describe('Issue #16732: AgentExecutionOptions<undefined> should not require structuredOutput', () => {
+    it('should allow AgentExecutionOptions<undefined> without structuredOutput', () => {
+      assertType<AgentExecutionOptions<undefined>>({ maxSteps: 50 });
+    });
+
+    it('should allow PublicAgentExecutionOptions<undefined> without structuredOutput', () => {
+      assertType<PublicAgentExecutionOptions<undefined>>({ maxSteps: 50 });
+    });
+
+    it('should allow AgentExecutionOptions<null> without structuredOutput', () => {
+      assertType<AgentExecutionOptions<null>>({ maxSteps: 50 });
+    });
+
+    it('should still require structuredOutput for an object OUTPUT', () => {
+      const schema = z.object({ value: z.string() });
+      // @ts-expect-error structuredOutput is required when OUTPUT is an object
+      assertType<AgentExecutionOptions<{ value: string }>>({ maxSteps: 50 });
+      assertType<AgentExecutionOptions<{ value: string }>>({
+        maxSteps: 50,
+        structuredOutput: { schema },
+      });
+    });
+
+    it('should not require structuredOutput for a nullable union (T | undefined)', () => {
+      // NonNullable<string | undefined> is `string`, which is not an object type,
+      // so structuredOutput stays optional for the nullable-union case.
+      assertType<AgentExecutionOptions<string | undefined>>({ maxSteps: 50 });
+    });
+  });
+
+  // Editor ownership is enforced via the `TEditor` generic inferred at
+  // `new Agent({...})` from the literal `editor` property. Annotating a value
+  // as the bare `AgentConfig` (default `TEditor`) intentionally does NOT narrow
+  // ownership, so these tests construct agents to exercise inference.
+  describe('editor config ownership', () => {
+    it('requires instructions when editor is absent', () => {
+      // @ts-expect-error - instructions is required when not owned by the editor
+      new Agent({ id: 'a', name: 'A', model: {} as any });
+    });
+
+    it('requires instructions when editor is false (nothing owned)', () => {
+      new Agent({ id: 'a', name: 'A', model: {} as any, editor: false, instructions: 'hi', tools: {} });
+
+      // @ts-expect-error - instructions still required when editor is false
+      new Agent({ id: 'a', name: 'A', model: {} as any, editor: false });
+    });
+
+    it('forbids instructions in code when editor owns instructions', () => {
+      new Agent({ id: 'a', name: 'A', model: {} as any, editor: { instructions: true }, tools: {} });
+
+      new Agent({
+        id: 'a',
+        name: 'A',
+        model: {} as any,
+        editor: { instructions: true },
+        // @ts-expect-error - instructions are owned by the editor, code must not set them
+        instructions: 'hi',
+      });
+    });
+
+    it('forbids tools in code when editor owns tool membership', () => {
+      new Agent({ id: 'a', name: 'A', model: {} as any, editor: { tools: true }, instructions: 'hi' });
+
+      new Agent({
+        id: 'a',
+        name: 'A',
+        model: {} as any,
+        editor: { tools: true },
+        instructions: 'hi',
+        // @ts-expect-error - tool membership is owned by the editor, code must not set tools
+        tools: {},
+      });
+    });
+
+    it('keeps tools code-owned in descriptions-only mode', () => {
+      // description-only editing leaves tool membership in code, so tools stay allowed
+      new Agent({
+        id: 'a',
+        name: 'A',
+        model: {} as any,
+        editor: { tools: { description: true } },
+        instructions: 'hi',
+        tools: {},
+      });
+    });
+
+    it('forbids both fields when editor owns instructions and tools', () => {
+      new Agent({ id: 'a', name: 'A', model: {} as any, editor: { instructions: true, tools: true } });
+
+      new Agent({
+        id: 'a',
+        name: 'A',
+        model: {} as any,
+        editor: { instructions: true, tools: true },
+        // @ts-expect-error - both fields owned by the editor
+        instructions: 'hi',
+      });
+    });
+  });
+
+  describe('Issue #20201: tool-approval resume methods expose a typed `model` override', () => {
+    // `resumeStream`/`resumeGenerate` already accept and consume a per-resume `model`
+    // override, but the public approve/decline entry points previously omitted it from
+    // their option types — forcing callers to cast past the signature (the source even
+    // carried a `// @ts-expect-error - the types here are wrong`). A `model` key on the
+    // options literal must now type-check against each method's parameter type; without
+    // the fix these object literals fail excess-property checking.
+    const agent = new Agent({ id: 'a', name: 'A', model: {} as any, instructions: 'hi' });
+
+    it('accepts `model` on approveToolCall / declineToolCall (stream)', () => {
+      const approve: Parameters<typeof agent.approveToolCall>[0] = { runId: 'r', model: {} as any };
+      const decline: Parameters<typeof agent.declineToolCall>[0] = { runId: 'r', model: {} as any };
+      assertType<string>(approve.runId);
+      assertType<string>(decline.runId);
+    });
+
+    it('accepts `model` on approveToolCallGenerate / declineToolCallGenerate (generate)', () => {
+      const approve: Parameters<typeof agent.approveToolCallGenerate>[0] = { runId: 'r', model: {} as any };
+      const decline: Parameters<typeof agent.declineToolCallGenerate>[0] = { runId: 'r', model: {} as any };
+      assertType<string>(approve.runId);
+      assertType<string>(decline.runId);
+    });
+  });
+
+  describe('Issue #15229: `AgentConfig.tools` rejects plain functions as individual entries', () => {
+    // `ProviderDefinedTool`'s v5 branch is all-optional with an index signature, which made
+    // any value — including a bare function — satisfy `ToolsInput`. Nested resolvers like
+    // `tools: { myTool: () => realTool }` compiled but crashed at runtime in `listTools()`.
+    const realTool = createTool({
+      id: 'real-tool',
+      description: 'a real tool',
+      inputSchema: z.object({ q: z.string() }),
+      execute: async () => ({ ok: true }),
+    });
+
+    it('rejects a function entry that returns a valid tool', () => {
+      const config: AgentConfig = {
+        id: 'a',
+        name: 'A',
+        model: {} as any,
+        instructions: 'hi',
+        // @ts-expect-error - per-entry resolver functions are not tools
+        tools: { myTool: () => realTool },
+      };
+      assertType<string>(config.name!);
+    });
+
+    it('rejects a function entry that returns a non-tool value', () => {
+      const config: AgentConfig = {
+        id: 'a',
+        name: 'A',
+        model: {} as any,
+        instructions: 'hi',
+        // @ts-expect-error - per-entry resolver functions are not tools
+        tools: { myTool: () => 42 },
+      };
+      assertType<string>(config.name!);
+    });
+
+    it('rejects an async function entry', () => {
+      const config: AgentConfig = {
+        id: 'a',
+        name: 'A',
+        model: {} as any,
+        instructions: 'hi',
+        // @ts-expect-error - per-entry resolver functions are not tools
+        tools: { myTool: async () => ({}) },
+      };
+      assertType<string>(config.name!);
+    });
+
+    it('accepts a static tool entry', () => {
+      const config: AgentConfig = {
+        id: 'a',
+        name: 'A',
+        model: {} as any,
+        instructions: 'hi',
+        tools: { myTool: realTool },
+      };
+      assertType<string>(config.name!);
+    });
+
+    it('accepts the webSearchTool placeholder as an entry', () => {
+      const config: AgentConfig = {
+        id: 'a',
+        name: 'A',
+        model: {} as any,
+        instructions: 'hi',
+        tools: { searchTheWeb: webSearchTool },
+      };
+      assertType<string>(config.name!);
+    });
+
+    it('accepts a provider-defined tool entry', () => {
+      const config: AgentConfig = {
+        id: 'a',
+        name: 'A',
+        model: {} as any,
+        instructions: 'hi',
+        tools: {
+          googleSearch: {
+            type: 'provider-defined',
+            id: 'google.google_search',
+            args: {},
+          } as any as ProviderDefinedTool & {
+            id: string;
+          },
+        },
+      };
+      assertType<string>(config.name!);
+    });
+
+    it('still accepts a whole-map resolver on `tools`', () => {
+      const config: AgentConfig = {
+        id: 'a',
+        name: 'A',
+        model: {} as any,
+        instructions: 'hi',
+        tools: () => ({ myTool: realTool }),
+      };
+      assertType<string>(config.name!);
     });
   });
 });

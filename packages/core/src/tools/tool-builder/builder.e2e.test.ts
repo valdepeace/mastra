@@ -2,7 +2,8 @@ import { openai } from '@ai-sdk/openai';
 import { createOpenAI as createOpenAIV5 } from '@ai-sdk/openai-v5';
 import type { LanguageModelV2 } from '@ai-sdk/provider-v5';
 import type { LanguageModelV1 as LanguageModel } from '@internal/ai-sdk-v4';
-import { createGatewayMock } from '@internal/test-utils';
+import { getLLMTestMode } from '@internal/llm-recorder';
+import { createGatewayMock, setupDummyApiKeys } from '@internal/test-utils';
 import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 import { createOpenRouter as createOpenRouterV5 } from '@openrouter/ai-sdk-provider-v5';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -13,6 +14,8 @@ import type { AnySpan } from '../../observability';
 import { RequestContext } from '../../request-context';
 import { createTool } from '../../tools';
 import { CoreToolBuilder } from './builder';
+
+setupDummyApiKeys(getLLMTestMode(), ['openai', 'openrouter']);
 
 const mock = createGatewayMock({ exactMatch: true });
 beforeAll(() => mock.start());
@@ -318,7 +321,6 @@ async function runSingleToolSchemaTest(
 const SUITE_TIMEOUT = 300000; // 5 minutes
 const TEST_TIMEOUT = 300000; // 5 minutes
 
-if (!process.env.OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY environment variable is required');
 const openrouter = createOpenRouter({ apiKey: process.env.OPENROUTER_API_KEY });
 
 const modelsToTestV1 = [
@@ -552,8 +554,9 @@ describe('CoreToolBuilder ID Preservation', () => {
 });
 
 describe('Tool Tracing Context Injection', () => {
-  it('should inject tracingContext for Mastra tools when agentSpan is available', async () => {
+  it('should inject tracingContext and a span-backed observe helper for Mastra tools when agentSpan is available', async () => {
     let receivedTracingContext: any = null;
+    const info = vi.fn();
 
     const testTool = createTool({
       id: 'tracing-test-tool',
@@ -561,12 +564,23 @@ describe('Tool Tracing Context Injection', () => {
       inputSchema: z.object({ message: z.string() }),
       execute: async (inputData, context) => {
         receivedTracingContext = context?.tracingContext;
+        context?.observe.log('info', 'tool executed', { message: inputData.message });
         return { result: `processed: ${inputData.message}` };
       },
     });
 
     // Mock agent span
     const mockToolSpan = {
+      isValid: true,
+      observabilityInstance: {
+        getLoggerContext: vi.fn(() => ({
+          debug: vi.fn(),
+          info,
+          warn: vi.fn(),
+          error: vi.fn(),
+          fatal: vi.fn(),
+        })),
+      },
       end: vi.fn(),
       error: vi.fn(),
     };
@@ -601,6 +615,7 @@ describe('Tool Tracing Context Injection', () => {
       name: "tool: 'tracing-test-tool'",
       input: { message: 'test' },
       attributes: {
+        toolCallId: 'test-call-id',
         toolDescription: 'Test tool that captures tracing context',
         toolType: 'tool',
       },
@@ -616,6 +631,7 @@ describe('Tool Tracing Context Injection', () => {
     // Verify tracingContext was injected with the tool span
     expect(receivedTracingContext).toBeTruthy();
     expect(receivedTracingContext.currentSpan).toBe(mockToolSpan);
+    expect(info).toHaveBeenCalledWith('tool executed', { message: 'test' });
 
     // Verify tool span was ended with result and success attribute
     expect(mockToolSpan.end).toHaveBeenCalledWith({
@@ -710,6 +726,7 @@ describe('Tool Tracing Context Injection', () => {
       name: "tool: 'vercel-tool'",
       input: { input: 'test' },
       attributes: {
+        toolCallId: 'test-call-id',
         toolDescription: 'Vercel tool test',
         toolType: 'tool',
       },
@@ -1008,6 +1025,7 @@ describe('Tool Tracing Context Injection', () => {
       name: "tool: 'toolset-tool'",
       input: { message: 'test' },
       attributes: {
+        toolCallId: 'test-call-id',
         toolDescription: 'Tool from a toolset',
         toolType: 'toolset',
       },

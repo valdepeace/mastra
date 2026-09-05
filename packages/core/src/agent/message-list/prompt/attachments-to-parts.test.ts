@@ -1,6 +1,6 @@
-import type { Attachment } from '@ai-sdk/ui-utils-v5';
 import type { FilePart, ImagePart } from '@internal/ai-sdk-v5';
 import { describe, it, expect } from 'vitest';
+import type { Attachment } from './attachments-to-parts';
 import { attachmentsToParts } from './attachments-to-parts';
 
 describe('attachmentsToParts', () => {
@@ -154,6 +154,29 @@ describe('attachmentsToParts', () => {
       mimeType: 'image/gif',
     });
     expect(imagePart2.image).toContain('data:image/gif;base64,');
+  });
+
+  it('should pass through OpenAI Files API file IDs as file parts without constructing a URL', () => {
+    const fileId = 'file-XkZk6RV6jeACpVewBphWEX';
+    const attachments: Attachment[] = [
+      {
+        url: fileId,
+        contentType: 'application/pdf',
+        name: 'document.pdf',
+      },
+    ];
+
+    // Must not throw "Invalid URL: file-..." (regression for #16408 follow-up)
+    expect(() => attachmentsToParts(attachments)).not.toThrow();
+
+    const parts = attachmentsToParts(attachments);
+    expect(parts).toHaveLength(1);
+    const filePart = parts[0] as unknown as FilePart;
+    expect(filePart).toMatchObject({
+      type: 'file',
+      data: fileId,
+      mimeType: 'application/pdf',
+    });
   });
 
   it('should throw error for raw base64 without contentType', () => {

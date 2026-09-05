@@ -81,7 +81,7 @@ const isRecord = (value: unknown): value is Record<string, any> => {
 };
 
 const getTextFromValue = (value: unknown): string | undefined => {
-  if (typeof value === 'string') return value;
+  if (typeof value === 'string') return value === '' ? undefined : value;
   if (Array.isArray(value)) {
     const textParts = value
       .filter(part => isRecord(part) && part.type === 'text' && typeof part.text === 'string')
@@ -90,10 +90,13 @@ const getTextFromValue = (value: unknown): string | undefined => {
   }
   if (!isRecord(value)) return undefined;
 
+  const fromParts = Array.isArray(value.parts) ? getTextFromValue(value.parts) : undefined;
+
   return (
     getTextFromValue(value.content) ??
-    (typeof value.text === 'string' ? value.text : undefined) ??
-    (typeof value.body === 'string' ? value.body : undefined)
+    (typeof value.text === 'string' && value.text !== '' ? value.text : undefined) ??
+    (typeof value.body === 'string' && value.body !== '' ? value.body : undefined) ??
+    fromParts
   );
 };
 
@@ -121,10 +124,31 @@ export const isScorerRunOutputForAgent = (output: unknown): output is ScorerRunO
   return Array.isArray(output) && output.every(isMastraDBMessageLike);
 };
 
+/**
+ * Resolves the effective role of a message, accounting for agent signal messages.
+ *
+ * Messages delivered through the agent subscription / signal API are persisted with
+ * `role: 'signal'` and carry their semantic role (e.g. `user`) on `type` and on
+ * `content.metadata.signal.{type,tagName}`. Treat those as their underlying role so
+ * helpers like `getUserMessageFromRunInput` can find them.
+ */
+const getEffectiveMessageRole = (message: Record<string, any>): string | undefined => {
+  if (message.role !== 'signal') return typeof message.role === 'string' ? message.role : undefined;
+
+  const signalMeta =
+    isRecord(message.content) && isRecord(message.content.metadata) ? message.content.metadata.signal : undefined;
+
+  const tagName = isRecord(signalMeta) && typeof signalMeta.tagName === 'string' ? signalMeta.tagName : undefined;
+  const signalType = isRecord(signalMeta) && typeof signalMeta.type === 'string' ? signalMeta.type : undefined;
+  const topLevelType = typeof message.type === 'string' ? message.type : undefined;
+
+  return tagName ?? signalType ?? topLevelType;
+};
+
 const getTextFromMessages = (messages: unknown, role: string): string | undefined => {
   if (!Array.isArray(messages)) return undefined;
 
-  const message = messages.find(message => isRecord(message) && message.role === role);
+  const message = messages.find(message => isRecord(message) && getEffectiveMessageRole(message) === role);
   return message ? getTextFromValue(message) : undefined;
 };
 
@@ -254,6 +278,53 @@ export const getUserMessageFromRunInput = (input?: unknown): string | undefined 
   );
 };
 
+const DEFAULT_CONVERSATION_HISTORY_MESSAGES = 10;
+
+/**
+ * Renders the remembered conversation history from an agent scorer run input as a transcript.
+ *
+ * Only agent run inputs carry `rememberedMessages`; any other input shape (a bare string,
+ * a plain `{ prompt }` object, `ModelMessage[]`) returns `undefined` so callers can safely
+ * fall back to single-turn behaviour.
+ *
+ * @param input - The scorer run input
+ * @param options.maxMessages - How many of the most recent remembered messages to keep (default 10)
+ * @returns A newline separated `role: text` transcript, or `undefined` if there is no history
+ *
+ * @example
+ * ```ts
+ * const scorer = createScorer({ ... })
+ *   .preprocess(({ run }) => {
+ *     const history = getConversationHistoryFromRunInput(run.input, { maxMessages: 4 });
+ *     return { history };
+ *   });
+ * ```
+ */
+export const getConversationHistoryFromRunInput = (
+  input?: unknown,
+  options?: { maxMessages?: number },
+): string | undefined => {
+  if (!isScorerRunInputForAgent(input)) return undefined;
+
+  const maxMessages = options?.maxMessages ?? DEFAULT_CONVERSATION_HISTORY_MESSAGES;
+  if (maxMessages <= 0) return undefined;
+
+  const lines = input.rememberedMessages
+    .slice(-maxMessages)
+    .map(message => {
+      if (!isRecord(message)) return undefined;
+
+      const role = getEffectiveMessageRole(message);
+      const text = getTextContentFromMastraDBMessage(message as MastraDBMessage).trim();
+      if (!role || !text) return undefined;
+
+      return `${role}: ${text}`;
+    })
+    .filter((line): line is string => Boolean(line));
+
+  return lines.length > 0 ? lines.join('\n') : undefined;
+};
+
 /**
  * Extracts all system messages from a scorer run input.
  *
@@ -356,6 +427,9 @@ export const getCombinedSystemPrompt = (input?: unknown): string => {
  * output (`{ text }`), task output (`{ content }`), a single assistant message
  * object, and a bare string.
  *
+ * For array outputs the final assistant message is used, so multi-step agent
+ * responses are scored on the last response rather than an intermediate one.
+ *
  * @param output - The scorer run output
  * @returns The assistant message text, or `undefined` if none can be extracted
  *
@@ -370,7 +444,18 @@ export const getCombinedSystemPrompt = (input?: unknown): string => {
  */
 export const getAssistantMessageFromRunOutput = (output?: unknown) => {
   if (typeof output === 'string') return output;
-  if (Array.isArray(output)) return getTextFromMessages(output, 'assistant');
+  if (Array.isArray(output)) {
+    const assistantMessages = output.filter(
+      message => isRecord(message) && getEffectiveMessageRole(message) === 'assistant',
+    );
+    // Prefer the last assistant message that carries text; a trailing assistant
+    // message may hold only tool-call or data parts.
+    for (let i = assistantMessages.length - 1; i >= 0; i--) {
+      const text = getTextFromValue(assistantMessages[i]);
+      if (text) return text;
+    }
+    return undefined;
+  }
   if (!isRecord(output)) return undefined;
 
   const isAssistantOutput = output.role === undefined || output.role === 'assistant';
@@ -728,19 +813,28 @@ export function extractToolCalls(output: ScorerRunOutputForAgent): { tools: stri
 
   for (let messageIndex = 0; messageIndex < output.length; messageIndex++) {
     const message = output[messageIndex];
-    // Tool invocations are now nested under content
-    if (message?.content?.toolInvocations) {
-      for (let invocationIndex = 0; invocationIndex < message.content.toolInvocations.length; invocationIndex++) {
-        const invocation = message.content.toolInvocations[invocationIndex];
-        if (invocation && invocation.toolName && (invocation.state === 'result' || invocation.state === 'call')) {
-          toolCalls.push(invocation.toolName);
-          toolCallInfos.push({
-            toolName: invocation.toolName,
-            toolCallId: invocation.toolCallId || `${messageIndex}-${invocationIndex}`,
-            messageIndex,
-            invocationIndex,
-          });
-        }
+    // Prefer the legacy toolInvocations array when present; fall back to
+    // V2 content.parts for messages that only store tool calls there.
+    const legacy = message?.content?.toolInvocations;
+    const fromParts = legacy
+      ? undefined
+      : message?.content?.parts
+          ?.filter((p): p is Extract<typeof p, { type: 'tool-invocation' }> => p.type === 'tool-invocation')
+          .map(p => p.toolInvocation);
+    const toolInvocations = legacy ?? fromParts;
+
+    if (!toolInvocations?.length) continue;
+
+    for (let invocationIndex = 0; invocationIndex < toolInvocations.length; invocationIndex++) {
+      const invocation = toolInvocations[invocationIndex];
+      if (invocation && invocation.toolName && (invocation.state === 'result' || invocation.state === 'call')) {
+        toolCalls.push(invocation.toolName);
+        toolCallInfos.push({
+          toolName: invocation.toolName,
+          toolCallId: invocation.toolCallId || `${messageIndex}-${invocationIndex}`,
+          messageIndex,
+          invocationIndex,
+        });
       }
     }
   }
@@ -831,8 +925,17 @@ export function extractToolResults(output: ScorerRunOutputForAgent): ToolResultI
   const results: ToolResultInfo[] = [];
 
   for (const message of output) {
-    const toolInvocations = message?.content?.toolInvocations;
-    if (!toolInvocations) continue;
+    // Prefer the legacy toolInvocations array when present; fall back to
+    // V2 content.parts for messages that only store tool calls there.
+    const legacy = message?.content?.toolInvocations;
+    const fromParts = legacy
+      ? undefined
+      : message?.content?.parts
+          ?.filter((p): p is Extract<typeof p, { type: 'tool-invocation' }> => p.type === 'tool-invocation')
+          .map(p => p.toolInvocation);
+    const toolInvocations = legacy ?? fromParts;
+
+    if (!toolInvocations?.length) continue;
 
     for (const invocation of toolInvocations) {
       if (invocation.state === 'result' && invocation.result !== undefined) {

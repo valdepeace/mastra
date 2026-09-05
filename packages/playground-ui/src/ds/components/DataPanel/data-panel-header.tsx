@@ -8,7 +8,14 @@ export interface DataPanelHeaderProps {
 export function DataPanelHeader({ className, children }: DataPanelHeaderProps) {
   return (
     <div
-      className={cn('flex items-center justify-between gap-2 border-b border-border1 mx-4 py-3 min-h-14', className)}
+      className={cn(
+        // Horizontal padding (not margin) so the bottom border spans the full card width.
+        'flex min-h-14 items-center justify-between gap-2 px-4 py-3',
+        // Bottom border only when something follows the header (i.e. the panel is expanded).
+        // When the panel is collapsed and the header is the only child, the border auto-hides.
+        'not-last:border-b not-last:border-border1',
+        className,
+      )}
     >
       {children}
     </div>

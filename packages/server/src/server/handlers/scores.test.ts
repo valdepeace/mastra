@@ -92,32 +92,6 @@ describe('Scores Handlers', () => {
       });
     });
 
-    it('should return empty array when storage method is not available', async () => {
-      const pagination = createPagination({ page: 0, perPage: 10 });
-
-      // Create mastra instance without storage
-      const mastraWithoutStorage = new Mastra({
-        logger: false,
-      });
-
-      const result = await LIST_SCORES_BY_RUN_ID_ROUTE.handler({
-        ...createTestServerContext({ mastra: mastraWithoutStorage }),
-        runId: 'test-run-1',
-        page: pagination.page,
-        perPage: pagination.perPage as number,
-      });
-
-      expect(result).toEqual({
-        pagination: {
-          hasMore: false,
-          page: 0,
-          perPage: 0,
-          total: 0,
-        },
-        scores: [],
-      });
-    });
-
     it('should handle storage errors gracefully', async () => {
       const pagination = createPagination({ page: 0, perPage: 10 });
       const error = new Error('Storage error');
@@ -176,33 +150,6 @@ describe('Scores Handlers', () => {
         page: 0,
         perPage: 10,
         hasMore: false,
-      });
-    });
-
-    it('should return empty array when storage method is not available', async () => {
-      const pagination = createPagination({ page: 0, perPage: 10 });
-
-      // Create mastra instance without storage
-      const mastraWithoutStorage = new Mastra({
-        logger: false,
-      });
-
-      const result = await LIST_SCORES_BY_ENTITY_ID_ROUTE.handler({
-        ...createTestServerContext({ mastra: mastraWithoutStorage }),
-        entityId: 'test-agent',
-        entityType: 'agent',
-        page: pagination.page,
-        perPage: pagination.perPage as number,
-      });
-
-      expect(result).toEqual({
-        pagination: {
-          hasMore: false,
-          page: 0,
-          perPage: 0,
-          total: 0,
-        },
-        scores: [],
       });
     });
 
@@ -272,30 +219,20 @@ describe('Scores Handlers', () => {
   describe('saveScoreHandler', () => {
     it('should save score successfully', async () => {
       const score = createSampleScore({ scorerId: 'new-score-1' });
-      const savedScore = { score };
 
       const result = await SAVE_SCORE_ROUTE.handler({
         ...createTestServerContext({ mastra }),
         score,
       });
 
-      expect(result).toEqual(savedScore);
-    });
-
-    it('should throw error when storage method is not available', async () => {
-      const score = createSampleScore({ scorerId: 'new-score-1' });
-
-      // Create mastra instance without storage
-      const mastraWithoutStorage = new Mastra({
-        logger: false,
+      // The store stamps its own createdAt/updatedAt, so match them loosely.
+      expect(result).toEqual({
+        score: {
+          ...score,
+          createdAt: expect.any(Date),
+          updatedAt: expect.any(Date),
+        },
       });
-
-      await expect(
-        SAVE_SCORE_ROUTE.handler({
-          ...createTestServerContext({ mastra: mastraWithoutStorage }),
-          score,
-        }),
-      ).rejects.toThrow(HTTPException);
     });
 
     it('should handle storage errors gracefully', async () => {

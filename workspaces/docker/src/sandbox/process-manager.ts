@@ -7,6 +7,8 @@
  * stdout/stderr streams.
  */
 
+import type { Duplex } from 'node:stream';
+
 import { ProcessHandle, SandboxProcessManager } from '@mastra/core/workspace';
 import type { CommandResult, ProcessInfo, SpawnProcessOptions } from '@mastra/core/workspace';
 import type { Container, Exec, ExecInspectInfo } from 'dockerode';
@@ -31,15 +33,17 @@ class DockerProcessHandle extends ProcessHandle {
   private _exitCode: number | undefined;
   /** @internal Set by kill() and timeout to distinguish forced termination from natural exit */
   _killed = false;
+  /** @internal Set by the timeout path to distinguish timeout kills from explicit kills */
+  _timedOut = false;
   private _waitPromise: Promise<CommandResult> | null = null;
-  private _stdinStream: NodeJS.WritableStream | null = null;
+  private _stdinStream: Duplex | null = null;
   private _execStream: NodeJS.ReadWriteStream | null = null;
 
   constructor(
     exec: Exec,
     container: Container,
     startTime: number,
-    stdinStream: NodeJS.WritableStream | null,
+    stdinStream: Duplex | null,
     options?: SpawnProcessOptions,
   ) {
     super(options);
@@ -145,7 +149,21 @@ class DockerProcessHandle extends ProcessHandle {
     if (!this._stdinStream) {
       throw new Error(`Process ${this.pid} was not started with stdin support`);
     }
-    this._stdinStream.write(data);
+    return new Promise<void>((resolve, reject) => {
+      this._stdinStream!.write(data, error => (error ? reject(error) : resolve()));
+    });
+  }
+
+  async closeStdin(): Promise<void> {
+    if (this._exitCode !== undefined) {
+      throw new Error(`Process ${this.pid} has already exited with code ${this._exitCode}`);
+    }
+    if (!this._stdinStream) {
+      throw new Error(`Process ${this.pid} was not started with stdin support`);
+    }
+    const stream = this._stdinStream;
+    if (stream.writableEnded) return;
+    await new Promise<void>(resolve => stream.end(resolve));
   }
 
   /** @internal Force-close the exec stream to unblock wait(). */
@@ -174,8 +192,8 @@ export class DockerProcessManager extends SandboxProcessManager {
   private _container: Container | null = null;
   private readonly _defaultTimeout: number;
 
-  constructor(options: { env: Record<string, string>; defaultTimeout?: number }) {
-    super(options);
+  constructor(options: { defaultTimeout?: number } = {}) {
+    super();
     this._defaultTimeout = options.defaultTimeout ?? 0;
   }
 
@@ -195,9 +213,8 @@ export class DockerProcessManager extends SandboxProcessManager {
   async spawn(command: string, options: SpawnProcessOptions = {}): Promise<ProcessHandle> {
     const container = this.container;
 
-    // Merge default env with per-spawn env
-    const mergedEnv = { ...this.env, ...options.env };
-    const envArray = Object.entries(mergedEnv)
+    // The base spawn wrapper already merged the sandbox env into options.env
+    const envArray = Object.entries({ ...options.env })
       .filter((entry): entry is [string, string] => entry[1] !== undefined)
       .map(([k, v]) => `${k}=${v}`);
 
@@ -298,6 +315,8 @@ export class DockerProcessManager extends SandboxProcessManager {
           stdout: handle.stdout,
           stderr: handle.stderr,
           executionTimeMs: Date.now() - startTime,
+          killed: true,
+          timedOut: handle._timedOut,
         });
       });
 
@@ -322,6 +341,7 @@ export class DockerProcessManager extends SandboxProcessManager {
       const timer = setTimeout(() => {
         if (handle.exitCode === undefined) {
           handle._killed = true;
+          handle._timedOut = true;
           handle.kill().catch(() => {});
           // Ensure stream is destroyed even if kill() fails (e.g., PID not found)
           handle._destroyStream();

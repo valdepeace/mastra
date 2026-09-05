@@ -16,6 +16,7 @@ describe('Workflow (fetch-mocked)', () => {
       if (url.includes('/start?runId=')) return Promise.resolve(createJsonResponse({ message: 'started' }));
       if (url.includes('/start-async')) return Promise.resolve(createJsonResponse({ result: 'started-async' }));
       if (url.includes('/resume?runId=')) return Promise.resolve(createJsonResponse({ message: 'resumed' }));
+      if (url.includes('/resume-no-wait')) return Promise.resolve(createJsonResponse({ runId: 'r-no-wait' }));
       if (url.includes('/resume-async')) return Promise.resolve(createJsonResponse({ result: 'resumed-async' }));
       if (url.includes('/resume-stream?')) {
         const body = Workflow.createRecordStream([{ type: 'result', payload: { ok: true } }]);
@@ -69,6 +70,15 @@ describe('Workflow (fetch-mocked)', () => {
     expect(resumeAsyncRes).toEqual({ result: 'resumed-async' });
   });
 
+  it('resumes workflow run fire-and-forget via resumeNoWait', async () => {
+    const run = await wf.createRun();
+    const resumeNoWaitRes = await run.resumeNoWait({ step: 's1' });
+    expect(resumeNoWaitRes).toEqual({ runId: 'r-no-wait' });
+
+    const call = fetchMock.mock.calls.find((args: any[]) => String(args[0]).includes('/resume-no-wait'));
+    expect(call).toBeTruthy();
+  });
+
   it('streams workflow execution as parsed objects', async () => {
     const run = await wf.createRun();
     const stream = await run.stream({ inputData: { x: 1 } });
@@ -83,6 +93,34 @@ describe('Workflow (fetch-mocked)', () => {
       { type: 'log', payload: { msg: 'hello' } },
       { type: 'result', payload: { ok: true } },
     ]);
+  });
+
+  it('streams records split across network chunks', async () => {
+    const run = await wf.createRun();
+    const encoded = new TextEncoder().encode('{"type":"result","payload":{"message":"mañana"}}\x1E');
+    const splitAt = encoded.indexOf(0xc3) + 1;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(encoded.slice(0, splitAt));
+              controller.enqueue(encoded.slice(splitAt));
+              controller.close();
+            },
+          }),
+          { status: 200 },
+        ),
+    );
+
+    const stream = await run.stream({ inputData: { x: 1 } });
+    const reader = (stream as ReadableStream<any>).getReader();
+
+    await expect(reader.read()).resolves.toMatchObject({
+      done: false,
+      value: { type: 'result', payload: { message: 'mañana' } },
+    });
+    await expect(reader.read()).resolves.toMatchObject({ done: true });
   });
 
   it('creates run using provided runId', async () => {

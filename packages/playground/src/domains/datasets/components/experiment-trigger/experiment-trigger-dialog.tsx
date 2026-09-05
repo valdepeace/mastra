@@ -1,6 +1,6 @@
+import { Button } from '@mastra/playground-ui/components/Button';
+import { CodeEditor } from '@mastra/playground-ui/components/CodeEditor';
 import {
-  Button,
-  Spinner,
   Dialog,
   DialogContent,
   DialogHeader,
@@ -8,60 +8,167 @@ import {
   DialogDescription,
   DialogBody,
   DialogFooter,
-} from '@mastra/playground-ui';
-import { format } from 'date-fns';
-import { useRef, useState } from 'react';
+} from '@mastra/playground-ui/components/Dialog';
+import { Input } from '@mastra/playground-ui/components/Input';
+import { Label } from '@mastra/playground-ui/components/Label';
+import { Spinner } from '@mastra/playground-ui/components/Spinner';
+import { useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { useDatasetMutations } from '../../hooks/use-dataset-mutations';
+import { useDataset } from '../../hooks/use-datasets';
+import { DatasetCombobox } from '../dataset-combobox';
+import { DatasetVersions } from '../dataset-versions';
 import { ScorerSelector } from './scorer-selector';
 import type { TargetType } from './target-selector';
 import { TargetSelector } from './target-selector';
+import { DynamicForm } from '@/lib/form';
+import { jsonSchemaToZodRuntime } from '@/lib/form/json-schema-to-zod-runtime';
 
 export interface ExperimentTriggerDialogProps {
-  datasetId: string;
-  version?: number;
+  initialDatasetId?: string;
+  initialDatasetVersion?: number;
+  initialScorerIds?: string[];
+  initialTargetType?: TargetType;
+  initialTargetId?: string;
+  initialName?: string;
+  initialDescription?: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSuccess?: (experimentId: string) => void;
 }
 
+/**
+ * Schema-driven request context form. Converts the dataset's plain JSON Schema
+ * into a zod schema and surfaces values via onChange (no global store coupling).
+ */
+function RequestContextForm({
+  requestContextSchema,
+  onChange,
+}: {
+  requestContextSchema: Record<string, unknown>;
+  onChange: (values: Record<string, unknown>) => void;
+}) {
+  const zodSchema = useMemo(() => {
+    try {
+      return jsonSchemaToZodRuntime(requestContextSchema as Parameters<typeof jsonSchemaToZodRuntime>[0]);
+    } catch (error) {
+      console.error('Failed to parse requestContextSchema:', error);
+      return null;
+    }
+  }, [requestContextSchema]);
+
+  if (!zodSchema) {
+    return <p className="text-destructive text-sm">Failed to parse request context schema</p>;
+  }
+
+  return (
+    <div className="space-y-2">
+      <Label>Request Context</Label>
+      <DynamicForm schema={zodSchema} onValuesChange={onChange} className="[&_button[type=submit]]:hidden" />
+    </div>
+  );
+}
+
 export function ExperimentTriggerDialog({
-  datasetId,
-  version,
+  initialDatasetId,
+  initialDatasetVersion,
+  initialScorerIds,
+  initialTargetType,
+  initialTargetId,
+  initialName,
+  initialDescription,
   open,
   onOpenChange,
   onSuccess,
 }: ExperimentTriggerDialogProps) {
   const contentRef = useRef<HTMLDivElement>(null);
-  const [targetType, setTargetType] = useState<TargetType | ''>('');
-  const [targetId, setTargetId] = useState<string>('');
-  const [selectedScorers, setSelectedScorers] = useState<string[]>([]);
+  const [name, setName] = useState(initialName ?? '');
+  const [description, setDescription] = useState(initialDescription ?? '');
+  const [datasetId, setDatasetId] = useState(initialDatasetId ?? '');
+  const [version, setVersion] = useState<number | null>(initialDatasetVersion ?? null);
+  const [targetType, setTargetType] = useState<TargetType | ''>(initialTargetType ?? '');
+  const [targetId, setTargetId] = useState<string>(initialTargetId ?? '');
+  const [selectedScorers, setSelectedScorers] = useState<string[]>(initialScorerIds ?? []);
+  const [requestContextValues, setRequestContextValues] = useState<Record<string, unknown>>({});
+  const [requestContextRaw, setRequestContextRaw] = useState('');
 
   const { triggerExperiment } = useDatasetMutations();
+  const { data: dataset } = useDataset(datasetId);
+  const requestContextSchema = dataset?.requestContextSchema as Record<string, unknown> | undefined;
 
-  const canRun = targetType && targetId;
+  const hasSchema = Boolean(requestContextSchema && Object.keys(requestContextSchema).length > 0);
+
+  const canRun = Boolean(datasetId && targetType && targetId && name.trim());
   const isRunning = triggerExperiment.isPending;
 
+  const handleDatasetChange = (nextDatasetId: string) => {
+    setDatasetId(nextDatasetId);
+    setVersion(null);
+    setRequestContextValues({});
+  };
+
+  const resetState = () => {
+    setName(initialName ?? '');
+    setDescription(initialDescription ?? '');
+    setDatasetId(initialDatasetId ?? '');
+    setVersion(initialDatasetVersion ?? null);
+    setTargetType(initialTargetType ?? '');
+    setTargetId(initialTargetId ?? '');
+    setSelectedScorers(initialScorerIds ?? []);
+    setRequestContextValues({});
+    setRequestContextRaw('');
+  };
+
+  const resolveRequestContext = (): Record<string, unknown> | undefined => {
+    if (hasSchema) {
+      const entries = Object.entries(requestContextValues).filter(([, v]) => v !== undefined && v !== '');
+      return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+    }
+    if (requestContextRaw.trim()) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(requestContextRaw);
+      } catch {
+        throw new Error('Request Context must be valid JSON');
+      }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('Request Context must be a JSON object');
+      }
+      return parsed as Record<string, unknown>;
+    }
+    return undefined;
+  };
+
   const handleRun = async () => {
-    if (!canRun) return;
+    // Explicit guards (rather than `canRun`) so TypeScript narrows `targetType` for the request.
+    if (!datasetId || !targetType || !targetId || !name.trim()) return;
+
+    let requestContext: Record<string, unknown> | undefined;
+    try {
+      requestContext = resolveRequestContext();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Request Context must be valid JSON';
+      toast.error(message);
+      return;
+    }
 
     try {
       const result = await triggerExperiment.mutateAsync({
         datasetId,
+        name: name.trim(),
+        description: description.trim() || undefined,
         targetType,
         targetId,
         scorerIds: selectedScorers.length > 0 ? selectedScorers : undefined,
-        version,
+        version: version ?? undefined,
+        requestContext,
       });
 
       toast.success('Experiment triggered successfully');
       onOpenChange(false);
       onSuccess?.(result.experimentId);
 
-      // Reset state
-      setTargetType('');
-      setTargetId('');
-      setSelectedScorers([]);
+      resetState();
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to trigger experiment';
       toast.error(message);
@@ -71,10 +178,7 @@ export function ExperimentTriggerDialog({
   const handleClose = () => {
     if (!isRunning) {
       onOpenChange(false);
-      // Reset state on close
-      setTargetType('');
-      setTargetId('');
-      setSelectedScorers([]);
+      resetState();
     }
   };
 
@@ -84,13 +188,55 @@ export function ExperimentTriggerDialog({
         <DialogHeader>
           <DialogTitle>Run Experiment</DialogTitle>
           <DialogDescription>
-            {version
-              ? `Execute items from ${format(new Date(version), 'MMM d, yyyy')} version against a target.`
-              : 'Execute all items in this dataset against a target.'}
+            {version != null
+              ? `Execute items from version v${version} of the dataset against a target.`
+              : 'Execute dataset items against a target.'}
           </DialogDescription>
         </DialogHeader>
 
         <DialogBody className="grid gap-6">
+          <div className="grid gap-6">
+            <div className="grid gap-2">
+              <Label htmlFor="experiment-name">Name *</Label>
+              <Input
+                id="experiment-name"
+                value={name}
+                onChange={e => setName(e.target.value)}
+                placeholder="Enter experiment name"
+                autoFocus
+                disabled={isRunning}
+              />
+            </div>
+
+            <div className="grid gap-2">
+              <Label htmlFor="experiment-description">Description</Label>
+              <Input
+                id="experiment-description"
+                value={description}
+                onChange={e => setDescription(e.target.value)}
+                placeholder="Enter experiment description (optional)"
+                disabled={isRunning}
+              />
+            </div>
+
+            <div className="grid gap-2">
+              <Label>Dataset</Label>
+              <DatasetCombobox value={datasetId} onValueChange={handleDatasetChange} container={contentRef} />
+            </div>
+
+            {datasetId && (
+              <div className="grid gap-2">
+                <Label>Version</Label>
+                <DatasetVersions
+                  datasetId={datasetId}
+                  value={version}
+                  onValueChange={setVersion}
+                  container={contentRef}
+                />
+              </div>
+            )}
+          </div>
+
           <TargetSelector
             targetType={targetType}
             setTargetType={setTargetType}
@@ -99,14 +245,25 @@ export function ExperimentTriggerDialog({
             container={contentRef}
           />
 
-          {/* Only show scorer selector for agent/workflow targets */}
-          {targetType && targetType !== 'scorer' && (
-            <ScorerSelector
-              selectedScorers={selectedScorers}
-              setSelectedScorers={setSelectedScorers}
-              disabled={isRunning}
-              container={contentRef}
-            />
+          <ScorerSelector
+            selectedScorers={selectedScorers}
+            setSelectedScorers={setSelectedScorers}
+            disabled={isRunning}
+            container={contentRef}
+          />
+
+          {hasSchema ? (
+            <RequestContextForm requestContextSchema={requestContextSchema!} onChange={setRequestContextValues} />
+          ) : (
+            <div className="space-y-2">
+              <Label>Request Context (JSON, optional)</Label>
+              <CodeEditor
+                value={requestContextRaw}
+                onChange={setRequestContextRaw}
+                showCopyButton={false}
+                className="min-h-[80px]"
+              />
+            </div>
           )}
         </DialogBody>
 
@@ -117,7 +274,7 @@ export function ExperimentTriggerDialog({
           <Button variant="primary" onClick={handleRun} disabled={!canRun || isRunning}>
             {isRunning ? (
               <>
-                <Spinner className="w-4 h-4" />
+                <Spinner className="h-4 w-4" />
                 Running...
               </>
             ) : (

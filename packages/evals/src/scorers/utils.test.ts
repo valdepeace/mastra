@@ -12,12 +12,14 @@ import { describe, it, expect } from 'vitest';
 import {
   getTextContentFromMastraDBMessage,
   getUserMessageFromRunInput,
+  getConversationHistoryFromRunInput,
   getCombinedSystemPrompt,
   getAssistantMessageFromRunOutput,
   getReasoningFromRunOutput,
   isScorerRunOutputForAgent,
   createTestMessage,
   createToolInvocation,
+  extractToolCalls,
   extractToolResults,
   extractTrajectory,
   compareTrajectories,
@@ -60,6 +62,45 @@ describe('Scorer Utils', () => {
       ];
       const result = getAssistantMessageFromRunOutput(output);
       expect(result).toBe('Assistant response');
+    });
+
+    it('should extract the final assistant response from multi-step output', () => {
+      const output: ScorerRunOutputForAgent = [
+        createTestMessage({ content: 'Intermediate assistant response', role: 'assistant' }),
+        createTestMessage({ content: 'Final assistant response', role: 'assistant' }),
+      ];
+
+      expect(getAssistantMessageFromRunOutput(output)).toBe('Final assistant response');
+    });
+
+    it('should extract the final assistant response from multi-step model messages', () => {
+      const output = [
+        { role: 'user', content: 'Question' },
+        { role: 'assistant', content: [{ type: 'text', text: 'Intermediate response' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'Final response' }] },
+      ];
+
+      expect(getAssistantMessageFromRunOutput(output)).toBe('Final response');
+    });
+
+    it('should fall back to the last text-bearing assistant message', () => {
+      const output: ScorerRunOutputForAgent = [
+        createTestMessage({ content: 'Assistant response', role: 'assistant' }),
+        {
+          id: 'assistant-no-text',
+          role: 'assistant',
+          createdAt: new Date(),
+          content: { format: 2, parts: [{ type: 'step-start' }] },
+        } as MastraDBMessage,
+      ];
+
+      expect(getAssistantMessageFromRunOutput(output)).toBe('Assistant response');
+    });
+
+    it('should return undefined when no assistant message is present', () => {
+      const output: ScorerRunOutputForAgent = [createTestMessage({ content: 'User message', role: 'user' })];
+
+      expect(getAssistantMessageFromRunOutput(output)).toBeUndefined();
     });
 
     it('should extract assistant text from workflow-style output', () => {
@@ -124,6 +165,112 @@ describe('Scorer Utils', () => {
       expect(result).toBe('User question');
     });
 
+    it('should extract user text from message parts when the content string is absent', () => {
+      const input: ScorerRunInputForAgent = {
+        inputMessages: [
+          {
+            id: 'user-msg-1',
+            role: 'user',
+            createdAt: new Date(),
+            content: {
+              format: 2,
+              parts: [{ type: 'text', text: 'What is the capital of France?' }],
+            },
+          },
+          {
+            id: 'assistant-msg-1',
+            role: 'assistant',
+            createdAt: new Date(),
+            content: {
+              format: 2,
+              parts: [{ type: 'text', text: 'Paris.' }],
+            },
+          },
+        ],
+        rememberedMessages: [],
+        systemMessages: [],
+        taggedSystemMessages: {},
+      };
+
+      const result = getUserMessageFromRunInput(input);
+      expect(result).toBe('What is the capital of France?');
+    });
+
+    it('should fall back to parts when the content string is empty', () => {
+      const input: ScorerRunInputForAgent = {
+        inputMessages: [
+          {
+            id: 'user-msg-empty-content',
+            role: 'user',
+            createdAt: new Date(),
+            content: {
+              format: 2,
+              content: '',
+              parts: [{ type: 'text', text: 'What is the capital of France?' }],
+            },
+          },
+        ],
+        rememberedMessages: [],
+        systemMessages: [],
+        taggedSystemMessages: {},
+      };
+
+      expect(getUserMessageFromRunInput(input)).toBe('What is the capital of France?');
+    });
+
+    it('should extract user text from a signal-role message (subscription / sendMessage path)', () => {
+      // Messages sent through agent.subscribeToThread + agent.sendMessage are persisted
+      // with role 'signal' and carry their user role on type / metadata.signal, with the
+      // text living only in content.parts (no flat content.content).
+      const input: ScorerRunInputForAgent = {
+        inputMessages: [
+          {
+            id: 'signal-msg-1',
+            role: 'signal',
+            type: 'user',
+            createdAt: new Date(),
+            content: {
+              format: 2,
+              parts: [{ type: 'text', text: 'What is the capital of France?' }],
+              metadata: {
+                signal: { id: 'signal-msg-1', type: 'user', tagName: 'user' },
+              },
+            },
+          },
+        ] as unknown as ScorerRunInputForAgent['inputMessages'],
+        rememberedMessages: [],
+        systemMessages: [],
+        taggedSystemMessages: {},
+      };
+
+      expect(getUserMessageFromRunInput(input)).toBe('What is the capital of France?');
+    });
+
+    it('should not treat a non-user signal message as the user message', () => {
+      const input: ScorerRunInputForAgent = {
+        inputMessages: [
+          {
+            id: 'signal-reminder-1',
+            role: 'signal',
+            type: 'system-reminder',
+            createdAt: new Date(),
+            content: {
+              format: 2,
+              parts: [{ type: 'text', text: 'A reminder, not a user message' }],
+              metadata: {
+                signal: { id: 'signal-reminder-1', type: 'system-reminder', tagName: 'system-reminder' },
+              },
+            },
+          },
+        ] as unknown as ScorerRunInputForAgent['inputMessages'],
+        rememberedMessages: [],
+        systemMessages: [],
+        taggedSystemMessages: {},
+      };
+
+      expect(getUserMessageFromRunInput(input)).toBeUndefined();
+    });
+
     it('should extract user text from workflow-style input', () => {
       expect(getUserMessageFromRunInput({ prompt: 'Workflow question' })).toBe('Workflow question');
       expect(getUserMessageFromRunInput('String question')).toBe('String question');
@@ -154,6 +301,58 @@ describe('Scorer Utils', () => {
       expect(getUserMessageFromRunInput({ inputMessages: [{ role: 'user', body: 'Body message question' }] })).toBe(
         'Body message question',
       );
+    });
+  });
+
+  describe('getConversationHistoryFromRunInput', () => {
+    const agentInput = (rememberedMessages: MastraDBMessage[]) => ({
+      inputMessages: [createTestMessage({ content: 'A', role: 'user', id: 'current' })],
+      rememberedMessages,
+      systemMessages: [],
+      taggedSystemMessages: {},
+    });
+
+    it('should render remembered messages as a role prefixed transcript in order', () => {
+      const history = getConversationHistoryFromRunInput(
+        agentInput([
+          createTestMessage({ content: 'Which option should I pick?', role: 'user', id: 'r1' }),
+          createTestMessage({ content: 'Option A or Option B?', role: 'assistant', id: 'r2' }),
+        ]),
+      );
+
+      expect(history).toBe('user: Which option should I pick?\nassistant: Option A or Option B?');
+    });
+
+    it('should keep only the most recent messages when maxMessages is set', () => {
+      const history = getConversationHistoryFromRunInput(
+        agentInput([
+          createTestMessage({ content: 'oldest', role: 'user', id: 'r1' }),
+          createTestMessage({ content: 'middle', role: 'assistant', id: 'r2' }),
+          createTestMessage({ content: 'newest', role: 'user', id: 'r3' }),
+        ]),
+        { maxMessages: 2 },
+      );
+
+      expect(history).toBe('assistant: middle\nuser: newest');
+    });
+
+    it('should return undefined when there is no usable history', () => {
+      expect(getConversationHistoryFromRunInput(agentInput([]))).toBeUndefined();
+      expect(
+        getConversationHistoryFromRunInput(agentInput([createTestMessage({ content: '', role: 'user', id: 'r1' })])),
+      ).toBeUndefined();
+      expect(
+        getConversationHistoryFromRunInput(agentInput([createTestMessage({ content: 'hi', role: 'user', id: 'r1' })]), {
+          maxMessages: 0,
+        }),
+      ).toBeUndefined();
+    });
+
+    it('should return undefined for non-agent run input shapes', () => {
+      expect(getConversationHistoryFromRunInput('just a string')).toBeUndefined();
+      expect(getConversationHistoryFromRunInput({ prompt: 'no history here' })).toBeUndefined();
+      expect(getConversationHistoryFromRunInput({ inputMessages: [{ role: 'user', content: 'hi' }] })).toBeUndefined();
+      expect(getConversationHistoryFromRunInput(undefined)).toBeUndefined();
     });
   });
 
@@ -556,6 +755,147 @@ describe('Scorer Utils', () => {
 
       expect(results).toHaveLength(1);
       expect(results[0]?.toolName).toBe('hasResultTool');
+    });
+
+    it('should extract tool results from V2 content.parts when toolInvocations is absent', () => {
+      const output: ScorerRunOutputForAgent = [
+        {
+          id: 'msg-1',
+          role: 'assistant',
+          content: {
+            format: 2,
+            parts: [
+              {
+                type: 'tool-invocation',
+                toolInvocation: {
+                  state: 'result',
+                  toolCallId: 'call-1',
+                  toolName: 'weatherTool',
+                  args: { city: 'Seoul' },
+                  result: { temperature: 22 },
+                },
+              },
+              { type: 'text', text: 'The temperature in Seoul is 22°C.' },
+            ],
+            content: 'The temperature in Seoul is 22°C.',
+          } as any,
+          createdAt: new Date(),
+        },
+      ];
+
+      const results = extractToolResults(output);
+
+      expect(results).toHaveLength(1);
+      expect(results[0]).toEqual({
+        toolName: 'weatherTool',
+        toolCallId: 'call-1',
+        args: { city: 'Seoul' },
+        result: { temperature: 22 },
+      });
+    });
+
+    it('should prefer toolInvocations over content.parts when both are present', () => {
+      const output: ScorerRunOutputForAgent = [
+        createTestMessage({
+          content: 'Done.',
+          role: 'assistant',
+          toolInvocations: [
+            createToolInvocation({
+              toolCallId: 'legacy-call',
+              toolName: 'legacyTool',
+              args: {},
+              result: { source: 'legacy' },
+              state: 'result',
+            }),
+          ],
+        }),
+      ];
+      // Inject an extra tool-invocation part that should be ignored
+      (output[0]!.content as any).parts.push({
+        type: 'tool-invocation',
+        toolInvocation: {
+          state: 'result',
+          toolCallId: 'parts-call',
+          toolName: 'partsTool',
+          args: {},
+          result: { source: 'parts' },
+        },
+      });
+
+      const results = extractToolResults(output);
+
+      expect(results).toHaveLength(1);
+      expect(results[0]?.toolName).toBe('legacyTool');
+    });
+  });
+
+  describe('extractToolCalls', () => {
+    it('should extract tool calls from legacy toolInvocations', () => {
+      const output: ScorerRunOutputForAgent = [
+        createTestMessage({
+          content: 'Checking weather.',
+          role: 'assistant',
+          toolInvocations: [
+            createToolInvocation({
+              toolCallId: 'call-1',
+              toolName: 'weatherTool',
+              args: { location: 'Tokyo' },
+              result: { temp: 28 },
+              state: 'result',
+            }),
+          ],
+        }),
+      ];
+
+      const { tools, toolCallInfos } = extractToolCalls(output);
+
+      expect(tools).toEqual(['weatherTool']);
+      expect(toolCallInfos).toHaveLength(1);
+      expect(toolCallInfos[0]?.toolName).toBe('weatherTool');
+      expect(toolCallInfos[0]?.toolCallId).toBe('call-1');
+    });
+
+    it('should extract tool calls from V2 content.parts when toolInvocations is absent', () => {
+      const output: ScorerRunOutputForAgent = [
+        {
+          id: 'msg-1',
+          role: 'assistant',
+          content: {
+            format: 2,
+            parts: [
+              {
+                type: 'tool-invocation',
+                toolInvocation: {
+                  state: 'result',
+                  toolCallId: 'call-1',
+                  toolName: 'weatherTool',
+                  args: { city: 'Seoul' },
+                  result: { temperature: 22 },
+                },
+              },
+              { type: 'text', text: 'The temperature in Seoul is 22°C.' },
+            ],
+            content: 'The temperature in Seoul is 22°C.',
+          } as any,
+          createdAt: new Date(),
+        },
+      ];
+
+      const { tools, toolCallInfos } = extractToolCalls(output);
+
+      expect(tools).toEqual(['weatherTool']);
+      expect(toolCallInfos).toHaveLength(1);
+      expect(toolCallInfos[0]?.toolName).toBe('weatherTool');
+      expect(toolCallInfos[0]?.toolCallId).toBe('call-1');
+    });
+
+    it('should return empty arrays when output has no tool calls', () => {
+      const output: ScorerRunOutputForAgent = [createTestMessage({ content: 'Hello!', role: 'assistant' })];
+
+      const { tools, toolCallInfos } = extractToolCalls(output);
+
+      expect(tools).toHaveLength(0);
+      expect(toolCallInfos).toHaveLength(0);
     });
   });
 

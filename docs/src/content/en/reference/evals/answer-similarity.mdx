@@ -1,6 +1,6 @@
 ---
 title: "Reference: Answer similarity scorer | Evals"
-description: Documentation for the Answer Similarity Scorer in Mastra, which compares agent outputs against ground truth answers for CI/CD testing.
+description: "The createAnswerSimilarityScorer() function creates a scorer that evaluates how similar an agent's output is to a ground truth answer."
 packages:
   - "@mastra/core"
   - "@mastra/evals"
@@ -156,7 +156,7 @@ import { runEvals } from '@mastra/core/evals'
 import { createAnswerSimilarityScorer } from '@mastra/evals/scorers/prebuilt'
 import { myAgent } from './agent'
 
-const scorer = createAnswerSimilarityScorer({ model: 'openai/gpt-5.4' })
+const scorer = createAnswerSimilarityScorer({ model: '__GATEWAY_OPENAI_MODEL__' })
 
 const result = await runEvals({
   data: [

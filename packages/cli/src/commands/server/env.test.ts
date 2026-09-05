@@ -46,7 +46,7 @@ afterEach(() => {
 });
 
 describe('resolveAuth', () => {
-  it('prefers MASTRA_ORG_ID over --org', async () => {
+  it('prefers MASTRA_ORG_ID over --org', { timeout: 10_000 }, async () => {
     process.env.MASTRA_ORG_ID = 'env-org';
     const { resolveAuth } = await import('./env.js');
     await expect(resolveAuth('cli-org')).resolves.toEqual({ token: 'tok', orgId: 'env-org' });
@@ -289,6 +289,17 @@ describe('envPullAction', () => {
     expect(content).not.toContain('also bad=');
     expect(content).toContain('# Skipped unsafe key');
     expect(spy.mock.calls.some(c => String(c[0]).includes('Skipped 2 unsafe key(s)'))).toBe(true);
+    spy.mockRestore();
+  });
+
+  it('notes that only project-level variables were pulled and points at `mastra env vars pull`', async () => {
+    mockGetServerProjectEnv.mockResolvedValue({ A: '1' });
+    const spy = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const { envPullAction } = await import('./env.js');
+    await envPullAction(undefined, {});
+    const out = spy.mock.calls.map(c => c[0]).join('\n');
+    expect(out).toContain('project-level variables only');
+    expect(out).toContain('mastra env vars pull');
     spy.mockRestore();
   });
 });

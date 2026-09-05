@@ -1,15 +1,18 @@
-import { Spinner, ProcessStepList, ProcessStepProgressBar, cn } from '@mastra/playground-ui';
-import type { ProcessStep } from '@mastra/playground-ui';
+import { Spinner } from '@mastra/playground-ui/components/Spinner';
+import { ProcessStepList, ProcessStepProgressBar } from '@mastra/playground-ui/components/Steps';
+import type { ProcessStep } from '@mastra/playground-ui/components/Steps';
+import { cn } from '@mastra/playground-ui/utils/cn';
 import { OctagonXIcon } from 'lucide-react';
 import { Container } from './shared';
 
 type TemplateInstallationProps = {
   name: string;
   streamResult?: any;
+  runId?: string;
   workflowInfo?: any;
 };
 
-export function TemplateInstallation({ name, streamResult, workflowInfo }: TemplateInstallationProps) {
+export function TemplateInstallation({ name, streamResult, runId, workflowInfo }: TemplateInstallationProps) {
   const phase = streamResult?.phase || 'initializing';
   const workflowState = streamResult?.payload?.workflowState;
   const currentStep = streamResult?.payload?.currentStep;
@@ -66,16 +69,18 @@ export function TemplateInstallation({ name, streamResult, workflowInfo }: Templ
   }));
 
   return (
-    <Container className="space-y-6 text-neutral3 mb-8 content-center">
+    <Container className="text-neutral3 mb-8 content-center space-y-6">
       {/* Header */}
       <div className="text-center">
-        <h3 className="text-lg font-semibold text-neutral5">{getPhaseMessage()}</h3>
-        {streamResult?.runId && <div className="mt-2 text-ui-sm text-neutral3">Run ID: {streamResult.runId}</div>}
+        <h3 className="text-neutral5 text-lg font-semibold">{getPhaseMessage()}</h3>
+        {(streamResult?.runId || runId) && (
+          <div className="text-ui-sm text-neutral3 mt-2">Run ID: {streamResult?.runId ?? runId}</div>
+        )}
       </div>
 
       {/* Progress Bar */}
       {hasSteps && totalSteps > 0 && !['error'].includes(phase) && (
-        <div className="max-w-[30rem] w-full mx-auto px-6">
+        <div className="mx-auto w-full max-w-[30rem] px-6">
           <ProcessStepProgressBar steps={steps} />
         </div>
       )}
@@ -98,7 +103,7 @@ export function TemplateInstallation({ name, streamResult, workflowInfo }: Templ
 
       {/* Simple loading state for initialization */}
       {!hasSteps && phase === 'initializing' && (
-        <div className="text-center text-sm text-neutral3 grid gap-4 justify-items-center">
+        <div className="text-neutral3 grid justify-items-center gap-4 text-center text-sm">
           <Spinner />
           <p>This may take some time...</p>
         </div>

@@ -18,6 +18,7 @@ import type {
   ProviderStatus,
   MountManager,
   MastraSandboxOptions,
+  SandboxCloneOptions,
 } from '@mastra/core/workspace';
 import { MastraSandbox, SandboxNotReadyError } from '@mastra/core/workspace';
 
@@ -89,6 +90,12 @@ export interface BlaxelSandboxOptions extends Omit<MastraSandboxOptions, 'proces
    * This maps to the Blaxel sandbox TTL.
    */
   timeout?: string;
+  /**
+   * Blaxel region where the sandbox should be created.
+   *
+   * Defaults to BL_REGION, then 'auto'.
+   */
+  region?: string;
   /** Environment variables to set in the sandbox */
   env?: Record<string, string>;
   /** Custom labels for the sandbox */
@@ -160,31 +167,58 @@ export class BlaxelSandbox extends MastraSandbox {
   private readonly image: string;
   private readonly memory: number;
   private readonly timeout?: string;
-  private readonly env: Record<string, string>;
+  private readonly region: string;
   private readonly labels: Record<string, string>;
   private readonly configuredRuntimes: SandboxRuntime[];
   private readonly ports: Array<{ name?: string; target: number; protocol?: 'HTTP' | 'TCP' | 'UDP' }>;
+  private readonly _constructorOptions: BlaxelSandboxOptions;
   declare readonly mounts: MountManager; // Non-optional (initialized by BaseSandbox)
 
   constructor(options: BlaxelSandboxOptions = {}) {
     super({
       ...options,
       name: 'BlaxelSandbox',
-      processes: new BlaxelProcessManager({ env: options.env }),
+      processes: new BlaxelProcessManager(),
     });
 
     this.id = options.id ?? this.generateId();
     this.image = options.image ?? 'blaxel/ts-app:latest';
     this.memory = options.memory ?? 4096;
     this.timeout = options.timeout;
-    this.env = options.env ?? {};
+    this.region = options.region || process.env.BL_REGION || 'auto';
     this.labels = options.labels ?? {};
     this.configuredRuntimes = options.runtimes ?? ['node', 'python', 'bash'];
     this.ports = options.ports ?? [];
+    this._constructorOptions = { ...options };
   }
 
   private generateId(): string {
     return `blaxel-sandbox-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  /**
+   * Construct a sibling `BlaxelSandbox` that inherits this sandbox's
+   * configuration (image, memory, region, runtimes, ports, labels) with
+   * per-instance overrides.
+   *
+   * Performs no I/O — the sandbox clone provisions (or reconnects to an
+   * existing Blaxel sandbox with the same logical `id` via
+   * `createIfNotExists`) on its own `start()`. Use it when one configured
+   * sandbox acts as the template for a fleet of independent sandboxes
+   * (e.g. one per project).
+   *
+   * `options.idleTimeoutMinutes` maps to Blaxel's `timeout` (TTL duration
+   * string); `options.sandboxId` is ignored because Blaxel reconnects by
+   * logical `id`.
+   */
+  clone(options: SandboxCloneOptions = {}): BlaxelSandbox {
+    const { id: _id, ...base } = this._constructorOptions;
+    return new BlaxelSandbox({
+      ...base,
+      ...(options.id !== undefined && { id: options.id }),
+      ...(options.env !== undefined && { env: options.env }),
+      ...(options.idleTimeoutMinutes !== undefined && { timeout: `${options.idleTimeoutMinutes}m` }),
+    });
   }
 
   get supportedRuntimes(): readonly SandboxRuntime[] {
@@ -637,6 +671,7 @@ export class BlaxelSandbox extends MastraSandbox {
         name: sandboxName,
         image: this.image,
         memory: this.memory,
+        region: this.region,
         ...(this.timeout && { ttl: this.timeout }),
         labels: {
           ...this.labels,
@@ -917,7 +952,7 @@ export class BlaxelSandbox extends MastraSandbox {
     try {
       // Merge sandbox default env with per-command env (per-command overrides)
       // Filter out undefined values to get Record<string, string>
-      const mergedEnv = { ...this.env, ...options.env };
+      const mergedEnv = { ...this.getEnv(), ...options.env };
       const envRecord = Object.fromEntries(
         Object.entries(mergedEnv).filter((entry): entry is [string, string] => entry[1] !== undefined),
       );
@@ -930,7 +965,7 @@ export class BlaxelSandbox extends MastraSandbox {
 
       const execPromise = sandbox.process.exec({
         command: fullCommand,
-        workingDir: options.cwd,
+        workingDir: options.cwd ?? this.workingDirectory,
         env: envRecord,
         waitForCompletion: true,
         ...(apiTimeout && { timeout: apiTimeout }),

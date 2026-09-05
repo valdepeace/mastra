@@ -4,22 +4,25 @@ import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import { RegisteredLogger } from '@mastra/core/logger';
 import type { IMastraLogger } from '@mastra/core/logger';
 import type {
+  ClientObservabilityProxy,
   CorrelationContext,
   ConfigSelector,
   ConfigSelectorOptions,
   FeedbackInput,
   FeedbackEvent,
   ObservabilityEntrypoint,
+  ObservabilityDropEvent,
   ObservabilityInstance,
   RecordedTrace,
   ScoreInput,
   ScoreEvent,
 } from '@mastra/core/observability';
-import type { ObservabilityStorage } from '@mastra/core/storage';
+import type { GetTraceResponse, ObservabilityStorage } from '@mastra/core/storage';
 import { routeToHandler } from './bus/route-event';
+import { createClientObservabilityProxy } from './client';
 import { SamplingStrategyType, observabilityRegistryConfigSchema, observabilityConfigValueSchema } from './config';
 import type { ObservabilityInstanceConfig, ObservabilityRegistryConfig } from './config';
-import { CloudExporter, DefaultExporter } from './exporters';
+import { MastraPlatformExporter, MastraStorageExporter } from './exporters';
 import { BaseObservabilityInstance, DefaultObservabilityInstance } from './instances';
 import {
   buildFeedbackEvent,
@@ -30,6 +33,7 @@ import {
 } from './recorded';
 import { ObservabilityRegistry } from './registry';
 import { SensitiveDataFilter } from './span_processors';
+import type { SensitiveDataFilterOptions } from './span_processors';
 
 /**
  * Type guard to check if an object is a BaseObservability instance
@@ -41,12 +45,24 @@ function isInstance(
 }
 
 /**
+ * Delays (ms) between attempts to rehydrate a trace from storage when an
+ * annotation (score/feedback) targets a span that has not been flushed by
+ * the configured exporters yet. Exporters buffer and flush asynchronously:
+ * by default they flush at 1000 spans or after a 5000ms wait
+ * (`maxBatchWaitMs`), so an annotation emitted right after a span ends can
+ * race the flush and be silently dropped. The schedule below sums to
+ * ~5.85s, covering the default flush interval with margin.
+ */
+const RECORDED_TRACE_LOOKUP_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 2000];
+
+/**
  * Top-level observability entrypoint. Manages a registry of ObservabilityInstance
  * configurations and provides instance selection via config selectors.
  */
 export class Observability extends MastraBase implements ObservabilityEntrypoint {
   #registry = new ObservabilityRegistry();
   #mastra?: Mastra;
+  #clientObservabilityProxy?: ClientObservabilityProxy;
 
   constructor(config: ObservabilityRegistryConfig) {
     super({
@@ -105,20 +121,37 @@ export class Observability extends MastraBase implements ObservabilityEntrypoint
       }
     }
 
+    // Resolve sensitive data filter setting (defaults to enabled).
+    const sensitiveDataFilterSetting = config.sensitiveDataFilter ?? true;
+    const shouldAutoApplySensitiveFilter = sensitiveDataFilterSetting !== false;
+    const sensitiveDataFilterOptions: SensitiveDataFilterOptions | undefined =
+      typeof sensitiveDataFilterSetting === 'object' && sensitiveDataFilterSetting !== null
+        ? sensitiveDataFilterSetting
+        : undefined;
+
+    const buildAutoSensitiveFilter = (): SensitiveDataFilter | undefined => {
+      if (!shouldAutoApplySensitiveFilter) {
+        return undefined;
+      }
+      return new SensitiveDataFilter(sensitiveDataFilterOptions);
+    };
+
     // Setup default config if enabled (deprecated)
     if (config.default?.enabled) {
       console.warn(
         '[Mastra Observability] The "default: { enabled: true }" configuration is deprecated and will be removed in a future version. ' +
-          'Please use explicit configs with DefaultExporter, CloudExporter, and SensitiveDataFilter instead. ' +
+          'Please use explicit configs with MastraStorageExporter and MastraPlatformExporter instead. ' +
+          'Sensitive data filtering is applied by default and can be controlled via the top-level "sensitiveDataFilter" option. ' +
           'See https://mastra.ai/docs/observability/tracing/overview for the recommended configuration.',
       );
 
+      const autoFilter = buildAutoSensitiveFilter();
       const defaultInstance = new DefaultObservabilityInstance({
         serviceName: 'mastra',
         name: 'default',
         sampling: { type: SamplingStrategyType.ALWAYS },
-        exporters: [new DefaultExporter(), new CloudExporter()],
-        spanOutputProcessors: [new SensitiveDataFilter()],
+        exporters: [new MastraStorageExporter(), new MastraPlatformExporter()],
+        spanOutputProcessors: autoFilter ? [autoFilter] : [],
       });
 
       // Register as default with high priority
@@ -130,9 +163,38 @@ export class Observability extends MastraBase implements ObservabilityEntrypoint
       const instances = Object.entries(config.configs);
 
       instances.forEach(([name, tracingDef], index) => {
-        const instance = isInstance(tracingDef)
-          ? tracingDef // Pre-instantiated custom implementation
-          : new DefaultObservabilityInstance({ ...tracingDef, name }); // Config -> Observability with instance name
+        let instance: ObservabilityInstance;
+        if (isInstance(tracingDef)) {
+          // Pre-instantiated custom implementation. We don't mutate it since
+          // the caller already owns it; warn if no SensitiveDataFilter is
+          // present and auto-apply is enabled.
+          instance = tracingDef;
+          if (shouldAutoApplySensitiveFilter) {
+            const processors = instance.getSpanOutputProcessors?.() ?? [];
+            const hasFilter = processors.some(p => p instanceof SensitiveDataFilter);
+            if (!hasFilter) {
+              this.logger?.warn(
+                '[Mastra Observability] Pre-instantiated observability instance does not include a SensitiveDataFilter. ' +
+                  'Auto-applied filtering is skipped for pre-instantiated instances. ' +
+                  'Add a SensitiveDataFilter to spanOutputProcessors when constructing the instance to redact sensitive data.',
+                { instanceName: name },
+              );
+            }
+          }
+        } else {
+          const userProcessors = tracingDef.spanOutputProcessors ?? [];
+          const hasFilter = userProcessors.some(p => p instanceof SensitiveDataFilter);
+          const autoFilter = !hasFilter ? buildAutoSensitiveFilter() : undefined;
+          // Auto-applied filter runs LAST so any sensitive data introduced by
+          // user processors (e.g. enrichment that copies headers/config into
+          // attributes) is still redacted before export.
+          const spanOutputProcessors = autoFilter ? [...userProcessors, autoFilter] : userProcessors;
+          instance = new DefaultObservabilityInstance({
+            ...tracingDef,
+            name,
+            spanOutputProcessors,
+          });
+        }
 
         // First user-provided instance becomes default only if no default config
         const isDefault = !config.default?.enabled && index === 0;
@@ -161,16 +223,24 @@ export class Observability extends MastraBase implements ObservabilityEntrypoint
 
       const config = instance.getConfig();
       const exporters = instance.getExporters();
+      const emitDropEvent =
+        instance instanceof BaseObservabilityInstance
+          ? (event: ObservabilityDropEvent) => instance.getObservabilityBus().emitDropEvent(event)
+          : undefined;
       exporters.forEach(exporter => {
         // Initialize exporter if it has an init method
         if ('init' in exporter && typeof exporter.init === 'function') {
-          try {
-            exporter.init({ mastra, config });
-          } catch (error) {
+          const handleInitError = (error: unknown) => {
             this.logger?.warn('Failed to initialize observability exporter', {
               exporterName: exporter.name,
               error: error instanceof Error ? error.message : String(error),
             });
+          };
+
+          try {
+            void Promise.resolve(exporter.init({ mastra, config, emitDropEvent })).catch(handleInitError);
+          } catch (error) {
+            handleInitError(error);
           }
         }
       });
@@ -244,18 +314,14 @@ export class Observability extends MastraBase implements ObservabilityEntrypoint
       return;
     }
 
-    const trace = await this.#getStoredTrace(args.traceId);
-    if (!trace) {
-      return;
-    }
-
-    const event = buildRecordedScoreEventFromTrace({
-      trace,
-      spanId: args.spanId,
-      score: args.score,
-    });
+    const event = await this.#buildRecordedEventWithRetry(args.traceId, trace =>
+      buildRecordedScoreEventFromTrace({ trace, spanId: args.spanId, score: args.score }),
+    );
 
     if (!event) {
+      this.logger?.warn(
+        `Score event was dropped because the target trace/span was not found in observability storage (traceId: ${args.traceId}, spanId: ${args.spanId})`,
+      );
       return;
     }
 
@@ -287,18 +353,14 @@ export class Observability extends MastraBase implements ObservabilityEntrypoint
       return;
     }
 
-    const trace = await this.#getStoredTrace(args.traceId);
-    if (!trace) {
-      return;
-    }
-
-    const event = buildRecordedFeedbackEventFromTrace({
-      trace,
-      spanId: args.spanId,
-      feedback: args.feedback,
-    });
+    const event = await this.#buildRecordedEventWithRetry(args.traceId, trace =>
+      buildRecordedFeedbackEventFromTrace({ trace, spanId: args.spanId, feedback: args.feedback }),
+    );
 
     if (!event) {
+      this.logger?.warn(
+        `Feedback event was dropped because the target trace/span was not found in observability storage (traceId: ${args.traceId}, spanId: ${args.spanId})`,
+      );
       return;
     }
 
@@ -352,9 +414,33 @@ export class Observability extends MastraBase implements ObservabilityEntrypoint
     this.#registry.clear();
   }
 
+  /** Flush all registered instances without shutting down. */
+  async flush(): Promise<void> {
+    await this.#registry.flush();
+  }
+
   /** Shut down all registered instances, flushing any pending data. */
   async shutdown(): Promise<void> {
     await this.#registry.shutdown();
+  }
+
+  /**
+   * Returns the proxy responsible for client observability (W3C trace
+   * context injection + OTLP/JSON payload reception for spans/logs
+   * returned from client-side execution).
+   *
+   * Lazily constructed on first call. Resolves the target observability
+   * instance per receive call so config selection works the same way
+   * as for server-side spans.
+   */
+  getClientObservabilityProxy(): ClientObservabilityProxy | undefined {
+    if (!this.#clientObservabilityProxy) {
+      this.#clientObservabilityProxy = createClientObservabilityProxy({
+        resolveInstance: () => this.getDefaultInstance(),
+        logger: this.logger,
+      });
+    }
+    return this.#clientObservabilityProxy;
   }
 
   async #getObservabilityStorage(): Promise<ObservabilityStorage | null> {
@@ -364,6 +450,30 @@ export class Observability extends MastraBase implements ObservabilityEntrypoint
     }
 
     return (await storage.getStore('observability')) ?? null;
+  }
+
+  /**
+   * Build a recorded score/feedback event from storage, retrying briefly to
+   * ride out the async exporter flush: annotations emitted right after a
+   * span ends can otherwise race the flush and be silently dropped.
+   */
+  async #buildRecordedEventWithRetry<TEvent>(
+    traceId: string,
+    build: (trace: GetTraceResponse) => TEvent | null,
+  ): Promise<TEvent | null> {
+    for (const delayMs of [0, ...RECORDED_TRACE_LOOKUP_RETRY_DELAYS_MS]) {
+      if (delayMs > 0) {
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
+
+      const trace = await this.#getStoredTrace(traceId);
+      const event = trace ? build(trace) : null;
+      if (event) {
+        return event;
+      }
+    }
+
+    return null;
   }
 
   async #getStoredTrace(traceId: string) {

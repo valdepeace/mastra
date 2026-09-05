@@ -1,6 +1,7 @@
 import type { ChunkType } from '../../stream';
 import { ChunkFrom } from '../../stream/types';
 import type { Processor } from '../index';
+import { REPROCESS_PART_KEY } from '../stream-reprocess';
 
 export type BatchPartsState = {
   batch: ChunkType[];
@@ -50,8 +51,9 @@ export class BatchPartsProcessor implements Processor<'batch-parts'> {
     streamParts: ChunkType[];
     state: Record<string, any>;
     abort: (reason?: string) => never;
+    writer?: { custom: (data: ChunkType) => Promise<void> };
   }): Promise<ChunkType | null> {
-    const { part, state } = args;
+    const { part, state, writer } = args;
 
     // Initialize state if not present
     if (!state.batch) {
@@ -83,7 +85,21 @@ export class BatchPartsProcessor implements Processor<'batch-parts'> {
     if (this.options.emitOnNonText && part.type !== 'text-delta') {
       const batchedChunk = this.flushBatch(state as BatchPartsState);
       if (batchedChunk) {
-        // Queue the non-text part for next emission so it isn't lost
+        // We have two parts to emit (the batched text and this non-text part)
+        // but can only return one. When running inside the processor chain,
+        // return the batched text (so it flows through any downstream
+        // processors) and stash the non-text part for the runner to re-drive
+        // through the whole chain right after. This avoids deferring the
+        // non-text part to the next processOutputStream call — which never
+        // happens when the stream stops on this part (e.g. a `stopWhen`
+        // condition halting the agentic loop on a tool result), dropping the
+        // part from the stream entirely.
+        if (writer) {
+          state[REPROCESS_PART_KEY] = part;
+          return batchedChunk;
+        }
+        // No writer (e.g. direct unit invocation): fall back to deferring the
+        // non-text part to the next call.
         state.pendingNonText = part;
         return batchedChunk;
       }
@@ -129,33 +145,37 @@ export class BatchPartsProcessor implements Processor<'batch-parts'> {
       return part || null;
     }
 
-    // Combine multiple text chunks into a single text part
-    const textChunks = state.batch.filter((part: ChunkType) => part.type === 'text-delta') as ChunkType[];
-
-    if (textChunks.length > 0) {
-      // Combine all text deltas
-      const combinedText = textChunks.map(part => (part.type === 'text-delta' ? part.payload.text : '')).join('');
-
-      // Create a new combined text part, preserving id and runId from the first chunk
-      const firstChunk = textChunks[0] as ChunkType & { type: 'text-delta' };
-      const combinedChunk: ChunkType = {
-        type: 'text-delta',
-        payload: { text: combinedText, id: firstChunk.payload.id },
-        runId: firstChunk.runId,
-        from: ChunkFrom.AGENT,
-      };
-
-      // Clear the batch completely - non-text chunks should be handled by the main logic
-      // when they arrive, not accumulated here
-      state.batch = [];
-
-      return combinedChunk;
-    } else {
-      // If no text chunks, return the first non-text part
+    // Emit the batch one part at a time, preserving order. Non-text parts can be
+    // buffered alongside text (e.g. when `emitOnNonText` is false), so we must not
+    // drop them when combining text. If the batch leads with a non-text part,
+    // emit it directly.
+    if (state.batch[0] && state.batch[0].type !== 'text-delta') {
       const part = state.batch[0];
       state.batch = state.batch.slice(1);
       return part || null;
     }
+
+    // Otherwise combine the leading run of contiguous text deltas into a single
+    // text part, keeping any later parts in the batch for subsequent flushes.
+    let textRunEnd = 0;
+    while (textRunEnd < state.batch.length && state.batch[textRunEnd]?.type === 'text-delta') {
+      textRunEnd++;
+    }
+    const textChunks = state.batch.slice(0, textRunEnd) as (ChunkType & { type: 'text-delta' })[];
+    const combinedText = textChunks.map(part => part.payload.text).join('');
+
+    // Preserve id and runId from the first chunk
+    const firstChunk = textChunks[0]!;
+    const combinedChunk: ChunkType = {
+      type: 'text-delta',
+      payload: { text: combinedText, id: firstChunk.payload.id },
+      runId: firstChunk.runId,
+      from: ChunkFrom.AGENT,
+    };
+
+    state.batch = state.batch.slice(textRunEnd);
+
+    return combinedChunk;
   }
 
   /**

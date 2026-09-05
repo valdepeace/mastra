@@ -1,5 +1,10 @@
 import type { ScoreRowData } from '@mastra/core/evals';
-import { Button, ButtonsGroup, DataKeysAndValues, DataPanel, Icon, cn } from '@mastra/playground-ui';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { ButtonsGroup } from '@mastra/playground-ui/components/ButtonsGroup';
+import { DataKeysAndValues } from '@mastra/playground-ui/components/DataKeysAndValues';
+import { DataPanel } from '@mastra/playground-ui/components/DataPanel';
+import { Icon } from '@mastra/playground-ui/icons/Icon';
+import { cn } from '@mastra/playground-ui/utils/cn';
 import { format } from 'date-fns/format';
 import { FileInputIcon, FileOutputIcon, GaugeIcon, ReceiptText, SaveIcon } from 'lucide-react';
 import { useState } from 'react';
@@ -17,7 +22,7 @@ function isCodeBasedScorer(score?: ScoreRowData): boolean {
 function buildDialogTitle(sectionTitle: string, icon: React.ReactNode, score: ScoreRowData) {
   return (
     <>
-      <span className="flex items-center gap-1.5 text-neutral2 uppercase tracking-widest [&>svg]:size-3.5">
+      <span className="text-neutral2 flex items-center gap-1.5 tracking-widest uppercase [&>svg]:size-3.5">
         {icon}
         {sectionTitle}
       </span>
@@ -78,7 +83,7 @@ export function ScoreDataPanel({ score, onClose, onPrevious, onNext }: ScoreData
             {score.traceId && (
               <>
                 <DataKeysAndValues.Key>Trace Id</DataKeysAndValues.Key>
-                <DataKeysAndValues.ValueLink href={`/traces/${encodeURIComponent(score.traceId)}`} as={Link}>
+                <DataKeysAndValues.ValueLink href={`/traces?traceId=${encodeURIComponent(score.traceId)}`} as={Link}>
                   {score.traceId}
                 </DataKeysAndValues.ValueLink>
               </>
@@ -87,7 +92,7 @@ export function ScoreDataPanel({ score, onClose, onPrevious, onNext }: ScoreData
               <>
                 <DataKeysAndValues.Key>Span Id</DataKeysAndValues.Key>
                 <DataKeysAndValues.ValueLink
-                  href={`/traces/${encodeURIComponent(score.traceId)}?spanId=${encodeURIComponent(score.spanId)}`}
+                  href={`/traces?traceId=${encodeURIComponent(score.traceId)}&spanId=${encodeURIComponent(score.spanId)}`}
                   as={Link}
                 >
                   {score.spanId}
@@ -96,7 +101,7 @@ export function ScoreDataPanel({ score, onClose, onPrevious, onNext }: ScoreData
             )}
           </DataKeysAndValues>
 
-          <div className="mt-6 mb-6 flex justify-end ">
+          <div className="mt-6 mb-6 flex justify-end">
             <Button size="sm" onClick={() => setDatasetDialogOpen(true)}>
               <Icon>
                 <SaveIcon />
@@ -114,9 +119,9 @@ export function ScoreDataPanel({ score, onClose, onPrevious, onNext }: ScoreData
             >
               <GaugeIcon />
               <span className="">Score:</span>
-              <b className="font-mono text-neutral3">{`${score.score == null || Number.isNaN(score.score) ? 'n/a' : score.score}`}</b>
+              <b className="text-neutral3 font-mono">{`${score.score == null || Number.isNaN(score.score) ? 'n/a' : score.score}`}</b>
             </div>
-            <div className="text-ui-smd font-mono mt-2">
+            <div className="text-ui-smd mt-2 font-mono">
               {score.reason ||
                 (isCodeBased ? 'N/A — code-based scorer does not generate a reason' : 'N/A — step not configured')}
             </div>

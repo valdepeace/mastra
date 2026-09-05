@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
 import { createTool } from '@mastra/core/tools';
-import type { PromptMessage, Resource, ResourceTemplate } from '@modelcontextprotocol/sdk/types.js';
+import type { PromptMessage, Resource, ResourceTemplateType } from '@modelcontextprotocol/server';
 import { z } from 'zod/v3';
 import { MCPServer } from '../server/server';
 import type { MCPServerResources, MCPServerResourceContent, MCPServerPrompts, MastraPrompt } from '../server/types';
@@ -78,7 +78,7 @@ const weatherResourceDefinitions: Resource[] = [
   },
 ];
 
-const weatherResourceTemplatesDefinitions: ResourceTemplate[] = [
+const weatherResourceTemplatesDefinitions: ResourceTemplateType[] = [
   {
     uriTemplate: 'weather://custom/{city}/{days}',
     name: 'Custom Weather Forecast',
@@ -203,10 +203,11 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
   });
 });
 
+const HOST = process.env.WEATHER_SERVER_HOST || '127.0.0.1';
 const PORT = process.env.WEATHER_SERVER_PORT || 60808;
-console.info(`[${serverId}] Starting HTTP server on port ${PORT}`);
-httpServer.listen(PORT, () => {
-  console.info(`[${serverId}] Weather server is running on SSE at http://localhost:${PORT}`);
+console.info(`[${serverId}] Starting HTTP server on ${HOST}:${PORT}`);
+httpServer.listen(Number(PORT), HOST, () => {
+  console.info(`[${serverId}] Weather server is running on SSE at http://${HOST}:${PORT}`);
 });
 
 // --- Interval-based Notifications ---

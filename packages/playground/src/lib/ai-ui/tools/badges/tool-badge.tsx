@@ -1,20 +1,38 @@
-import { CodeEditor, ToolsIcon } from '@mastra/playground-ui';
-import type { MastraUIMessage } from '@mastra/react';
+import {
+  presentTool,
+  stringifyToolValue,
+  ToolCallMono,
+  ToolCallPresentedHeader,
+} from '@mastra/playground-ui/components/ai/tool-call';
+import type { ToolCallStatus } from '@mastra/playground-ui/components/ai/tool-call';
+import { CodeEditor } from '@mastra/playground-ui/components/CodeEditor';
 import { BackgroundTaskMetadataDialogTrigger } from './background-task-metadata-dialog';
 import { BadgeWrapper } from './badge-wrapper';
 import { NetworkChoiceMetadataDialogTrigger } from './network-choice-metadata-dialog';
+import { SectionLabel } from './section-label';
 import type { ToolApprovalButtonsProps } from './tool-approval-buttons';
 import { ToolApprovalButtons } from './tool-approval-buttons';
+import type { MessageMetadata } from '@/lib/ai-ui/messages/message-metadata';
+
+function formatArgs(args: Record<string, unknown> | string): { pretty: string; parsed?: Record<string, unknown> } {
+  try {
+    const { __mastraMetadata: _, _background, ...parsed } = typeof args === 'object' ? args : JSON.parse(args);
+    return { pretty: stringifyToolValue(parsed), parsed };
+  } catch {
+    return { pretty: stringifyToolValue(args) };
+  }
+}
 
 export interface ToolBadgeProps extends Omit<ToolApprovalButtonsProps, 'toolCalled'> {
   toolName: string;
   args: Record<string, unknown> | string;
   result: any;
-  metadata?: MastraUIMessage['metadata'];
+  metadata?: MessageMetadata;
   toolOutput: Array<{ toolId: string }>;
   suspendPayload?: any;
   toolCalled?: boolean;
   withoutArgs?: boolean;
+  status?: ToolCallStatus;
 }
 
 export const ToolBadge = ({
@@ -29,32 +47,16 @@ export const ToolBadge = ({
   isNetwork,
   toolCalled: toolCalledProp,
   withoutArgs,
+  status = 'idle',
 }: ToolBadgeProps) => {
-  let argSlot = null;
+  const { pretty: argsPretty, parsed: argsObject } = formatArgs(args);
+  const { icon, label, detail } = presentTool(toolName, argsObject);
+  const resultPretty = result !== undefined && result !== null ? stringifyToolValue(result) : undefined;
 
-  try {
-    const { __mastraMetadata: _, _background, ...formattedArgs } = typeof args === 'object' ? args : JSON.parse(args);
-    argSlot = <CodeEditor data={formattedArgs} data-testid="tool-args" />;
-  } catch {
-    argSlot = <pre className="whitespace-pre bg-surface4 p-4 rounded-md overflow-x-auto">{args as string}</pre>;
-  }
-
-  let resultSlot =
-    typeof result === 'string' ? (
-      <pre className="whitespace-pre bg-surface4 p-4 rounded-md overflow-x-auto">{result}</pre>
-    ) : (
-      <CodeEditor data={result} data-testid="tool-result" />
-    );
-
-  let suspendPayloadSlot =
-    typeof suspendPayload === 'string' ? (
-      <pre className="whitespace-pre bg-surface4 p-4 rounded-md overflow-x-auto">{suspendPayload}</pre>
-    ) : (
-      <CodeEditor data={suspendPayload} data-testid="tool-suspend-payload" />
-    );
-
-  const selectionReason = metadata?.mode === 'network' ? metadata.selectionReason : undefined;
-  const agentNetworkInput = metadata?.mode === 'network' ? metadata.agentInput : undefined;
+  const routingDecision = metadata?.mode === 'network' ? metadata.routingDecision : undefined;
+  const selectionReason =
+    metadata?.mode === 'network' ? (routingDecision?.selectionReason ?? metadata.selectionReason) : undefined;
+  const agentNetworkInput = metadata?.mode === 'network' ? (routingDecision ?? metadata.agentInput) : undefined;
 
   const toolCalled = toolCalledProp ?? (result || toolOutput.length > 0);
 
@@ -66,8 +68,8 @@ export const ToolBadge = ({
   return (
     <BadgeWrapper
       data-testid="tool-badge"
-      icon={<ToolsIcon className="text-accent6" />}
-      title={toolName}
+      header={<ToolCallPresentedHeader icon={icon} label={label} detail={detail} />}
+      status={status}
       extraInfo={
         metadata?.mode === 'network' ? (
           <NetworkChoiceMetadataDialogTrigger
@@ -80,47 +82,52 @@ export const ToolBadge = ({
       }
       initialCollapsed={!!!(toolApprovalMetadata ?? suspendPayload)}
     >
-      <div className="space-y-4">
-        {withoutArgs ? null : (
-          <div>
-            <p className="font-medium pb-2">Tool arguments</p>
-            {argSlot}
+      {!withoutArgs && (
+        <ToolCallMono copyText={argsPretty} data-testid="tool-args" className="text-icon5">
+          {argsPretty}
+        </ToolCallMono>
+      )}
+
+      {suspendPayload !== undefined && suspendPayload && (
+        <div>
+          <SectionLabel>Suspend payload</SectionLabel>
+          {typeof suspendPayload === 'string' ? (
+            <ToolCallMono copyText={suspendPayload} className="text-icon3">
+              {suspendPayload}
+            </ToolCallMono>
+          ) : (
+            <CodeEditor data={suspendPayload} data-testid="tool-suspend-payload" />
+          )}
+        </div>
+      )}
+
+      {resultPretty && (
+        <ToolCallMono
+          copyText={resultPretty}
+          data-testid="tool-result"
+          className={status === 'error' ? 'text-error/90' : 'text-icon3'}
+        >
+          {resultPretty}
+        </ToolCallMono>
+      )}
+
+      {toolOutput.length > 0 && (
+        <div>
+          <SectionLabel>Tool output</SectionLabel>
+          <div className="h-40 overflow-y-auto">
+            <CodeEditor data={toolOutput} data-testid="tool-output" />
           </div>
-        )}
+        </div>
+      )}
 
-        {suspendPayloadSlot !== undefined && suspendPayload && (
-          <div>
-            <p className="font-medium pb-2">Tool suspend payload</p>
-            {suspendPayloadSlot}
-          </div>
-        )}
-
-        {resultSlot !== undefined && result && (
-          <div>
-            <p className="font-medium pb-2">Tool result</p>
-            {resultSlot}
-          </div>
-        )}
-
-        {toolOutput.length > 0 && (
-          <div>
-            <p className="font-medium pb-2">Tool output</p>
-
-            <div className="h-40 overflow-y-auto">
-              <CodeEditor data={toolOutput} data-testid="tool-output" />
-            </div>
-          </div>
-        )}
-
-        <ToolApprovalButtons
-          toolCalled={toolCalled}
-          toolCallId={toolCallId}
-          toolApprovalMetadata={toolApprovalMetadata}
-          toolName={toolName}
-          isNetwork={isNetwork}
-          isGenerateMode={metadata?.mode === 'generate'}
-        />
-      </div>
+      <ToolApprovalButtons
+        toolCalled={toolCalled}
+        toolCallId={toolCallId}
+        toolApprovalMetadata={toolApprovalMetadata}
+        toolName={toolName}
+        isNetwork={isNetwork}
+        isGenerateMode={metadata?.mode === 'generate'}
+      />
     </BadgeWrapper>
   );
 };

@@ -31,16 +31,62 @@ export { getObservationsAsOf } from './observation-utils';
 
 // Types
 export { ModelByInputTokens, type ModelByInputTokensConfig } from './model-by-input-tokens';
+export { Extractor } from './extractor';
+export type {
+  ExtractorConfig,
+  ExtractorOnExtractedContext,
+  ExtractorRuntimeContext,
+  ExtractorSource,
+} from './extractor';
+export { WorkingMemoryExtractor } from './working-memory-extractor';
+export {
+  buildSubconsciousActivitySnapshot,
+  KnowledgeSemanticIndexCoordinator,
+  publishSubconsciousActivity,
+  renderSubconsciousActivity,
+  StaleKnowledgeSemanticIndexError,
+  Subconscious,
+  SUBCONSCIOUS_ACTIVITY_STATE_ID,
+  SubconsciousRemindExtractor,
+} from './subconscious';
+export type {
+  KnowledgeSemanticIndexCoordinatorConfig,
+  ResolvedSubconsciousAgent,
+  SubconsciousActivitySnapshot,
+  SubconsciousActivityUpdate,
+  ResolvedSubconsciousConfig,
+  SubconsciousBuiltInObservationAgent,
+  SubconsciousBuiltInObservationConfig,
+  SubconsciousConfig,
+  SubconsciousCustomObservationConfig,
+  SubconsciousObservationEntry,
+} from './subconscious';
+
+// Standalone conversation summarization (reuses the Observer + extractor plumbing)
+export { summarizeConversation } from './summarize';
+export type { SummarizeConversationOptions, SummarizeConversationResult, SummarizeModel } from './summarize';
 
 export type {
   ObservationalMemoryConfig,
   ObservationDebugEvent,
   ObserveHooks,
+  ObserveHookContext,
   ObserveHookUsage,
+  ObserveTrigger,
   ObservationConfig,
   ReflectionConfig,
+  ContinuationHintsConfig,
   ObserverResult,
   ReflectorResult,
+  // Observation marker config
+  ObservationMarkerConfig,
+  // Observation data parts
+  DataOmObservationStartPart,
+  DataOmObservationEndPart,
+  DataOmObservationFailedPart,
+  DataOmStatusPart,
+  DataOmThreadUpdatePart,
+  DataOmObservationPart,
   // Buffering data parts
   DataOmBufferingStartPart,
   DataOmBufferingEndPart,

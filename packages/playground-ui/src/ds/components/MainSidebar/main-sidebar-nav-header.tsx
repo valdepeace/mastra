@@ -1,8 +1,7 @@
-import { VisuallyHidden } from '@radix-ui/react-visually-hidden';
 import type { ComponentPropsWithoutRef } from 'react';
 import type { SidebarState } from './main-sidebar-context';
-import { useMaybeSidebar } from './main-sidebar-context';
-import { MainSidebarNavSeparator } from './main-sidebar-nav-separator';
+import { useMaybeSidebarState } from './main-sidebar-context';
+import { VisuallyHidden } from '@/ds/primitives/visually-hidden';
 import type { LinkComponent } from '@/ds/types/link-component';
 import { cn } from '@/lib/utils';
 
@@ -23,48 +22,46 @@ export function MainSidebarNavHeader({
   LinkComponent: LinkProp,
   ...props
 }: MainSidebarNavHeaderProps) {
-  const ctx = useMaybeSidebar();
+  const ctx = useMaybeSidebarState();
   const state: SidebarState = stateProp ?? ctx?.state ?? 'default';
-  const Link: LinkComponent | 'a' = LinkProp ?? ctx?.LinkComponent ?? 'a';
-  const isDefaultState = state === 'default';
-
-  if (!isDefaultState) {
-    return (
-      <div className={cn('grid items-center min-h-11', className)}>
-        {/* Keep `...props` on the slotted <header> so consumers' `id` reaches the
-            DOM — `MainSidebarSections` uses it as the section's `aria-labelledby`. */}
-        <VisuallyHidden asChild>
-          <header {...props}>{children}</header>
-        </VisuallyHidden>
-        <MainSidebarNavSeparator />
-      </div>
-    );
-  }
+  const isMobile = ctx?.isMobile ?? false;
+  const Link: LinkComponent = LinkProp ?? ctx?.LinkComponent ?? 'a';
+  const showTitle = state === 'default' && !isMobile;
 
   return (
-    <div className={cn('grid grid-cols-[auto_1fr] items-center gap-2 min-w-0 min-h-11', className)}>
-      <header
-        {...props}
-        className={cn('min-w-0 max-w-full truncate text-ui-xs uppercase tracking-widest pl-3', {
-          'text-black dark:text-white font-semibold': isActive,
-          'text-neutral3/75': !isActive,
-        })}
-      >
-        {href ? (
-          <Link
-            href={href}
-            className={cn('block min-w-0 truncate transition-colors duration-normal', {
-              'hover:text-neutral5': !isActive,
-              'text-black dark:text-white': isActive,
-            })}
-          >
-            {children}
-          </Link>
-        ) : (
-          children
-        )}
-      </header>
-      <MainSidebarNavSeparator />
+    <div className={cn('mt-2 mb-0.5 flex min-h-8 min-w-0 items-center', className)}>
+      {showTitle ? (
+        <header
+          {...props}
+          className={cn('max-w-full min-w-0 truncate pl-3 text-ui-sm font-medium', {
+            'text-neutral5': isActive,
+            'text-neutral3/70': !isActive,
+          })}
+        >
+          {href ? (
+            <Link
+              href={href}
+              className={cn('duration-normal block min-w-0 truncate transition-colors', {
+                'hover:text-neutral5': !isActive,
+                'text-neutral5': isActive,
+              })}
+            >
+              {children}
+            </Link>
+          ) : (
+            children
+          )}
+        </header>
+      ) : (
+        <>
+          {/* Keep header in DOM (visually hidden) so consumers' `id` still resolves
+              for `MainSidebarSections`' `aria-labelledby`. */}
+          <VisuallyHidden asChild>
+            <header {...props}>{children}</header>
+          </VisuallyHidden>
+          <div aria-hidden="true" className="bg-border1 mx-3 h-px flex-1" />
+        </>
+      )}
     </div>
   );
 }

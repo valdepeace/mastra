@@ -2,7 +2,7 @@ import type { StepFlowEntry, WorkflowRunState } from '../..';
 import { RequestContext } from '../../../di';
 import type { PubSub } from '../../../events';
 import type { StepExecutor } from '../step-executor';
-import { getStep } from './utils';
+import { getStepId } from './utils';
 import type { ProcessorArgs } from '.';
 
 export async function processWorkflowWaitForEvent(
@@ -22,10 +22,10 @@ export async function processWorkflowWaitForEvent(
     return;
   }
 
-  const currentStep = getStep(workflowData.workflow, executionPath);
+  const currentStepId = getStepId(workflowData.workflow, executionPath);
   const prevResult = {
     status: 'success',
-    output: currentState?.context[currentStep?.id ?? 'input']?.payload,
+    output: currentState?.context[currentStepId ?? 'input']?.payload,
   };
 
   await pubsub.publish('workflows', {
@@ -40,7 +40,7 @@ export async function processWorkflowWaitForEvent(
       parentWorkflow: workflowData.parentWorkflow,
       stepResults: currentState?.context,
       prevResult,
-      activeSteps: [],
+      activeStepsPath: {},
       requestContext: currentState?.requestContext,
       perStep: workflowData.perStep,
     },
@@ -53,9 +53,10 @@ export async function processWorkflowSleep(
     runId,
     executionPath,
     stepResults,
-    activeSteps,
+    activeStepsPath,
     resumeSteps,
     timeTravel,
+    restart,
     prevResult,
     resumeData,
     parentWorkflow,
@@ -139,11 +140,12 @@ export async function processWorkflowSleep(
           executionPath: executionPath.slice(0, -1).concat([executionPath[executionPath.length - 1]! + 1]),
           resumeSteps,
           timeTravel,
+          restart,
           stepResults,
           prevResult,
           resumeData,
           parentWorkflow,
-          activeSteps,
+          activeStepsPath,
           requestContext,
           perStep,
         },
@@ -159,9 +161,10 @@ export async function processWorkflowSleepUntil(
     runId,
     executionPath,
     stepResults,
-    activeSteps,
+    activeStepsPath,
     resumeSteps,
     timeTravel,
+    restart,
     prevResult,
     resumeData,
     parentWorkflow,
@@ -246,11 +249,12 @@ export async function processWorkflowSleepUntil(
           executionPath: executionPath.slice(0, -1).concat([executionPath[executionPath.length - 1]! + 1]),
           resumeSteps,
           timeTravel,
+          restart,
           stepResults,
           prevResult,
           resumeData,
           parentWorkflow,
-          activeSteps,
+          activeStepsPath,
           requestContext,
           perStep,
         },

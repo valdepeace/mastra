@@ -13,7 +13,7 @@
  */
 
 import type { Sandbox } from '@daytonaio/sdk';
-import { ProcessHandle, SandboxProcessManager } from '@mastra/core/workspace';
+import { ProcessHandle, UnsupportedStdinCloseError, SandboxProcessManager } from '@mastra/core/workspace';
 import type { CommandResult, ProcessInfo, SpawnProcessOptions } from '@mastra/core/workspace';
 import { shellQuote } from '../utils/shell-quote';
 import type { DaytonaSandbox } from './index';
@@ -104,6 +104,8 @@ class DaytonaProcessHandle extends ProcessHandle {
             stdout: this.stdout,
             stderr: this.stderr || error.message,
             executionTimeMs: Date.now() - this._startTime,
+            killed: true,
+            timedOut: true,
           };
         }
         throw error;
@@ -123,6 +125,8 @@ class DaytonaProcessHandle extends ProcessHandle {
         stdout: this.stdout,
         stderr: this.stderr,
         executionTimeMs: Date.now() - this._startTime,
+        killed: true,
+        timedOut: false,
       };
     }
 
@@ -156,6 +160,10 @@ class DaytonaProcessHandle extends ProcessHandle {
     }
     await this._sandbox.process.sendSessionCommandInput(this.pid, this._cmdId, data);
   }
+
+  async closeStdin(): Promise<void> {
+    throw new UnsupportedStdinCloseError('Daytona SDK does not expose a way to close stdin for a running process');
+  }
 }
 
 // =============================================================================
@@ -163,7 +171,6 @@ class DaytonaProcessHandle extends ProcessHandle {
 // =============================================================================
 
 export interface DaytonaProcessManagerOptions {
-  env?: Record<string, string | undefined>;
   /** Default timeout in milliseconds for commands that don't specify one. */
   defaultTimeout?: number;
 }
@@ -177,27 +184,33 @@ export class DaytonaProcessManager extends SandboxProcessManager<DaytonaSandbox>
   private readonly _defaultTimeout?: number;
 
   constructor(opts: DaytonaProcessManagerOptions = {}) {
-    super({ env: opts.env });
+    super();
     this._defaultTimeout = opts.defaultTimeout;
   }
 
   async spawn(command: string, options: SpawnProcessOptions = {}): Promise<ProcessHandle> {
-    // Apply default timeout if the caller didn't specify one
+    // Apply default timeout and default cwd: per-command cwd wins, then an
+    // explicitly configured workingDirectory, then the first mount path so
+    // that relative paths resolve inside the FUSE mount instead of
+    // /home/daytona. The probe-filled base field deliberately does not
+    // participate — it just reports the session home.
     const effectiveOptions = {
       ...options,
       timeout: options.timeout ?? this._defaultTimeout,
+      cwd: options.cwd ?? this.sandbox.explicitWorkingDirectory ?? this.sandbox.mounts?.entries?.keys().next().value,
     };
+
+    // The base spawn wrapper already merged the sandbox env into options.env
+    const envs = Object.fromEntries(
+      Object.entries(effectiveOptions.env ?? {}).filter((entry): entry is [string, string] => entry[1] !== undefined),
+    );
+
+    // Validate/build before retryOnDead so user-controlled validation errors
+    // cannot be mistaken for Daytona dead-sandbox errors.
+    const sessionCommand = buildSpawnCommand(command, effectiveOptions.cwd, envs);
+
     return this.sandbox.retryOnDead(async () => {
       const sandbox = this.sandbox.daytona;
-
-      // Merge default env with per-spawn env
-      const mergedEnv = { ...this.env, ...effectiveOptions.env };
-      const envs = Object.fromEntries(
-        Object.entries(mergedEnv).filter((entry): entry is [string, string] => entry[1] !== undefined),
-      );
-
-      // Build command with baked-in env and cwd, wrapped in subshell
-      const sessionCommand = buildSpawnCommand(command, effectiveOptions.cwd, envs);
 
       // Unique session ID per spawn — used as the PID
       const sessionId = `mastra-proc-${Date.now().toString(36)}-${++this._spawnCounter}`;
@@ -248,6 +261,8 @@ export class DaytonaProcessManager extends SandboxProcessManager<DaytonaSandbox>
 // Command Building
 // =============================================================================
 
+const SHELL_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 /**
  * Build a shell command string that bakes in cwd and env vars.
  * Wraps the user command in a subshell `(command)` so that:
@@ -262,6 +277,9 @@ function buildSpawnCommand(command: string, cwd: string | undefined, envs: Recor
   const parts: string[] = [];
 
   for (const [k, v] of Object.entries(envs)) {
+    if (!SHELL_IDENTIFIER_PATTERN.test(k)) {
+      throw new Error(`Invalid environment variable name: ${JSON.stringify(k)}`);
+    }
     parts.push(`export ${k}=${shellQuote(v)}`);
   }
 

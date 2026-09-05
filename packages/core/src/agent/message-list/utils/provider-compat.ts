@@ -85,6 +85,139 @@ export function ensureAnthropicCompatibleMessages(
 }
 
 /**
+ * Tool call ids in the assistant message at `index` that already have a matching tool_result,
+ * either inline in the same message or in the tool message immediately after it — the only
+ * two positions providers accept.
+ */
+function collectPairedToolCallIds(messages: ModelMessage[], index: number): Set<string> {
+  const current = messages[index]!;
+  if (!Array.isArray(current.content)) return new Set();
+
+  const useIds = new Set<string>();
+  const resultIds = new Set<string>();
+  for (const part of current.content) {
+    if (part.type === 'tool-call') useIds.add(part.toolCallId);
+    else if (part.type === 'tool-result') resultIds.add(part.toolCallId);
+  }
+
+  const next = messages[index + 1];
+  if (next && next.role === 'tool' && Array.isArray(next.content)) {
+    for (const part of next.content) {
+      if (part.type === 'tool-result') resultIds.add(part.toolCallId);
+    }
+  }
+
+  return new Set([...useIds].filter(id => resultIds.has(id)));
+}
+
+/**
+ * Removes orphan tool_use / tool_result blocks. Anthropic requires every tool_result
+ * to be in the message immediately after its matching tool_use, and every tool_use
+ * to have a matching tool_result in the next message. Recall windows can slice
+ * through a parallel tool-call group and leave behind half a pair.
+ */
+export function sanitizeOrphanedToolPairs(messages: ModelMessage[]): ModelMessage[] {
+  const filteredContents = messages.map(m => (Array.isArray(m.content) ? [...m.content] : null));
+
+  for (let i = 0; i < messages.length; i++) {
+    const current = messages[i]!;
+
+    if (current.role === 'assistant' && Array.isArray(current.content)) {
+      const validPairs = collectPairedToolCallIds(messages, i);
+      const next = messages[i + 1];
+
+      filteredContents[i] = filteredContents[i]!.filter(p => {
+        if (p.type !== 'tool-call') return true;
+        const tc = p as { toolCallId: string; providerExecuted?: boolean };
+        // Provider-executed tools may be deferred (e.g. Anthropic web_search): the tool_use
+        // can appear without a matching tool_result until the provider resumes on the next call.
+        return tc.providerExecuted === true || validPairs.has(tc.toolCallId);
+      });
+
+      if (next && next.role === 'tool' && Array.isArray(next.content)) {
+        filteredContents[i + 1] = filteredContents[i + 1]!.filter(
+          p => p.type !== 'tool-result' || validPairs.has((p as { toolCallId: string }).toolCallId),
+        );
+      }
+    } else if (current.role === 'tool' && Array.isArray(current.content)) {
+      const prev = messages[i - 1];
+      if (!prev || prev.role !== 'assistant' || !Array.isArray(prev.content)) {
+        filteredContents[i] = filteredContents[i]!.filter(p => p.type !== 'tool-result');
+      }
+    }
+  }
+
+  const result: ModelMessage[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const original = messages[i]!;
+    const filtered = filteredContents[i];
+    if (filtered == null) {
+      result.push(original);
+      continue;
+    }
+    if (filtered.length === 0) continue;
+    if (Array.isArray(original.content) && filtered.length === original.content.length) {
+      result.push(original);
+      continue;
+    }
+    result.push({ ...original, content: filtered } as ModelMessage);
+  }
+
+  return result;
+}
+
+/**
+ * Keeps result-less tool calls in the prompt by pairing each one with a placeholder result.
+ *
+ * Used when the caller opted to keep suspended tool calls visible to the agent
+ * (`filterIncompleteToolCalls: false`). Providers reject a tool_use with no matching
+ * tool_result, so dropping the call is not the only option — synthesizing the missing
+ * half keeps the pending call in context while satisfying the pairing requirement.
+ *
+ * Provider-executed calls are left alone: they may be legitimately deferred to the next
+ * request, and giving them a result would resolve a call the provider intends to resume.
+ *
+ * @see https://github.com/mastra-ai/mastra/issues/20610
+ */
+export function pairOrphanedToolCalls(messages: ModelMessage[]): ModelMessage[] {
+  const paired: ModelMessage[] = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    const current = messages[i]!;
+    paired.push(current);
+
+    if (current.role !== 'assistant' || !Array.isArray(current.content)) continue;
+
+    const pairedIds = collectPairedToolCallIds(messages, i);
+    const placeholders: ToolResultPart[] = [];
+    for (const part of current.content) {
+      if (part.type !== 'tool-call') continue;
+      const tc = part as { toolCallId: string; toolName: string; providerExecuted?: boolean };
+      if (tc.providerExecuted === true || pairedIds.has(tc.toolCallId)) continue;
+      placeholders.push({
+        type: 'tool-result',
+        toolCallId: tc.toolCallId,
+        toolName: tc.toolName,
+        output: { type: 'json', value: { status: 'pending' } },
+      });
+    }
+
+    if (placeholders.length === 0) continue;
+
+    const next = messages[i + 1];
+    if (next && next.role === 'tool' && Array.isArray(next.content)) {
+      paired.push({ ...next, content: [...next.content, ...placeholders] });
+      i++;
+    } else {
+      paired.push({ role: 'tool', content: placeholders });
+    }
+  }
+
+  // Every tool call is paired by now, so this only clears tool_results whose call is gone.
+  return sanitizeOrphanedToolPairs(paired);
+}
+
+/**
  * Enriches a single message's tool-result parts with input field
  */
 function enrichToolResultsWithInput(message: ModelMessage, dbMessages: MastraDBMessage[]): ModelMessage {
@@ -195,8 +328,10 @@ export function findToolCallArgs(messages: MastraDBMessage[], toolCallId: string
       );
 
       if (toolCallPart && toolCallPart.type === 'tool-invocation') {
-        // Return the args even if it's undefined or empty object
-        return toolCallPart.toolInvocation.args || {};
+        const args = toolCallPart.toolInvocation.args || {};
+        if (typeof args === 'object' && Object.keys(args).length > 0) {
+          return args;
+        }
       }
     }
 
@@ -205,7 +340,10 @@ export function findToolCallArgs(messages: MastraDBMessage[], toolCallId: string
       const toolInvocation = msg.content.toolInvocations.find(inv => inv.toolCallId === toolCallId);
 
       if (toolInvocation) {
-        return toolInvocation.args || {};
+        const args = toolInvocation.args || {};
+        if (typeof args === 'object' && Object.keys(args).length > 0) {
+          return args;
+        }
       }
     }
   }

@@ -40,9 +40,14 @@ export function generateContextualValue(fieldName?: string): string {
 
   const field = fieldName.toLowerCase();
 
+  // Timestamp fields used in body validation need a valid ISO string.
+  if (field === 'createdat' || field === 'updatedat') return new Date().toISOString();
+
   if (field === 'entitytype') return 'AGENT';
   if (field === 'entityid') return 'test-agent';
   if (field === 'role') return 'user';
+  // Cron fields must be a valid cron expression (schedule create routes).
+  if (field === 'cron') return '* * * * *';
   if (field === 'fields') return 'result'; // For workflow execution result field filtering (status is always included)
   // JSON-encoded query params (wrapped with wrapSchemaForQueryParams)
   if (field === 'tags') return '["test-tag"]'; // For observability traces filtering
@@ -111,6 +116,16 @@ export function generateValidDataFromSchema(schema: z.ZodTypeAny, fieldName?: st
     def = getZodDef(schema);
   }
 
+  // Unwrap z.preprocess / .transform pipes (Zod 4 represents these as ZodPipe
+  // with the validated schema at `def.out`). Without this the generator falls
+  // through to `undefined` for any query schema that uses a top-level
+  // preprocess (e.g. legacy-shape back-compat shims).
+  while (typeName === 'ZodPipe' && def?.out) {
+    schema = def.out;
+    typeName = getZodTypeName(schema);
+    def = getZodDef(schema);
+  }
+
   if (typeName === 'ZodOptional' || typeName === 'ZodNullable') {
     return generateValidDataFromSchema(def.innerType, fieldName);
   }
@@ -122,7 +137,18 @@ export function generateValidDataFromSchema(schema: z.ZodTypeAny, fieldName?: st
     }
   }
 
-  if (typeName === 'ZodString') return generateContextualValue(fieldName);
+  if (typeName === 'ZodString') {
+    const hasDateTimeFormat = (def.checks ?? []).some((check: any) => {
+      const checkDef = check._zod?.def ?? check.def ?? check;
+      return check.kind === 'datetime' || check.format === 'datetime' || checkDef.format === 'datetime';
+    });
+    if (hasDateTimeFormat) {
+      if (fieldName?.toLowerCase() === 'from') return '2026-01-01T00:00:00.000Z';
+      if (fieldName?.toLowerCase() === 'to') return '2026-01-02T00:00:00.000Z';
+      return '2026-01-01T00:00:00.000Z';
+    }
+    return generateContextualValue(fieldName);
+  }
   if (typeName === 'ZodNumber') {
     // Respect min/max constraints from Zod checks
     let min = -Infinity;
@@ -169,6 +195,13 @@ export function generateValidDataFromSchema(schema: z.ZodTypeAny, fieldName?: st
         if (zod4Def.check === 'safeint') {
           requiresSafeInt = true;
           requiresInt = true;
+        }
+        // Zod 4 emits `int()` as `number_format` with `format: 'int' | 'safeint'`.
+        if (zod4Def.check === 'number_format') {
+          if (zod4Def.format === 'int' || zod4Def.format === 'safeint') {
+            requiresInt = true;
+            if (zod4Def.format === 'safeint') requiresSafeInt = true;
+          }
         }
       }
     }
@@ -352,6 +385,7 @@ export function getDefaultValidPathParams(route: ServerRoute): Record<string, an
   if (route.path.includes(':toolId')) params.toolId = 'test-tool';
   if (route.path.includes(':threadId')) params.threadId = 'test-thread';
   if (route.path.includes(':conversationId')) params.conversationId = 'test-thread';
+  if (route.path.includes(':controllerId')) params.controllerId = 'test-controller';
   if (route.path.includes(':responseId')) params.responseId = 'test-response';
   if (route.path.includes(':resourceId')) params.resourceId = 'test-resource';
   if (route.path.includes(':modelConfigId')) params.modelConfigId = 'id1';
@@ -362,6 +396,7 @@ export function getDefaultValidPathParams(route: ServerRoute): Record<string, an
     params.scorerId = 'test-scorer';
   }
   if (route.path.includes(':scoreId')) params.scoreId = 'test-score';
+  if (route.path.includes(':feedbackId')) params.feedbackId = 'test-feedback';
   if (route.path.includes(':traceId')) params.traceId = 'test-trace';
   if (route.path.includes(':runId')) params.runId = 'test-run';
   if (route.path.includes(':stepId')) params.stepId = 'test-step';
@@ -375,6 +410,7 @@ export function getDefaultValidPathParams(route: ServerRoute): Record<string, an
   if (route.path.includes(':actionId')) params.actionId = 'merge-template';
   if (route.path.includes(':storedAgentId')) params.storedAgentId = 'test-stored-agent';
   if (route.path.includes(':storedScorerId')) params.storedScorerId = 'test-stored-scorer';
+  if (route.path.includes(':roleId')) params.roleId = 'test-role';
   if (route.path.includes(':versionId')) params.versionId = 'test-version-id';
   if (route.path.includes(':processorId')) params.processorId = 'test-processor';
   // MCP route params - need to get actual server ID from test context
@@ -396,6 +432,7 @@ export function getDefaultValidPathParams(route: ServerRoute): Record<string, an
   if (route.path.includes(':promptBlockId')) params.promptBlockId = 'test-stored-prompt-block';
   if (route.path.includes(':storedWorkspaceId')) params.storedWorkspaceId = 'test-stored-workspace';
   if (route.path.includes(':storedSkillId')) params.storedSkillId = 'test-stored-skill';
+  if (route.path.includes(':dynamicWorkflowId')) params.dynamicWorkflowId = 'test-dynamic-workflow';
   if (route.path.includes(':scorerId') && route.path.includes('/stored/scorers/'))
     params.scorerId = 'test-stored-scorer';
 
@@ -409,9 +446,14 @@ export function getDefaultValidPathParams(route: ServerRoute): Record<string, an
   // Tool provider route params
   if (route.path.includes(':providerId')) params.providerId = 'test-provider';
   if (route.path.includes(':toolSlug')) params.toolSlug = 'test-tool-slug';
+  if (route.path.includes(':authId')) params.authId = 'test-auth-id';
+  if (route.path.includes(':connectionId')) params.connectionId = 'test-connection-id';
 
   // Channel route params
   if (route.path.includes(':platform')) params.platform = 'test-platform';
+
+  // Builder registry route params
+  if (route.path.includes(':registryId')) params.registryId = 'skills-sh';
 
   return params;
 }
@@ -422,6 +464,10 @@ export function getDefaultInvalidPathParams(route: ServerRoute): Array<Record<st
 
   if (route.path.includes(':agentId')) {
     invalid.push({ agentId: 123 });
+  }
+
+  if (route.path.includes(':registryId')) {
+    invalid.push({ registryId: 123 });
   }
 
   return invalid;

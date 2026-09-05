@@ -1,13 +1,31 @@
-import { toAISdkV4Messages, toAISdkV5Messages } from '@mastra/ai-sdk/ui';
-import type { MastraUIMessage } from '@mastra/react';
-import { useEffect, useMemo } from 'react';
+import { useEffect, useRef } from 'react';
 import { useAgentSettings } from '../context/agent-context';
 import { useMergedRequestContext } from '@/domains/request-context/context/schema-request-context';
 import { useAgentMessages } from '@/hooks/use-agent-messages';
+import { ChatProvider } from '@/lib/ai-ui/chat/chat-provider';
 import { Thread } from '@/lib/ai-ui/thread';
 
-import { MastraRuntimeProvider } from '@/services/mastra-runtime-provider';
 import type { ChatProps } from '@/types';
+
+interface AvailableSuggestedPromptsOptions {
+  suggestedPrompts?: string[];
+  isNewThread?: boolean;
+  isMessagesLoading: boolean;
+}
+
+/**
+ * Keeps existing-thread prompts hidden until message history has loaded, so
+ * they do not briefly appear before the conversation replaces the welcome UI.
+ */
+const getAvailableSuggestedPrompts = ({
+  suggestedPrompts,
+  isNewThread,
+  isMessagesLoading,
+}: AvailableSuggestedPromptsOptions) => {
+  if (isNewThread) return suggestedPrompts;
+  if (isMessagesLoading) return undefined;
+  return suggestedPrompts;
+};
 
 export const AgentChat = ({
   agentId,
@@ -17,14 +35,20 @@ export const AgentChat = ({
   refreshThreadList,
   modelVersion,
   agentVersionId,
+  supportsMemory,
   modelList,
   messageId,
+  suggestedPrompts,
   isNewThread,
   hideModelSwitcher,
-}: Omit<ChatProps, 'initialMessages' | 'initialLegacyMessages'> & {
+  runOptionsSlot,
+}: Omit<ChatProps, 'initialMessages'> & {
+  memory?: boolean;
   messageId?: string;
+  suggestedPrompts?: string[];
   isNewThread?: boolean;
   hideModelSwitcher?: boolean;
+  runOptionsSlot?: React.ReactNode;
 }) => {
   const { settings } = useAgentSettings();
   const requestContext = useMergedRequestContext();
@@ -55,34 +79,41 @@ export const AgentChat = ({
   // Stable empty array per thread: stays the same reference across re-renders
   // (preventing useChat from wiping streamed messages), but changes when threadId
   // changes (allowing useChat to reset when switching threads).
-  const emptyMessages = useMemo(() => [] as never[], [threadId]);
+  const emptyMessagesRef = useRef<{ threadId: string; messages: never[] }>({ threadId, messages: [] });
+  if (emptyMessagesRef.current.threadId !== threadId) {
+    emptyMessagesRef.current = { threadId, messages: [] };
+  }
 
-  const messages = data?.messages ?? emptyMessages;
-  const v5Messages = useMemo(() => toAISdkV5Messages(messages) as MastraUIMessage[], [messages]);
-  const v4Messages = useMemo(() => toAISdkV4Messages(messages), [messages]);
+  const messages = data?.messages ?? emptyMessagesRef.current.messages;
+  const availableSuggestedPrompts = getAvailableSuggestedPrompts({
+    suggestedPrompts,
+    isNewThread,
+    isMessagesLoading,
+  });
 
   return (
-    <MastraRuntimeProvider
+    <ChatProvider
       agentId={agentId}
       agentName={agentName}
       modelVersion={modelVersion}
       agentVersionId={agentVersionId}
+      supportsMemory={supportsMemory}
       threadId={threadId}
-      initialMessages={v5Messages}
-      initialLegacyMessages={v4Messages}
-      memory={memory}
+      initialMessages={messages}
       refreshThreadList={refreshThreadList}
       settings={settings}
       requestContext={requestContext}
     >
       <Thread
         agentName={agentName ?? ''}
-        hasMemory={memory}
         agentId={agentId}
         threadId={threadId}
+        suggestedPrompts={availableSuggestedPrompts}
         hasModelList={Boolean(modelList)}
         hideModelSwitcher={hideModelSwitcher}
+        refreshThreadList={refreshThreadList}
+        runOptionsSlot={runOptionsSlot}
       />
-    </MastraRuntimeProvider>
+    </ChatProvider>
   );
 };

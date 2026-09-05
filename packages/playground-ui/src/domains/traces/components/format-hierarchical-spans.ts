@@ -8,9 +8,16 @@ type TimelineSpan = {
   startedAt: Date | string;
   endedAt?: Date | string | null;
   parentSpanId?: string | null;
+  matchedInPayloadOnly?: boolean;
 };
 
-export const formatHierarchicalSpans = (spans: TimelineSpan[]): UISpan[] => {
+/**
+ * When `anchorSpanId` is provided, that span is treated as the displayed root
+ * regardless of its `parentSpanId` -- the branch-subtree case from `getBranch`,
+ * where the anchor has a real parent that's outside the returned set. Without
+ * it, the displayed roots are the spans with no parent (the trace case).
+ */
+export const formatHierarchicalSpans = (spans: TimelineSpan[], anchorSpanId?: string): UISpan[] => {
   if (!spans || spans.length === 0) {
     return [];
   }
@@ -39,15 +46,20 @@ export const formatHierarchicalSpans = (spans: TimelineSpan[]): UISpan[] => {
       endTime: endDate ? endDate.toISOString() : undefined,
       spans: [],
       parentSpanId: spanRecord.parentSpanId,
+      matchedInPayloadOnly: spanRecord.matchedInPayloadOnly,
     };
 
     spanMap.set(spanRecord.spanId, uiSpan);
   });
 
-  spans.forEach(spanRecord => {
-    const uiSpan = spanMap.get(spanRecord.spanId)!;
+  const isAnchor = (spanRecord: TimelineSpan) =>
+    anchorSpanId ? spanRecord.spanId === anchorSpanId : spanRecord?.parentSpanId == null;
 
-    if (spanRecord?.parentSpanId == null) {
+  spans.forEach(spanRecord => {
+    const uiSpan = spanMap.get(spanRecord.spanId);
+    if (!uiSpan) return;
+
+    if (isAnchor(spanRecord)) {
       if (overallEndDate && uiSpan.endTime && overallEndDate > new Date(uiSpan.endTime)) {
         uiSpan.endTime = overallEndDate.toISOString();
         const overallEndTime = new Date(overallEndDate).getTime();
@@ -56,10 +68,14 @@ export const formatHierarchicalSpans = (spans: TimelineSpan[]): UISpan[] => {
       }
       rootSpans.push(uiSpan);
     } else {
-      const parent = spanMap.get(spanRecord.parentSpanId);
+      const parent = spanRecord.parentSpanId ? spanMap.get(spanRecord.parentSpanId) : undefined;
       if (parent) {
-        parent.spans!.push(uiSpan);
+        parent.spans ??= [];
+        parent.spans.push(uiSpan);
       } else {
+        // Orphan: either the parent isn't in the supplied set (branch subtree boundary), or
+        // the span has no parent yet wasn't picked as the anchor (rare when `anchorSpanId`
+        // is specified). Surface it at the displayed root rather than dropping it.
         rootSpans.push(uiSpan);
       }
     }

@@ -9,16 +9,34 @@ import {
   createRouteAdapterTestSuite,
   createDefaultTestContext,
   createStreamWithSensitiveData,
+  createStreamWithUnserializableChunk,
+  expectSerializedStreamChunks,
   consumeSSEStream,
   createMultipartTestSuite,
 } from '@internal/server-adapter-test-utils';
 import { Mastra } from '@mastra/core';
 import { registerApiRoute } from '@mastra/core/server';
+import { createRoute } from '@mastra/server/server-adapter';
 import type { ServerRoute } from '@mastra/server/server-adapter';
 import Koa from 'koa';
 import bodyParser from 'koa-bodyparser';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { z } from 'zod';
 import { MastraServer } from '../index';
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitFor(assertion: () => boolean, timeout = 500): Promise<void> {
+  const start = Date.now();
+  while (!assertion()) {
+    if (Date.now() - start > timeout) {
+      throw new Error('Timed out waiting for assertion');
+    }
+    await sleep(1);
+  }
+}
 
 // Wrapper describe block so the factory can call describe() inside
 describe('Koa Server Adapter', () => {
@@ -104,6 +122,8 @@ describe('Koa Server Adapter', () => {
         const isStream =
           contentType.includes('text/plain') ||
           contentType.includes('text/event-stream') ||
+          contentType.includes('audio/') ||
+          contentType.includes('application/octet-stream') ||
           transferEncoding === 'chunked';
 
         if (isStream && response.body) {
@@ -332,7 +352,7 @@ describe('Koa Server Adapter', () => {
         { prefix: '' },
       );
 
-      expect(app.middleware).toHaveLength(3);
+      expect(app.middleware).toHaveLength(4);
 
       server = await new Promise(resolve => {
         const s = app.listen(0, () => resolve(s));
@@ -348,6 +368,156 @@ describe('Koa Server Adapter', () => {
       const secondResponse = await fetch(`http://localhost:${port}/second`);
       expect(secondResponse.status).toBe(200);
       await expect(secondResponse.json()).resolves.toEqual({ route: 'second' });
+    });
+
+    // Regression: subclasses sometimes forward an app-like object (e.g. a
+    // koa-router instance or a mounted sub-app) to super.registerRoute().
+    // Before the fix, getRouteDispatcherGroup unconditionally read
+    // `app.middleware.length` and threw `TypeError: Cannot read properties of
+    // undefined (reading 'length')` during init.
+    describe('non-Koa app-like targets', () => {
+      const buildRouterLike = () => {
+        const used: Koa.Middleware[] = [];
+        const routerLike = {
+          use(mw: Koa.Middleware) {
+            used.push(mw);
+            return routerLike;
+          },
+        };
+        return { routerLike, used };
+      };
+
+      it('does not throw when app.middleware is missing entirely', async () => {
+        const koaApp = new Koa();
+        const adapter = new MastraServer({ app: koaApp, mastra: new Mastra({}) });
+        const { routerLike, used } = buildRouterLike();
+
+        await expect(
+          adapter.registerRoute(
+            routerLike as unknown as Koa,
+            {
+              method: 'GET',
+              path: '/ping',
+              responseType: 'json',
+              handler: async () => ({ ok: true }),
+            },
+            { prefix: '' },
+          ),
+        ).resolves.toBeUndefined();
+
+        expect(used).toHaveLength(1);
+        expect(used[0].name).toBe('mastraRouteDispatcher');
+      });
+
+      it('does not reuse a dispatcher when app.middleware is present but not an array', async () => {
+        const koaApp = new Koa();
+        const adapter = new MastraServer({ app: koaApp, mastra: new Mastra({}) });
+        const { routerLike, used } = buildRouterLike();
+        // Some wrappers expose `middleware` as a non-array (e.g. an object map).
+        // Without the Array.isArray() guard, the reuse-cache path would either
+        // crash on `.length` or silently cache a bogus `stackLengthAfterRegistration`
+        // and start incorrectly reusing the dispatcher across calls.
+        (routerLike as any).middleware = { not: 'an array' };
+
+        await adapter.registerRoute(
+          routerLike as unknown as Koa,
+          {
+            method: 'GET',
+            path: '/x',
+            responseType: 'json',
+            handler: async () => ({ route: 'x' }),
+          },
+          { prefix: '' },
+        );
+
+        await adapter.registerRoute(
+          routerLike as unknown as Koa,
+          {
+            method: 'GET',
+            path: '/y',
+            responseType: 'json',
+            handler: async () => ({ route: 'y' }),
+          },
+          { prefix: '' },
+        );
+
+        expect(used).toHaveLength(2);
+        expect(used.every(mw => mw.name === 'mastraRouteDispatcher')).toBe(true);
+      });
+
+      it('registers a fresh dispatcher per route on non-Koa targets (no reuse)', async () => {
+        const koaApp = new Koa();
+        const adapter = new MastraServer({ app: koaApp, mastra: new Mastra({}) });
+        const { routerLike, used } = buildRouterLike();
+
+        await adapter.registerRoute(
+          routerLike as unknown as Koa,
+          {
+            method: 'GET',
+            path: '/a',
+            responseType: 'json',
+            handler: async () => ({ route: 'a' }),
+          },
+          { prefix: '' },
+        );
+
+        await adapter.registerRoute(
+          routerLike as unknown as Koa,
+          {
+            method: 'GET',
+            path: '/b',
+            responseType: 'json',
+            handler: async () => ({ route: 'b' }),
+          },
+          { prefix: '' },
+        );
+
+        // Without `app.middleware`, reuse is impossible — each registration
+        // must produce its own dispatcher middleware on the target.
+        expect(used).toHaveLength(2);
+        expect(used.every(mw => mw.name === 'mastraRouteDispatcher')).toBe(true);
+        expect(used[0]).not.toBe(used[1]);
+      });
+
+      it('serves the route end-to-end when the router-like target is mounted on a real Koa app', async () => {
+        const koaApp = new Koa();
+        koaApp.use(bodyParser());
+
+        const adapter = new MastraServer({ app: koaApp, mastra: new Mastra({}) });
+        adapter.registerContextMiddleware();
+
+        // routerLike forwards `.use` straight onto the real Koa app, mimicking
+        // a mount/wrapper pattern where the dispatcher ultimately runs inside
+        // the parent app's middleware stack.
+        const routerLike = {
+          use: (mw: Koa.Middleware) => {
+            koaApp.use(mw);
+            return routerLike;
+          },
+        };
+
+        await adapter.registerRoute(
+          routerLike as unknown as Koa,
+          {
+            method: 'GET',
+            path: '/mounted',
+            responseType: 'json',
+            handler: async () => ({ route: 'mounted' }),
+          },
+          { prefix: '' },
+        );
+
+        server = await new Promise(resolve => {
+          const s = koaApp.listen(0, () => resolve(s));
+        });
+
+        const address = server.address();
+        const port = typeof address === 'object' && address ? address.port : 0;
+
+        const response = await fetch(`http://localhost:${port}/mounted`);
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({ route: 'mounted' });
+      });
     });
   });
 
@@ -433,6 +603,144 @@ describe('Koa Server Adapter', () => {
       const finish = chunks.find(c => c.type === 'finish');
       expect(finish).toBeDefined();
       expect(finish.payload.metadata.request).toBeUndefined();
+    });
+
+    it('should pass SSE comment chunks through without data wrapping', async () => {
+      const app = new Koa();
+      app.use(bodyParser());
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/sse-comment',
+        responseType: 'stream',
+        streamFormat: 'sse',
+        handler: async () =>
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(': heartbeat\n\n');
+              controller.enqueue({ type: 'text-delta', payload: { text: 'hello' } });
+              controller.close();
+            },
+          }),
+      };
+
+      app.use(adapter.createContextMiddleware());
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      server = await new Promise(resolve => {
+        const s = app.listen(0, () => resolve(s));
+      });
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+
+      const response = await fetch(`http://localhost:${port}/test/sse-comment`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(text).toContain(': heartbeat\n\n');
+      expect(text).toContain('data: {"type":"text-delta","payload":{"text":"hello"}}\n\n');
+      expect(text).not.toContain('data: ": heartbeat');
+    });
+
+    it('should write SSE connected comment when sseFlushOnConnect is true', async () => {
+      const app = new Koa();
+      app.use(bodyParser());
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/sse-flush',
+        responseType: 'stream',
+        streamFormat: 'sse',
+        sseFlushOnConnect: true,
+        handler: async () =>
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'text-delta', payload: { text: 'hello' } });
+              controller.close();
+            },
+          }),
+      };
+
+      app.use(adapter.createContextMiddleware());
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      server = await new Promise(resolve => {
+        const s = app.listen(0, () => resolve(s));
+      });
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+
+      const response = await fetch(`http://localhost:${port}/test/sse-flush`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      const connectedIndex = text.indexOf(': connected\n\n');
+      const dataIndex = text.indexOf('data: ');
+      expect(connectedIndex).toBeGreaterThanOrEqual(0);
+      expect(dataIndex).toBeGreaterThanOrEqual(0);
+      expect(connectedIndex).toBeLessThan(dataIndex);
+    });
+
+    it('should not write SSE connected comment when sseFlushOnConnect is not set', async () => {
+      const app = new Koa();
+      app.use(bodyParser());
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/sse-no-flush',
+        responseType: 'stream',
+        streamFormat: 'sse',
+        handler: async () =>
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'text-delta', payload: { text: 'hello' } });
+              controller.close();
+            },
+          }),
+      };
+
+      app.use(adapter.createContextMiddleware());
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      server = await new Promise(resolve => {
+        const s = app.listen(0, () => resolve(s));
+      });
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+
+      const response = await fetch(`http://localhost:${port}/test/sse-no-flush`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(text).not.toContain(': connected');
+      expect(text).toContain('data: ');
     });
 
     it('should NOT redact sensitive data when streamOptions.redact is false', async () => {
@@ -582,6 +890,67 @@ describe('Koa Server Adapter', () => {
       const textDelta = chunks.find(c => c.type === 'text-delta');
       expect(textDelta).toBeDefined();
       expect(textDelta.textDelta).toBe('Hello');
+    });
+  });
+
+  // Repro for https://github.com/mastra-ai/mastra/issues/17821 — a chunk that
+  // JSON.stringify can't handle (e.g. a BigInt step output) used to throw inside
+  // the stream loop and silently close the HTTP stream.
+  describe('Stream Chunk Serialization', () => {
+    let context: AdapterTestContext;
+    let server: Server | null = null;
+
+    beforeEach(async () => {
+      context = await createDefaultTestContext();
+    });
+
+    afterEach(async () => {
+      if (server) {
+        await new Promise<void>((resolve, reject) => {
+          server!.close(err => {
+            if (err) reject(err);
+            else resolve();
+          });
+        });
+        server = null;
+      }
+    });
+
+    it('serializes BigInt chunks and skips unserializable chunks without killing the stream', async () => {
+      const app = new Koa();
+      app.use(bodyParser());
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/unserializable-stream',
+        responseType: 'stream',
+        streamFormat: 'sse',
+        handler: async () => createStreamWithUnserializableChunk(),
+      };
+
+      app.use(adapter.createContextMiddleware());
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      server = await new Promise(resolve => {
+        const s = app.listen(0, () => resolve(s));
+      });
+      const address = server!.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+
+      const response = await fetch(`http://localhost:${port}/test/unserializable-stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+
+      expect(response.status).toBe(200);
+      const chunks = await consumeSSEStream(response.body);
+      expectSerializedStreamChunks(chunks);
     });
   });
 
@@ -752,6 +1121,47 @@ describe('Koa Server Adapter', () => {
     },
   });
 
+  describe('Channel webhook diagnostics', () => {
+    let server: Server | null = null;
+
+    afterEach(async () => {
+      if (server) {
+        await new Promise<void>((resolve, reject) => {
+          server!.close(err => {
+            if (err) reject(err);
+            else resolve();
+          });
+        });
+        server = null;
+      }
+    });
+
+    it('warns for an unregistered channel webhook when no custom API routes exist', async () => {
+      const mastra = new Mastra({ logger: false });
+      const warnSpy = vi.spyOn(mastra.getLogger(), 'warn');
+      const app = new Koa();
+      const adapter = new MastraServer({ app, mastra });
+
+      await adapter.init();
+
+      server = await new Promise(resolve => {
+        const startedServer = app.listen(0, () => resolve(startedServer));
+      });
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+
+      const response = await fetch(`http://localhost:${port}/api/agents/support/channels/slack/webhook`, {
+        method: 'POST',
+      });
+
+      expect(response.status).toBe(404);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('channels.adapters configuration'), {
+        agentId: 'support',
+        platform: 'slack',
+      });
+    });
+  });
+
   describe('Custom API Routes (registerApiRoute)', () => {
     let server: Server | null = null;
 
@@ -847,6 +1257,170 @@ describe('Koa Server Adapter', () => {
       expect(response.status).toBe(200);
       const data = await response.json();
       expect(data).toEqual({ echo: { test: 'data' } });
+    });
+
+    it('registers createRoute routes from customApiRoutes with runtime validation', async () => {
+      const route = createRoute({
+        method: 'POST',
+        path: '/custom/validated',
+        responseType: 'json',
+        requiresAuth: false,
+        bodySchema: z.object({ name: z.string() }),
+        handler: async ({ name }) => ({ greeting: `Hello, ${name}` }),
+      });
+      const protectedRoute = createRoute({
+        method: 'GET',
+        path: '/custom/secure',
+        responseType: 'json',
+        requiresAuth: true,
+        handler: async () => ({ secret: true }),
+      });
+
+      const mastra = new Mastra({ server: { apiRoutes: [route, protectedRoute] } });
+      const originalGetServer = mastra.getServer.bind(mastra);
+      mastra.getServer = () =>
+        ({
+          ...originalGetServer(),
+          auth: {
+            authenticateToken: async (token: string) => (token === 'valid-token' ? { id: 'user-1' } : null),
+            authorize: async () => true,
+          },
+        }) as any;
+      const app = new Koa();
+      app.use(bodyParser());
+
+      const adapter = new MastraServer({ app, mastra });
+      await adapter.init();
+
+      server = await new Promise(resolve => {
+        const s = app.listen(0, () => resolve(s));
+      });
+      const address = server!.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+
+      const invalidResponse = await fetch(`http://localhost:${port}/custom/validated`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 42 }),
+      });
+      expect(invalidResponse.status).toBe(400);
+      await expect(invalidResponse.json()).resolves.toMatchObject({ error: 'Invalid request body' });
+
+      const validResponse = await fetch(`http://localhost:${port}/custom/validated`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Ada' }),
+      });
+      expect(validResponse.status).toBe(200);
+      await expect(validResponse.json()).resolves.toEqual({ greeting: 'Hello, Ada' });
+
+      const unauthenticated = await fetch(`http://localhost:${port}/custom/secure`);
+      expect(unauthenticated.status).toBe(401);
+
+      const authenticated = await fetch(`http://localhost:${port}/custom/secure`, {
+        headers: { Authorization: 'Bearer valid-token' },
+      });
+      expect(authenticated.status).toBe(200);
+      await expect(authenticated.json()).resolves.toEqual({ secret: true });
+    });
+  });
+
+  describe('Custom route stream disconnect handling', () => {
+    let server: Server | null = null;
+
+    afterEach(async () => {
+      if (server) {
+        await new Promise<void>(resolve => server!.close(() => resolve()));
+        server = null;
+      }
+    });
+
+    it('cancels a custom route stream when the client cancels the response body', async () => {
+      const cancel = vi.fn();
+      const signalAbort = vi.fn();
+      const customRoutes = [
+        registerApiRoute('/custom/stream', {
+          method: 'GET',
+          handler: async c => {
+            c.req.raw.signal.addEventListener('abort', signalAbort);
+            return new Response(
+              new ReadableStream({
+                async pull(controller) {
+                  controller.enqueue(new TextEncoder().encode('chunk\n'));
+                  await sleep(5);
+                },
+                cancel,
+              }),
+            );
+          },
+        }),
+      ];
+
+      const app = new Koa();
+      app.use(bodyParser());
+      const adapter = new MastraServer({ app, mastra: new Mastra({}), customApiRoutes: customRoutes });
+      await adapter.init();
+
+      server = await new Promise(resolve => {
+        const s = app.listen(0, () => resolve(s));
+      });
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+
+      const response = await fetch(`http://localhost:${port}/custom/stream`);
+      const reader = response.body!.getReader();
+      await reader.read();
+      await reader.cancel();
+
+      await waitFor(() => cancel.mock.calls.length > 0);
+      await waitFor(() => signalAbort.mock.calls.length > 0);
+    });
+
+    it('does not cancel a custom POST stream when the request completes normally', async () => {
+      const cancel = vi.fn();
+      const signalAbort = vi.fn();
+      const customRoutes = [
+        registerApiRoute('/custom/post-stream', {
+          method: 'POST',
+          handler: async c => {
+            c.req.raw.signal.addEventListener('abort', signalAbort);
+            return new Response(
+              new ReadableStream({
+                start(controller) {
+                  controller.enqueue(new TextEncoder().encode('one\n'));
+                  setTimeout(() => {
+                    controller.enqueue(new TextEncoder().encode('two\n'));
+                    controller.close();
+                  }, 10);
+                },
+                cancel,
+              }),
+            );
+          },
+        }),
+      ];
+
+      const app = new Koa();
+      app.use(bodyParser());
+      const adapter = new MastraServer({ app, mastra: new Mastra({}), customApiRoutes: customRoutes });
+      await adapter.init();
+
+      server = await new Promise(resolve => {
+        const s = app.listen(0, () => resolve(s));
+      });
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+
+      const response = await fetch(`http://localhost:${port}/custom/post-stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hello: 'world' }),
+      });
+
+      await expect(response.text()).resolves.toBe('one\ntwo\n');
+      await sleep(10);
+      expect(cancel).not.toHaveBeenCalled();
+      expect(signalAbort).not.toHaveBeenCalled();
     });
   });
 

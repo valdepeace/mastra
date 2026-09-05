@@ -1,3 +1,4 @@
+import { generateKeyPairSync } from 'node:crypto';
 import type { Server } from 'node:http';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -8,10 +9,13 @@ import type {
   SendMessageResponse,
   Task,
   TaskPushNotificationConfig,
-} from '@mastra/core/a2a';
+} from '@mastra/core/a2a/client';
+import { ListTasksRequest as ListTasksRequestV1 } from '@mastra/core/a2a/v1';
+import canonicalize from 'canonicalize';
+import { CompactSign, base64url, exportJWK } from 'jose';
 import { describe, it, beforeEach, afterEach, expect, expectTypeOf } from 'vitest';
 import { MastraClientError } from '../types';
-import { A2A } from './a2a';
+import { A2A, A2AV1 } from './a2a';
 import type { A2AStreamEventData } from './a2a';
 
 async function collectStream<T>(stream: AsyncIterable<T>): Promise<T[]> {
@@ -48,6 +52,43 @@ describe('A2A', () => {
   });
 
   describe('agent card operations', () => {
+    async function createSignedAgentCard(card: AgentCard) {
+      const { privateKey, publicKey } = generateKeyPairSync('ec', {
+        namedCurve: 'P-256',
+      });
+      const canonicalPayload = canonicalize(card);
+
+      if (!canonicalPayload) {
+        throw new Error('Failed to canonicalize test Agent Card');
+      }
+
+      const compactJws = await new CompactSign(new TextEncoder().encode(canonicalPayload))
+        .setProtectedHeader({
+          alg: 'ES256',
+          kid: 'test-key',
+          jku: 'https://example.com/.well-known/jwks.json',
+        })
+        .sign(privateKey);
+
+      const [protectedHeader, , signature] = compactJws.split('.');
+      if (!protectedHeader || !signature) {
+        throw new Error('Failed to create compact JWS for test Agent Card');
+      }
+
+      return {
+        card: {
+          ...card,
+          signatures: [
+            {
+              protected: protectedHeader,
+              signature,
+            },
+          ],
+        } satisfies AgentCard,
+        publicJwk: await exportJWK(publicKey),
+      };
+    }
+
     it('getAgentCard fetches the well-known agent card', async () => {
       const mockCard: AgentCard = {
         name: 'Test Agent',
@@ -70,6 +111,135 @@ describe('A2A', () => {
 
       await expect(a2a.getAgentCard()).resolves.toEqual(mockCard);
       await expect(a2a.getCard()).resolves.toEqual(mockCard);
+    });
+
+    it('verifies a signed agent card when verifySignature is configured', async () => {
+      const baseCard: AgentCard = {
+        name: 'Test Agent',
+        description: 'A signed test agent',
+        url: `${serverUrl}/api/a2a/test-agent`,
+        version: '1.0.0',
+        protocolVersion: '0.3.0',
+        capabilities: {},
+        defaultInputModes: ['text/plain'],
+        defaultOutputModes: ['text/plain'],
+        skills: [],
+      };
+      const { card, publicJwk } = await createSignedAgentCard(baseCard);
+      let keyProviderInput:
+        | {
+            kid?: string;
+            jku?: string;
+            alg?: string;
+          }
+        | undefined;
+
+      server.on('request', (_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(card));
+      });
+
+      const a2a = new A2A({ baseUrl: serverUrl }, 'test-agent');
+      const receivedCard = await a2a.getAgentCard({
+        verifySignature: {
+          keyProvider: input => {
+            keyProviderInput = {
+              kid: input.kid,
+              jku: input.jku,
+              alg: input.alg,
+            };
+            return publicJwk;
+          },
+          algorithms: ['ES256'],
+        },
+      });
+
+      expect(receivedCard).toEqual(card);
+      expect(keyProviderInput).toEqual({
+        kid: 'test-key',
+        jku: 'https://example.com/.well-known/jwks.json',
+        alg: 'ES256',
+      });
+    });
+
+    it('returns unsigned cards unchanged when verifySignature is configured', async () => {
+      const mockCard: AgentCard = {
+        name: 'Test Agent',
+        description: 'An unsigned test agent',
+        url: `${serverUrl}/api/a2a/test-agent`,
+        version: '1.0.0',
+        protocolVersion: '0.3.0',
+        capabilities: {},
+        defaultInputModes: ['text/plain'],
+        defaultOutputModes: ['text/plain'],
+        skills: [],
+      };
+      let keyProviderCalled = false;
+
+      server.on('request', (_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(mockCard));
+      });
+
+      const a2a = new A2A({ baseUrl: serverUrl }, 'test-agent');
+      const receivedCard = await a2a.getAgentCard({
+        verifySignature: {
+          keyProvider: () => {
+            keyProviderCalled = true;
+            return null;
+          },
+        },
+      });
+
+      expect(receivedCard).toEqual(mockCard);
+      expect(keyProviderCalled).toBe(false);
+    });
+
+    it('throws when a signed agent card cannot be verified', async () => {
+      const baseCard: AgentCard = {
+        name: 'Test Agent',
+        description: 'An invalid signed test agent',
+        url: `${serverUrl}/api/a2a/test-agent`,
+        version: '1.0.0',
+        protocolVersion: '0.3.0',
+        capabilities: {},
+        defaultInputModes: ['text/plain'],
+        defaultOutputModes: ['text/plain'],
+        skills: [],
+      };
+      const { card, publicJwk } = await createSignedAgentCard(baseCard);
+      const tamperedSignature = (() => {
+        const bytes = base64url.decode(card.signatures?.[0]?.signature ?? '');
+        bytes[0] = bytes[0] ^ 0xff;
+        return base64url.encode(bytes);
+      })();
+      const invalidCard: AgentCard = {
+        ...card,
+        signatures: card.signatures?.map((signature, index) =>
+          index === 0
+            ? {
+                ...signature,
+                signature: tamperedSignature,
+              }
+            : signature,
+        ),
+      };
+
+      server.on('request', (_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(invalidCard));
+      });
+
+      const a2a = new A2A({ baseUrl: serverUrl }, 'test-agent');
+
+      await expect(
+        a2a.getAgentCard({
+          verifySignature: {
+            keyProvider: () => publicJwk,
+            algorithms: ['ES256'],
+          },
+        }),
+      ).rejects.toThrow('A2A Agent Card signature verification failed');
     });
 
     it('getExtendedAgentCard sends the authenticated extended card method', async () => {
@@ -467,5 +637,56 @@ describe('A2A', () => {
         message: 'Push Notification is not supported',
       });
     });
+  });
+});
+
+describe('A2AV1', () => {
+  let server: Server;
+  let serverUrl: string;
+
+  beforeEach(async () => {
+    server = createServer();
+    await new Promise<void>(resolve => server.listen(0, resolve));
+    const address = server.address() as AddressInfo;
+    serverUrl = `http://localhost:${address.port}`;
+  });
+
+  afterEach(async () => {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  });
+
+  it('sends the v1 protocol header and serializes list tasks requests', async () => {
+    let receivedHeader: string | undefined;
+    let receivedBody: Record<string, any> | undefined;
+
+    server.on('request', (req, res) => {
+      let body = '';
+      req.on('data', chunk => {
+        body += chunk;
+      });
+      req.on('end', () => {
+        receivedHeader = req.headers['a2a-version'] as string | undefined;
+        receivedBody = JSON.parse(body);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: receivedBody?.id,
+            result: { tasks: [], nextPageToken: '' },
+          }),
+        );
+      });
+    });
+
+    const a2a = new A2AV1({ baseUrl: serverUrl }, 'test-agent');
+    const result = await a2a.listTasks(ListTasksRequestV1.fromJSON({ contextId: 'context-1', pageSize: 10 }));
+
+    expect(receivedHeader).toBe('1.0');
+    expect(receivedBody).toMatchObject({
+      jsonrpc: '2.0',
+      method: 'tasks/list',
+      params: { contextId: 'context-1', pageSize: 10 },
+    });
+    expect(result.tasks).toEqual([]);
   });
 });

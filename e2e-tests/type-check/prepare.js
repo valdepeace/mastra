@@ -1,7 +1,7 @@
 import { cp, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execa } from 'execa';
+import { installWithRetry } from '../_local-registry-setup/install.js';
 
 /**
  *
@@ -17,11 +17,15 @@ export async function setupTemplate(pathToStoreFiles, pkgManager) {
   await mkdir(newPath, { recursive: true });
   await cp(templatePath, newPath, { recursive: true });
 
+  const installArgs =
+    pkgManager === 'pnpm'
+      ? ['install', '--config.minimum-release-age=0', '--config.trust-policy=no-check']
+      : ['install'];
+
   console.log('Directory:', newPath);
   console.log('Installing dependencies...');
-  await execa(pkgManager, ['install'], {
+  installWithRetry(pkgManager, installArgs, {
     cwd: newPath,
-    stdio: 'inherit',
     env: process.env,
   });
 }

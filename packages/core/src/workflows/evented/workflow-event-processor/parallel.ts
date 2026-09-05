@@ -1,6 +1,7 @@
-import type { StepFlowEntry } from '../..';
+import type { SingleStepEntry, StepFlowEntry } from '../..';
 import { RequestContext } from '../../../di';
 import type { PubSub } from '../../../events';
+import { getSingleStepEntryId } from '../../utils';
 import { resolveCurrentState } from '../helpers';
 import type { StepExecutor } from '../step-executor';
 import type { ProcessorArgs } from '.';
@@ -11,9 +12,10 @@ export async function processWorkflowParallel(
     runId,
     executionPath,
     stepResults,
-    activeSteps,
+    activeStepsPath,
     resumeSteps,
     timeTravel,
+    restart,
     prevResult,
     resumeData,
     parentWorkflow,
@@ -30,12 +32,19 @@ export async function processWorkflowParallel(
     step: Extract<StepFlowEntry, { type: 'parallel' }>;
   },
 ) {
+  const pathsToRun: Record<string, boolean> = {};
   // Get current state from stepResults or passed state
   const currentState = resolveCurrentState({ stepResults, state });
   for (let i = 0; i < step.steps.length; i++) {
     const nestedStep = step.steps[i];
-    if (nestedStep?.type === 'step') {
-      activeSteps[nestedStep.step.id] = true;
+    if (nestedStep) {
+      const nestedStepId = getSingleStepEntryId(nestedStep);
+      //if restart, only run the step if it's in the active steps path
+      if (restart) {
+        pathsToRun[nestedStepId] = !!restart.activeStepsPath[nestedStepId];
+      } else {
+        pathsToRun[nestedStepId] = true;
+      }
       if (perStep) {
         break;
       }
@@ -43,30 +52,36 @@ export async function processWorkflowParallel(
   }
 
   await Promise.all(
-    step.steps
-      ?.filter(step => activeSteps[step.step.id])
-      .map(async (_step, idx) => {
-        return pubsub.publish('workflows', {
-          type: 'workflow.step.run',
+    // Iterate the full steps array and guard inside so `idx` stays the branch's
+    // real index. Filtering first and using the post-filter index would route a
+    // restart to the wrong branch when the active branches are not a zero-based
+    // contiguous prefix (mirrors `processWorkflowConditional` below).
+    step.steps?.map(async (child, idx) => {
+      if (!pathsToRun[getSingleStepEntryId(child)]) {
+        return;
+      }
+      return pubsub.publish('workflows', {
+        type: 'workflow.step.run',
+        runId,
+        data: {
+          workflowId,
           runId,
-          data: {
-            workflowId,
-            runId,
-            executionPath: executionPath.concat([idx]),
-            resumeSteps,
-            stepResults,
-            prevResult,
-            resumeData,
-            timeTravel,
-            parentWorkflow,
-            activeSteps,
-            requestContext,
-            perStep,
-            state: currentState,
-            outputOptions,
-          },
-        });
-      }),
+          executionPath: restart ? executionPath.slice(0, -1).concat([idx]) : executionPath.concat([idx]),
+          resumeSteps,
+          stepResults,
+          prevResult,
+          resumeData,
+          timeTravel,
+          restart: restart ? { ...restart, isParallelOrConditionalRestarted: true } : undefined,
+          parentWorkflow,
+          activeStepsPath,
+          requestContext,
+          perStep,
+          state: currentState,
+          outputOptions,
+        },
+      });
+    }),
   );
 }
 
@@ -76,9 +91,10 @@ export async function processWorkflowConditional(
     runId,
     executionPath,
     stepResults,
-    activeSteps,
+    activeStepsPath,
     resumeSteps,
     timeTravel,
+    restart,
     prevResult,
     resumeData,
     parentWorkflow,
@@ -100,6 +116,9 @@ export async function processWorkflowConditional(
   // Get current state from stepResults or passed state
   const currentState = resolveCurrentState({ stepResults, state });
 
+  // On restart, executionPath already includes the persisted branch index, so replace it instead of appending.
+  const branchPath = (idx: number) => (restart ? executionPath.slice(0, -1) : executionPath).concat([idx]);
+
   // Create a proper RequestContext from the plain object passed in ProcessorArgs
   const reqContext = new RequestContext(Object.entries(requestContext ?? {}) as any);
 
@@ -119,7 +138,7 @@ export async function processWorkflowConditional(
     truthyIdxs[idxs[i]!] = true;
   }
 
-  let onlyStepToRun: Extract<StepFlowEntry, { type: 'step' }> | undefined;
+  let onlyStepToRun: SingleStepEntry | undefined;
 
   if (perStep) {
     const stepsToRun = step.steps.filter((_, idx) => truthyIdxs[idx]);
@@ -127,22 +146,24 @@ export async function processWorkflowConditional(
   }
 
   if (onlyStepToRun) {
-    activeSteps[onlyStepToRun.step.id] = true;
-    const stepIndex = step.steps.findIndex(step => step.step.id === onlyStepToRun.step.id);
+    const onlyStepToRunId = getSingleStepEntryId(onlyStepToRun);
+    const stepIndex = step.steps.findIndex(child => getSingleStepEntryId(child) === onlyStepToRunId);
+    activeStepsPath[onlyStepToRunId] = branchPath(stepIndex);
     await pubsub.publish('workflows', {
       type: 'workflow.step.run',
       runId,
       data: {
         workflowId,
         runId,
-        executionPath: executionPath.concat([stepIndex]),
+        executionPath: branchPath(stepIndex),
         resumeSteps,
         stepResults,
         timeTravel,
+        restart,
         prevResult,
         resumeData,
         parentWorkflow,
-        activeSteps,
+        activeStepsPath,
         requestContext,
         perStep,
         state: currentState,
@@ -151,10 +172,10 @@ export async function processWorkflowConditional(
     });
   } else {
     await Promise.all(
-      step.steps.map(async (step, idx) => {
+      step.steps.map(async (child, idx) => {
         if (truthyIdxs[idx]) {
-          if (step?.type === 'step') {
-            activeSteps[step.step.id] = true;
+          if (child) {
+            activeStepsPath[getSingleStepEntryId(child)] = branchPath(idx);
           }
           return pubsub.publish('workflows', {
             type: 'workflow.step.run',
@@ -162,14 +183,15 @@ export async function processWorkflowConditional(
             data: {
               workflowId,
               runId,
-              executionPath: executionPath.concat([idx]),
+              executionPath: branchPath(idx),
               resumeSteps,
               stepResults,
               timeTravel,
+              restart: restart ? { ...restart, isParallelOrConditionalRestarted: true } : undefined,
               prevResult,
               resumeData,
               parentWorkflow,
-              activeSteps,
+              activeStepsPath,
               requestContext,
               perStep,
               state: currentState,
@@ -183,13 +205,13 @@ export async function processWorkflowConditional(
             data: {
               workflowId,
               runId,
-              executionPath: executionPath.concat([idx]),
+              executionPath: branchPath(idx),
               resumeSteps,
               stepResults,
               prevResult: { status: 'skipped' },
               resumeData,
               parentWorkflow,
-              activeSteps,
+              activeStepsPath,
               requestContext,
               perStep,
               state: currentState,

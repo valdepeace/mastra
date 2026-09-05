@@ -1,4 +1,5 @@
 import { ReadableStream } from 'node:stream/web';
+import type { ActorSignal } from '@mastra/core/auth/ee';
 import { getErrorFromUnknown } from '@mastra/core/error';
 import type { Mastra } from '@mastra/core/mastra';
 import type { TracingContext, TracingOptions } from '@mastra/core/observability';
@@ -21,6 +22,13 @@ import type {
 import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
 import { subscribe } from 'inngest/realtime';
+import type { Realtime } from 'inngest/realtime';
+import {
+  buildDurableResumeEventData,
+  buildDurableTimeTravelEventData,
+  buildDurableTriggerEventData,
+  mergeResumeRequestContext,
+} from './durable-event-payload';
 import type { InngestEngineType } from './types';
 
 export class InngestRun<
@@ -37,7 +45,8 @@ export class InngestRun<
   TState = unknown,
   TInput = unknown,
   TOutput = unknown,
-> extends Run<TEngineType, TSteps, TState, TInput, TOutput> {
+  TRequestContext = unknown,
+> extends Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext> {
   private inngest: Inngest;
   serializedStepGraph: SerializedStepFlowEntry[];
   #mastra: Mastra;
@@ -113,17 +122,15 @@ export class InngestRun<
       };
 
       // Start realtime subscription for workflow-finish event
-      let realtimeStreamPromise: ReturnType<typeof subscribe> | null = null;
+      let realtimeSubscriptionPromise: Promise<Realtime.Subscribe.CallbackSubscription> | null = null;
 
       const startRealtimeSubscription = async () => {
         try {
-          realtimeStreamPromise = subscribe(
-            {
-              channel: `workflow:${this.workflowId}:${this.runId}`,
-              topics: ['watch'],
-              app: this.inngest,
-            },
-            async (message: any) => {
+          realtimeSubscriptionPromise = subscribe({
+            channel: `workflow:${this.workflowId}:${this.runId}`,
+            topics: ['watch'],
+            app: this.inngest,
+            onMessage: async (message: any) => {
               if (resolved) return;
 
               const event = message.data;
@@ -155,14 +162,14 @@ export class InngestRun<
                 handleResult(result, 'realtime');
               }
             },
-          );
+          });
 
-          // Set unsubscribe immediately so cleanup can cancel even before await resolves
+          // Set unsubscribe immediately so cleanup can close the subscription even before setup resolves.
           unsubscribe = () => {
-            realtimeStreamPromise?.then(stream => stream.cancel().catch(() => {})).catch(() => {});
+            realtimeSubscriptionPromise?.then(subscription => subscription.close()).catch(() => {});
           };
 
-          await realtimeStreamPromise;
+          await realtimeSubscriptionPromise;
         } catch {
           // Realtime subscription failed - polling will still work as fallback
         }
@@ -284,7 +291,8 @@ export class InngestRun<
         : {
             initialState: TState;
           }) & {
-        requestContext?: RequestContext;
+        requestContext?: RequestContext<TRequestContext>;
+        actor?: ActorSignal;
         outputWriter?: OutputWriter;
         tracingContext?: TracingContext;
         tracingOptions?: TracingOptions;
@@ -319,7 +327,8 @@ export class InngestRun<
         : {
             initialState: TState;
           }) & {
-        requestContext?: RequestContext;
+        requestContext?: RequestContext<TRequestContext>;
+        actor?: ActorSignal;
         tracingOptions?: TracingOptions;
         outputOptions?: {
           includeState?: boolean;
@@ -356,16 +365,17 @@ export class InngestRun<
     // Send event to Inngest (fire-and-forget)
     const eventOutput = await this.inngest.send({
       name: `workflow.${this.workflowId}`,
-      data: {
+      data: buildDurableTriggerEventData({
         inputData: inputDataToUse,
         initialState: initialStateToUse,
         runId: this.runId,
         resourceId: this.resourceId,
         outputOptions: args.outputOptions,
         tracingOptions: args.tracingOptions,
-        requestContext: args.requestContext ? Object.fromEntries(args.requestContext.entries()) : {},
+        requestContext: args.requestContext,
+        actor: args.actor,
         perStep: args.perStep,
-      },
+      }),
     });
 
     const eventId = eventOutput.ids[0];
@@ -384,10 +394,12 @@ export class InngestRun<
     tracingOptions,
     format,
     requestContext,
+    actor,
     perStep,
   }: {
     inputData?: TInput;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
+    actor?: ActorSignal;
     initialState?: TState;
     tracingOptions?: TracingOptions;
     outputOptions?: {
@@ -424,7 +436,7 @@ export class InngestRun<
 
     const eventOutput = await this.inngest.send({
       name: eventName,
-      data: {
+      data: buildDurableTriggerEventData({
         inputData: inputDataToUse,
         initialState: initialStateToUse,
         runId: this.runId,
@@ -432,9 +444,10 @@ export class InngestRun<
         outputOptions,
         tracingOptions,
         format,
-        requestContext: requestContext ? Object.fromEntries(requestContext.entries()) : {},
+        requestContext,
+        actor,
         perStep,
-      },
+      }),
     });
 
     const eventId = eventOutput.ids[0];
@@ -466,7 +479,8 @@ export class InngestRun<
       | string
       | string[];
     label?: string;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
+    actor?: ActorSignal;
     perStep?: boolean;
   }): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
     const p = this._resume(params).then(result => {
@@ -481,7 +495,15 @@ export class InngestRun<
     return p;
   }
 
-  async _resume<TResume>(params: {
+  /**
+   * Performs all resume preparation and dispatches the resume event to Inngest,
+   * but does NOT wait for the workflow result. Shared by `_resume()` (which polls
+   * for the result afterwards) and `resumeAsync()` (which returns immediately).
+   *
+   * Send-time failures (invalid resume data, event send failure) reject synchronously,
+   * and the snapshot is rolled back to its prior state on send failure.
+   */
+  async _resumeAndSendEvent<TResume>(params: {
     resumeData?: TResume;
     step?:
       | Step<string, any, any, TResume, any>
@@ -489,9 +511,10 @@ export class InngestRun<
       | string
       | string[];
     label?: string;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
+    actor?: ActorSignal;
     perStep?: boolean;
-  }): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
+  }): Promise<{ eventId: string }> {
     const storage = this.#mastra?.getStorage();
 
     const workflowsStore = await storage?.getStore('workflows');
@@ -526,9 +549,7 @@ export class InngestRun<
     const resumeDataToUse = await this._validateResumeData(params.resumeData, suspendedStep);
 
     // Merge persisted requestContext from snapshot with any new values from params
-    const persistedRequestContext = (snapshot as any)?.requestContext ?? {};
-    const newRequestContext = params.requestContext ? Object.fromEntries(params.requestContext.entries()) : {};
-    const mergedRequestContext = { ...persistedRequestContext, ...newRequestContext };
+    const mergedRequestContext = mergeResumeRequestContext((snapshot as any)?.requestContext, params.requestContext);
 
     // Mark the snapshot as 'running' before sending the event so that
     // snapshot-based polling doesn't return the stale suspended/paused result.
@@ -549,21 +570,19 @@ export class InngestRun<
     try {
       eventOutput = await this.inngest.send({
         name: `workflow.${this.workflowId}`,
-        data: {
+        data: buildDurableResumeEventData({
           inputData: resumeDataToUse,
-          initialState: snapshot?.value ?? {},
           runId: this.runId,
           workflowId: this.workflowId,
-          stepResults: snapshot?.context as any,
           resume: {
             steps,
-            stepResults: snapshot?.context as any,
             resumePayload: resumeDataToUse,
             resumePath: steps?.[0] ? (snapshot?.suspendedPaths?.[steps?.[0]] as any) : undefined,
           },
           requestContext: mergedRequestContext,
+          actor: params.actor,
           perStep: params.perStep,
-        },
+        }),
       });
     } catch (err) {
       // Rollback: restore the original snapshot so the run isn't stuck in 'running'.
@@ -586,10 +605,59 @@ export class InngestRun<
     if (!eventId) {
       throw new Error('Event ID is not set');
     }
+
+    return { eventId };
+  }
+
+  async _resume<TResume>(params: {
+    resumeData?: TResume;
+    step?:
+      | Step<string, any, any, TResume, any>
+      | [...Step<string, any, any, any, any>[], Step<string, any, any, TResume, any>]
+      | string
+      | string[];
+    label?: string;
+    requestContext?: RequestContext<TRequestContext>;
+    actor?: ActorSignal;
+    perStep?: boolean;
+  }): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
+    const { eventId } = await this._resumeAndSendEvent(params);
     const runOutput = await this.getRunOutput(eventId);
     const result = runOutput?.output?.result;
     this.hydrateFailedResult(result);
     return result;
+  }
+
+  /**
+   * Resumes a suspended workflow without waiting for completion (fire-and-forget).
+   * Returns immediately with the runId after sending the resume event to Inngest.
+   * The workflow continues executing independently in Inngest.
+   *
+   * Mirrors `startAsync()`: send-time failures (invalid resume data, event send
+   * failure) still reject synchronously and roll back the snapshot, but the result
+   * is never polled via `getRunOutput()`. This avoids the polling-based 404 race when
+   * you don't need the resolved result inline.
+   *
+   * NOTE: this is exposed over HTTP / the client SDK as `resume-no-wait` / `resumeNoWait()`,
+   * not `resumeAsync`, because the existing `resumeAsync()` client/server surface awaits the
+   * full workflow result. TODO(v2): consolidate so `resumeAsync` consistently means
+   * fire-and-forget across core, client SDK and HTTP routes (breaking change deferred to v2).
+   */
+  async resumeAsync<TResume>(params: {
+    resumeData?: TResume;
+    step?:
+      | Step<string, any, any, TResume, any>
+      | [...Step<string, any, any, any, any>[], Step<string, any, any, TResume, any>]
+      | string
+      | string[];
+    label?: string;
+    requestContext?: RequestContext<TRequestContext>;
+    actor?: ActorSignal;
+    perStep?: boolean;
+  }): Promise<{ runId: string }> {
+    await this._resumeAndSendEvent(params);
+    // Return immediately - NO POLLING
+    return { runId: this.runId };
   }
 
   async timeTravel<TInput>(params: {
@@ -603,7 +671,8 @@ export class InngestRun<
       | string[];
     context?: TimeTravelContext<any, any, any, any>;
     nestedStepsContext?: Record<string, TimeTravelContext<any, any, any, any>>;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
+    actor?: ActorSignal;
     tracingOptions?: TracingOptions;
     outputOptions?: {
       includeState?: boolean;
@@ -634,7 +703,8 @@ export class InngestRun<
       | string[];
     context?: TimeTravelContext<any, any, any, any>;
     nestedStepsContext?: Record<string, TimeTravelContext<any, any, any, any>>;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
+    actor?: ActorSignal;
     tracingOptions?: TracingOptions;
     outputOptions?: {
       includeState?: boolean;
@@ -744,7 +814,7 @@ export class InngestRun<
     try {
       eventOutput = await this.inngest.send({
         name: `workflow.${this.workflowId}`,
-        data: {
+        data: buildDurableTimeTravelEventData({
           initialState: timeTravelData.state,
           runId: this.runId,
           workflowId: this.workflowId,
@@ -752,9 +822,10 @@ export class InngestRun<
           timeTravel: timeTravelData,
           tracingOptions: params.tracingOptions,
           outputOptions: params.outputOptions,
-          requestContext: params.requestContext ? Object.fromEntries(params.requestContext.entries()) : {},
+          requestContext: params.requestContext,
+          actor: params.actor,
           perStep: params.perStep,
-        },
+        }),
       });
     } catch (err) {
       // Rollback: restore the previous snapshot so the run isn't stuck in 'running'.
@@ -818,7 +889,11 @@ export class InngestRun<
     };
   }
 
-  streamLegacy({ inputData, requestContext }: { inputData?: TInput; requestContext?: RequestContext } = {}): {
+  streamLegacy({
+    inputData,
+    requestContext,
+    actor,
+  }: { inputData?: TInput; requestContext?: RequestContext<TRequestContext>; actor?: ActorSignal } = {}): {
     stream: ReadableStream<StreamEvent>;
     getWorkflowState: () => Promise<WorkflowResult<TState, TInput, TOutput, TSteps>>;
   } {
@@ -864,7 +939,7 @@ export class InngestRun<
       }
     };
 
-    this.executionResults = this._start({ inputData, requestContext, format: 'legacy' }).then(result => {
+    this.executionResults = this._start({ inputData, requestContext, actor, format: 'legacy' }).then(result => {
       if (result.status !== 'suspended') {
         this.closeStreamAction?.().catch(() => {});
       }
@@ -881,6 +956,7 @@ export class InngestRun<
   stream({
     inputData,
     requestContext,
+    actor,
     tracingOptions,
     closeOnSuspend = true,
     initialState,
@@ -888,7 +964,8 @@ export class InngestRun<
     perStep,
   }: {
     inputData?: TInput;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
+    actor?: ActorSignal;
     tracingContext?: TracingContext;
     tracingOptions?: TracingOptions;
     closeOnSuspend?: boolean;
@@ -908,8 +985,8 @@ export class InngestRun<
     const self = this;
     const stream = new ReadableStream<WorkflowStreamEvent>({
       async start(controller) {
-        // TODO: fix this, watch doesn't have a type
-        const unwatch = self.watch(async ({ type, from = ChunkFrom.WORKFLOW, payload }) => {
+        const unwatch = self.watch(async (event: WorkflowStreamEvent) => {
+          const { type, from = ChunkFrom.WORKFLOW, payload } = event;
           controller.enqueue({
             type,
             runId: self.runId,
@@ -934,6 +1011,7 @@ export class InngestRun<
         const executionResultsPromise = self._start({
           inputData,
           requestContext,
+          actor,
           // tracingContext, // We are not able to pass a reference to a span here, what to do?
           initialState,
           tracingOptions,
@@ -981,6 +1059,7 @@ export class InngestRun<
     context,
     nestedStepsContext,
     requestContext,
+    actor,
     // tracingContext,
     tracingOptions,
     outputOptions,
@@ -996,7 +1075,8 @@ export class InngestRun<
       | string[];
     context?: TimeTravelContext<any, any, any, any>;
     nestedStepsContext?: Record<string, TimeTravelContext<any, any, any, any>>;
-    requestContext?: RequestContext;
+    requestContext?: RequestContext<TRequestContext>;
+    actor?: ActorSignal;
     tracingContext?: TracingContext;
     tracingOptions?: TracingOptions;
     outputOptions?: {
@@ -1010,8 +1090,8 @@ export class InngestRun<
     const self = this;
     const stream = new ReadableStream<WorkflowStreamEvent>({
       async start(controller) {
-        // TODO: fix this, watch doesn't have a type
-        const unwatch = self.watch(async ({ type, from = ChunkFrom.WORKFLOW, payload }) => {
+        const unwatch = self.watch(async (event: WorkflowStreamEvent) => {
+          const { type, from = ChunkFrom.WORKFLOW, payload } = event;
           controller.enqueue({
             type,
             runId: self.runId,
@@ -1040,6 +1120,7 @@ export class InngestRun<
           resumeData,
           initialState,
           requestContext,
+          actor,
           tracingOptions,
           outputOptions,
           perStep,

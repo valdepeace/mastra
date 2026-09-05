@@ -151,6 +151,99 @@ describe('Structured output with memory - assistant message in final position (#
     expect(lastMessage.role).toBe('user');
   });
 
+  it('guards Claude 5 assistant-role input without configured input processors or memory', async () => {
+    const capturedPrompts: any[] = [];
+    const mockModel = new MockLanguageModelV2({
+      provider: 'anthropic',
+      modelId: 'claude-opus-5',
+      doGenerate: async options => {
+        capturedPrompts.push(options.prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          content: [{ type: 'text', text: JSON.stringify({ answer: 'done' }) }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'claude-5-trailing-assistant-guard-test',
+      name: 'Claude 5 Trailing Assistant Guard Test',
+      instructions: 'Return a structured response.',
+      model: mockModel,
+    });
+
+    await agent.generate([{ role: 'assistant', content: 'Draft response' }], {
+      structuredOutput: { schema: z.object({ answer: z.string() }) },
+    });
+
+    const nonSystemMessages = capturedPrompts[0].filter((message: any) => message.role !== 'system');
+    expect(nonSystemMessages.at(-1)).toMatchObject({ role: 'user' });
+  });
+
+  it('preserves assistant prefill for Claude 4.5', async () => {
+    const capturedPrompts: any[] = [];
+    const mockModel = new MockLanguageModelV2({
+      provider: 'anthropic',
+      modelId: 'claude-sonnet-4-5',
+      doGenerate: async options => {
+        capturedPrompts.push(options.prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          content: [{ type: 'text', text: JSON.stringify({ answer: 'done' }) }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'claude-4-5-assistant-prefill-test',
+      name: 'Claude 4.5 Assistant Prefill Test',
+      instructions: 'Return a structured response.',
+      model: mockModel,
+    });
+
+    await agent.generate([{ role: 'assistant', content: 'Draft response' }], {
+      structuredOutput: { schema: z.object({ answer: z.string() }) },
+    });
+
+    const nonSystemMessages = capturedPrompts[0].filter((message: any) => message.role !== 'system');
+    expect(nonSystemMessages.at(-1)).toMatchObject({ role: 'assistant' });
+  });
+
+  it('does not guard non-Anthropic assistant-role input', async () => {
+    const capturedPrompts: any[] = [];
+    const mockModel = new MockLanguageModelV2({
+      provider: 'openai',
+      modelId: 'gpt-5',
+      doGenerate: async options => {
+        capturedPrompts.push(options.prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          content: [{ type: 'text', text: JSON.stringify({ answer: 'done' }) }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'non-anthropic-trailing-assistant-control-test',
+      name: 'Non-Anthropic Trailing Assistant Control Test',
+      instructions: 'Return a structured response.',
+      model: mockModel,
+    });
+
+    await agent.generate([{ role: 'assistant', content: 'Draft response' }], {
+      structuredOutput: { schema: z.object({ answer: z.string() }) },
+    });
+
+    const nonSystemMessages = capturedPrompts[0].filter((message: any) => message.role !== 'system');
+    expect(nonSystemMessages.at(-1)).toMatchObject({ role: 'assistant' });
+  });
+
   it('should not send prompt ending with assistant message when using stream with assistant-role input, structuredOutput and memory', async () => {
     const threadId = randomUUID();
     const resourceId = 'user-12800-stream';
@@ -854,5 +947,109 @@ describe('Structured output memory inheritance', () => {
 
       expect(assistantText).toBe('Main agent summary.');
     });
+  });
+});
+
+/**
+ * Regression test for issue #14659:
+ * `agent.stream()` with `structuredOutput` persists "[object Object]" as message text
+ *
+ * Root cause: the stream path's `onFinish` handler computed `outputText` by calling
+ * `.map(m => m.content).join('\n')` on the message list, which serialized content
+ * objects to "[object Object]" instead of extracting text from their parts.
+ *
+ * Fix: use `payload.text` for plain text output and `JSON.stringify(payload.object)`
+ * for structured output — matching the generate path's behaviour.
+ */
+describe('Structured output stream memory persistence (#14659)', () => {
+  it('should persist well-formed text when using stream with structuredOutput, not "[object Object]"', async () => {
+    const threadId = randomUUID();
+    const resourceId = 'user-14659';
+
+    const mockMemory = new MockMemory();
+
+    const expectedObject = {
+      primitiveId: 'agent1',
+      primitiveType: 'agent',
+      prompt: 'research dolphins',
+      selectionReason: 'best fit',
+    };
+    const expectedText = JSON.stringify(expectedObject);
+
+    const mockModel = new MockLanguageModelV2({
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          {
+            type: 'response-metadata',
+            id: 'response-14659',
+            modelId: 'mock-model',
+            timestamp: new Date(0),
+          },
+          { type: 'text-start', id: 'text-1' },
+          { type: 'text-delta', id: 'text-1', delta: expectedText },
+          { type: 'text-end', id: 'text-1' },
+          {
+            type: 'finish',
+            finishReason: 'stop',
+            usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          },
+        ]),
+      }),
+    });
+
+    const agent = new Agent({
+      id: 'structured-output-stream-text-test',
+      name: 'Stream Structured Output Agent',
+      instructions: 'You are a routing agent.',
+      model: mockModel,
+      memory: mockMemory,
+    });
+
+    await mockMemory.createThread({ threadId, resourceId });
+
+    const response = await agent.stream('Select a primitive', {
+      memory: {
+        thread: threadId,
+        resource: resourceId,
+      },
+      structuredOutput: {
+        schema: z.object({
+          primitiveId: z.string(),
+          primitiveType: z.string(),
+          prompt: z.string(),
+          selectionReason: z.string(),
+        }),
+      },
+    });
+
+    await response.consumeStream();
+
+    const { messages } = await mockMemory.recall({ threadId, resourceId });
+    const savedTexts = messages
+      .filter(msg => msg.role === 'assistant')
+      .map(msg => {
+        const content = msg.content as any;
+        return Array.isArray(content?.parts)
+          ? content.parts
+              .filter((p: any) => p.type === 'text')
+              .map((p: any) => p.text)
+              .join('')
+          : typeof content === 'string'
+            ? content
+            : String(content);
+      });
+
+    // Ensure at least one assistant message was persisted so the loop below is not vacuous.
+    expect(savedTexts.length).toBeGreaterThan(0);
+
+    // If any assistant message was persisted, it must not contain "[object Object]".
+    // Before the fix, outputText was computed as `.map(m => m.content).join('\n')`
+    // which serialized content objects, producing "[object Object]\n[object Object]\n...".
+    for (const text of savedTexts) {
+      expect(text, `Persisted message text must not be "[object Object]"`).not.toContain('[object Object]');
+    }
   });
 });

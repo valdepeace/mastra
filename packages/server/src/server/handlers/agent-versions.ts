@@ -17,8 +17,10 @@ import {
 } from '../schemas/agent-versions';
 import type { ServerRoute, RouteSchemas, InferParams } from '../server-adapter/routes';
 import { createRoute } from '../server-adapter/routes/route-builder';
+import { assertStoredResourceScope, getStoredResourceScope } from '../utils';
 
 import { handleError } from './error';
+import { validateAgentInstructionReferences } from './validate-agent-instructions';
 import {
   extractConfigFromVersion,
   calculateChangedFields,
@@ -68,7 +70,7 @@ export const LIST_AGENT_VERSIONS_ROUTE = createRoute({
   summary: 'List agent versions',
   description: 'Returns a paginated list of all versions for a stored agent',
   tags: ['Agent Versions'],
-  handler: async ({ mastra, agentId, page, perPage, orderBy }) => {
+  handler: async ({ mastra, agentId, page, perPage, orderBy, requestContext }) => {
     try {
       const storage = mastra.getStorage();
 
@@ -94,6 +96,7 @@ export const LIST_AGENT_VERSIONS_ROUTE = createRoute({
       if (!storedAgent && !codeAgentExists) {
         throw new HTTPException(404, { message: `Agent with id ${agentId} not found` });
       }
+      assertStoredResourceScope(storedAgent, await getStoredResourceScope(mastra, requestContext));
 
       const result = await agentsStore.listVersions({
         agentId,
@@ -123,7 +126,7 @@ export const CREATE_AGENT_VERSION_ROUTE = createRoute({
   summary: 'Create agent version',
   description: 'Creates a new version snapshot of the current agent configuration',
   tags: ['Agent Versions'],
-  handler: async ({ mastra, agentId, changeMessage }) => {
+  handler: async ({ mastra, agentId, changeMessage, requestContext }) => {
     try {
       const storage = mastra.getStorage();
 
@@ -141,6 +144,7 @@ export const CREATE_AGENT_VERSION_ROUTE = createRoute({
       if (!agent) {
         throw new HTTPException(404, { message: `Agent with id ${agentId} not found` });
       }
+      assertStoredResourceScope(agent, await getStoredResourceScope(mastra, requestContext));
 
       // Get the current active version to snapshot its config
       let currentConfig: Record<string, unknown> = {};
@@ -215,7 +219,7 @@ export const GET_AGENT_VERSION_ROUTE = createRoute({
   summary: 'Get agent version',
   description: 'Returns a specific version of an agent by its version ID',
   tags: ['Agent Versions'],
-  handler: async ({ mastra, agentId, versionId }) => {
+  handler: async ({ mastra, agentId, versionId, requestContext }) => {
     try {
       const storage = mastra.getStorage();
 
@@ -238,6 +242,8 @@ export const GET_AGENT_VERSION_ROUTE = createRoute({
       if (version.agentId !== agentId) {
         throw new HTTPException(404, { message: `Version with id ${versionId} not found for agent ${agentId}` });
       }
+      const agent = await agentsStore.getById(agentId);
+      assertStoredResourceScope(agent, await getStoredResourceScope(mastra, requestContext));
 
       return version;
     } catch (error) {
@@ -259,7 +265,7 @@ export const ACTIVATE_AGENT_VERSION_ROUTE = createRoute({
   summary: 'Activate agent version',
   description: 'Sets a specific version as the active version for the agent',
   tags: ['Agent Versions'],
-  handler: async ({ mastra, agentId, versionId }) => {
+  handler: async ({ mastra, agentId, versionId, requestContext }) => {
     try {
       const storage = mastra.getStorage();
 
@@ -277,6 +283,7 @@ export const ACTIVATE_AGENT_VERSION_ROUTE = createRoute({
       if (!agent) {
         throw new HTTPException(404, { message: `Agent with id ${agentId} not found` });
       }
+      assertStoredResourceScope(agent, await getStoredResourceScope(mastra, requestContext));
 
       // Verify version exists and belongs to this agent
       const version = await agentsStore.getVersion(versionId);
@@ -286,6 +293,12 @@ export const ACTIVATE_AGENT_VERSION_ROUTE = createRoute({
       if (version.agentId !== agentId) {
         throw new HTTPException(404, { message: `Version with id ${versionId} not found for agent ${agentId}` });
       }
+
+      await validateAgentInstructionReferences({
+        instructions: version.instructions,
+        mastra,
+        requestContext,
+      });
 
       // Update the agent's activeVersionId AND status to 'published'
       await agentsStore.update({
@@ -321,7 +334,7 @@ export const RESTORE_AGENT_VERSION_ROUTE = createRoute({
   summary: 'Restore agent version',
   description: 'Restores the agent configuration from a version, creating a new version',
   tags: ['Agent Versions'],
-  handler: async ({ mastra, agentId, versionId }) => {
+  handler: async ({ mastra, agentId, versionId, requestContext }) => {
     try {
       const storage = mastra.getStorage();
 
@@ -339,6 +352,7 @@ export const RESTORE_AGENT_VERSION_ROUTE = createRoute({
       if (!agent) {
         throw new HTTPException(404, { message: `Agent with id ${agentId} not found` });
       }
+      assertStoredResourceScope(agent, await getStoredResourceScope(mastra, requestContext));
 
       // Get the version to restore
       const versionToRestore = await agentsStore.getVersion(versionId);
@@ -422,7 +436,7 @@ export const DELETE_AGENT_VERSION_ROUTE = createRoute({
   summary: 'Delete agent version',
   description: 'Deletes a specific version (cannot delete the active version)',
   tags: ['Agent Versions'],
-  handler: async ({ mastra, agentId, versionId }) => {
+  handler: async ({ mastra, agentId, versionId, requestContext }) => {
     try {
       const storage = mastra.getStorage();
 
@@ -440,6 +454,7 @@ export const DELETE_AGENT_VERSION_ROUTE = createRoute({
       if (!agent) {
         throw new HTTPException(404, { message: `Agent with id ${agentId} not found` });
       }
+      assertStoredResourceScope(agent, await getStoredResourceScope(mastra, requestContext));
 
       // Verify version exists and belongs to this agent
       const version = await agentsStore.getVersion(versionId);
@@ -498,7 +513,7 @@ export const COMPARE_AGENT_VERSIONS_ROUTE: ServerRoute<
   summary: 'Compare agent versions',
   description: 'Compares two versions and returns the differences between them',
   tags: ['Agent Versions'],
-  handler: async ({ mastra, agentId, from, to }) => {
+  handler: async ({ mastra, agentId, from, to, requestContext }) => {
     try {
       const storage = mastra.getStorage();
 
@@ -510,6 +525,8 @@ export const COMPARE_AGENT_VERSIONS_ROUTE: ServerRoute<
       if (!agentsStore) {
         throw new HTTPException(500, { message: 'Agents storage domain is not available' });
       }
+      const agent = await agentsStore.getById(agentId);
+      assertStoredResourceScope(agent, await getStoredResourceScope(mastra, requestContext));
 
       // Get both versions
       const fromVersion = await agentsStore.getVersion(from);

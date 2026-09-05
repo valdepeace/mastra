@@ -1,7 +1,7 @@
 import type { z } from 'zod/v4';
 import type { AgentExecutionOptionsBase } from '../agent/agent.types';
 import type { SerializedError } from '../error';
-import type { ScoringSamplingConfig } from '../evals/types';
+import type { ScoringSamplingConfig, ScoringSource } from '../evals/types';
 import type { MastraDBMessage, StorageThreadType, SerializedMemoryConfig } from '../memory/types';
 import type { ProcessorPhase } from '../processor-provider';
 import { getZodInnerType, getZodTypeName } from '../utils/zod-utils';
@@ -63,6 +63,10 @@ export type PaginationInfo = {
 
 export type MastraMessageFormat = 'v1' | 'v2';
 
+export type StorageMetadataFilterValue = string | number | boolean | null;
+
+export type StorageMetadataFilter = Record<string, StorageMetadataFilterValue>;
+
 /**
  * Common options for listing messages (pagination, filtering, ordering)
  */
@@ -100,6 +104,13 @@ type StorageListMessagesOptions = {
        */
       endExclusive?: boolean;
     };
+    /**
+     * Filter messages by shallow scalar metadata key-value pairs from message content metadata.
+     * All specified key-value pairs must match with exact type equality (AND logic).
+     * Keys must start with a letter or underscore, contain only letters, numbers, and underscores,
+     * be at most 128 characters, and cannot be `__proto__`, `prototype`, or `constructor`.
+     */
+    metadata?: StorageMetadataFilter;
   };
   orderBy?: StorageOrderBy<'createdAt'>;
 };
@@ -296,6 +307,37 @@ export interface StorageMCPClientToolsConfig {
 }
 
 /**
+ * One pinned connection on a tool provider config (per-agent snapshot).
+ * Adapter-native `connectionId` is the join key into the
+ * `mastra_tool_provider_connections` storage table.
+ */
+export interface StorageToolProviderConfigConnection {
+  kind: 'author' | 'invoker' | 'platform';
+  connectionId: string;
+  toolkit: string;
+  label?: string;
+  scope?: StorageToolProviderConnectionScope;
+}
+
+/**
+ * Per-tool metadata (toolkit + optional description override) for a tool
+ * provider's selected tools.
+ */
+export interface StorageToolProviderToolMeta {
+  toolkit?: string;
+  description?: string;
+}
+
+/**
+ * Stored shape for one tool provider's configuration on one agent.
+ * Keyed by tool slug for `tools` and by toolkit slug for `connections`.
+ */
+export interface StorageToolProviderConfig {
+  tools: Record<string, StorageToolProviderToolMeta>;
+  connections: Record<string, StorageToolProviderConfigConnection[]>;
+}
+
+/**
  * Scorer reference with optional sampling configuration
  */
 export interface StorageScorerConfig {
@@ -366,7 +408,14 @@ export type StorageDefaultOptions = Omit<
   | 'system' // SystemMessage can be arrays or complex message objects
   | 'stopWhen' // StopCondition is a complex union type from AI SDK
   | 'providerOptions' // ProviderOptions includes provider-specific types from external packages
->;
+  | 'requireToolApproval' // can be a function at runtime; stored options must be serializable
+> & {
+  /**
+   * Stored agents only support a boolean here. Function-based approval policies are runtime-only
+   * and cannot be serialized, so they are intentionally excluded from stored default options.
+   */
+  requireToolApproval?: boolean;
+};
 
 /**
  * A conditional variant: a value paired with an optional RuleGroup.
@@ -385,6 +434,22 @@ export interface StorageConditionalVariant<T> {
  * A variant with no rules always matches (acts as the default/base).
  */
 export type StorageConditionalField<T> = T | StorageConditionalVariant<T>[];
+
+/**
+ * Serializable subset of `AgentDurableOption` that can be persisted on a stored
+ * agent version snapshot. `cache` and `pubsub` are live runtime objects and are
+ * intentionally excluded — they are inherited from the Mastra instance at
+ * hydration time. `id`/`name` are excluded because a stored agent's durable
+ * wrapper must keep the agent's own id/name to stay addressable.
+ */
+export type StorageDurableConfig =
+  | boolean
+  | {
+      /** Maximum steps for the durable agentic loop. */
+      maxSteps?: number;
+      /** Auto-cleanup timer for durable stream state (ms). `0` disables cleanup. */
+      cleanupTimeoutMs?: number;
+    };
 
 /**
  * Agent version snapshot type containing ALL agent configuration fields.
@@ -413,6 +478,12 @@ export interface StorageAgentSnapshotType {
    * Static or conditional on request context.
    */
   integrationTools?: StorageConditionalField<Record<string, StorageMCPClientToolsConfig>>;
+  /**
+   * Tool provider configs keyed by provider id (e.g. `'composio'`).
+   * Each config selects tool slugs and pins per-toolkit connections.
+   * Static or conditional on request context.
+   */
+  toolProviders?: StorageConditionalField<Record<string, StorageToolProviderConfig>>;
   /** Processor graph for input processing — static or conditional on request context */
   inputProcessors?: StorageConditionalField<StoredProcessorGraph>;
   /** Processor graph for output processing — static or conditional on request context */
@@ -425,10 +496,18 @@ export interface StorageAgentSnapshotType {
   mcpClients?: StorageConditionalField<Record<string, StorageMCPClientToolsConfig>>;
   /** Workspace reference — ID of a stored workspace or inline config — static or conditional on request context */
   workspace?: StorageConditionalField<StorageWorkspaceRef>;
+  /** Browser reference — inline browser config — static or conditional on request context */
+  browser?: StorageConditionalField<StorageBrowserRef>;
   /** Skill entity IDs with optional per-skill overrides — static or conditional on request context */
   skills?: StorageConditionalField<Record<string, StorageSkillConfig>>;
   /** Skill format for system message injection (default: 'xml') */
   skillsFormat?: 'xml' | 'json' | 'markdown';
+  /**
+   * Opt the hydrated agent into durable execution. Serializable subset of
+   * `AgentDurableOption` — `cache`/`pubsub` are live objects and stay code-level.
+   * Not conditional: durability is decided at registration time, not per request.
+   */
+  durable?: StorageDurableConfig;
   /** JSON Schema for validating request context values. Stored as JSON Schema since Zod is not serializable. */
   requestContextSchema?: Record<string, unknown>;
 }
@@ -437,6 +516,15 @@ export interface StorageAgentSnapshotType {
  * Thin agent record type containing only metadata fields.
  * All configuration lives in version snapshots (StorageAgentSnapshotType).
  */
+/**
+ * Visibility of a stored agent.
+ * - `private`: only the owner (or admins) can read the record.
+ * - `public`: any authenticated caller with `agents:read` can read the record.
+ */
+export type StorageVisibility = 'private' | 'public';
+
+export const STORAGE_VISIBILITY_VALUES = ['private', 'public'] as const satisfies readonly StorageVisibility[];
+
 export interface StorageAgentType {
   /** Unique, immutable identifier */
   id: string;
@@ -446,8 +534,19 @@ export interface StorageAgentType {
   activeVersionId?: string;
   /** Author identifier for multi-tenant filtering */
   authorId?: string;
+  /**
+   * Visibility of the stored agent. `private` limits access to the owner / admins;
+   * `public` allows any authenticated caller with `agents:read` to read.
+   * May be undefined for legacy records created before visibility was introduced.
+   */
+  visibility?: StorageVisibility;
   /** Additional metadata for the agent */
   metadata?: Record<string, unknown>;
+  /**
+   * Denormalized count of favorites on this agent. Maintained by the favorites
+   * storage domain. Optional; treat undefined as 0 for legacy rows.
+   */
+  favoriteCount?: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -471,6 +570,8 @@ export type StorageCreateAgentInput = {
   id: string;
   /** Author identifier for multi-tenant filtering */
   authorId?: string;
+  /** Visibility of the stored agent (defaults to 'private' when an authorId is set) */
+  visibility?: StorageVisibility;
   /** Additional metadata for the agent */
   metadata?: Record<string, unknown>;
 } & StorageAgentSnapshotType;
@@ -485,15 +586,19 @@ export type StorageUpdateAgentInput = {
   id: string;
   /** Author identifier for multi-tenant filtering */
   authorId?: string;
+  /** Visibility of the stored agent */
+  visibility?: StorageVisibility;
   /** Additional metadata for the agent */
   metadata?: Record<string, unknown>;
   /** FK to agent_versions.id - the currently active version */
   activeVersionId?: string;
   /** Agent status: 'draft' or 'published' */
   status?: 'draft' | 'published' | 'archived';
-} & Partial<Omit<StorageAgentSnapshotType, 'memory'>> & {
+} & Partial<Omit<StorageAgentSnapshotType, 'memory' | 'browser'>> & {
     /** Memory configuration object (static or conditional), or null to disable memory */
     memory?: StorageConditionalField<SerializedMemoryConfig> | null;
+    /** Browser configuration (inline ref), or null to disable browser */
+    browser?: StorageConditionalField<StorageBrowserRef> | null;
   };
 
 export type StorageListAgentsInput = {
@@ -514,6 +619,10 @@ export type StorageListAgentsInput = {
    */
   authorId?: string;
   /**
+   * Filter agents by visibility (exact match).
+   */
+  visibility?: StorageVisibility;
+  /**
    * Filter agents by metadata key-value pairs.
    * All specified key-value pairs must match (AND logic).
    */
@@ -523,6 +632,25 @@ export type StorageListAgentsInput = {
    * Defaults to 'published' if not specified.
    */
   status?: 'draft' | 'published' | 'archived';
+  /**
+   * Restrict results to this set of agent IDs. Used by the favorites feature
+   * to fetch a specific subset of favorited agents. When provided as an
+   * empty array, the result is empty.
+   */
+  entityIds?: string[];
+  /**
+   * When set, agents favorited by this user are returned first, ordered
+   * by `(is_favorited DESC, <existing orderBy>, id ASC)` over the full
+   * candidate set before pagination. Implementations that don't support
+   * favorited-first sort treat this as undefined.
+   */
+  pinFavoritedFor?: string;
+  /**
+   * When true, only agents favorited by `pinFavoritedFor` are returned.
+   * Requires `pinFavoritedFor` to be set. SQL backends collapse this into
+   * the same JOIN used for favorited-first sort.
+   */
+  favoritedOnly?: boolean;
 };
 
 export type StorageListAgentsOutput = PaginationInfo & {
@@ -822,6 +950,10 @@ export interface StorageScorerDefinitionType {
   activeVersionId?: string;
   /** Author identifier for multi-tenant filtering */
   authorId?: string;
+  /** Organization identifier for multi-tenant scoping */
+  organizationId?: string;
+  /** Project identifier for multi-tenant scoping */
+  projectId?: string;
   /** Additional metadata for the scorer */
   metadata?: Record<string, unknown>;
   createdAt: Date;
@@ -847,6 +979,10 @@ export type StorageCreateScorerDefinitionInput = {
   id: string;
   /** Author identifier for multi-tenant filtering */
   authorId?: string;
+  /** Organization identifier for multi-tenant scoping */
+  organizationId?: string;
+  /** Project identifier for multi-tenant scoping */
+  projectId?: string;
   /** Additional metadata for the scorer */
   metadata?: Record<string, unknown>;
 } & StorageScorerDefinitionSnapshotType;
@@ -883,6 +1019,14 @@ export type StorageListScorerDefinitionsInput = {
    * Filter scorers by author identifier.
    */
   authorId?: string;
+  /**
+   * Filter scorers by organization identifier (multi-tenant scoping).
+   */
+  organizationId?: string;
+  /**
+   * Filter scorers by project identifier (multi-tenant scoping).
+   */
+  projectId?: string;
   /**
    * Filter scorers by metadata key-value pairs.
    * All specified key-value pairs must match (AND logic).
@@ -983,6 +1127,10 @@ export interface BufferedObservationChunk {
   currentTask?: string;
   /** Optional thread title from observer output */
   threadTitle?: string;
+  /** Values extracted during this buffered observation cycle. */
+  extractedValues?: Record<string, unknown>;
+  /** Extractor failures from this buffered observation cycle. */
+  extractionFailures?: Array<{ slug: string; error: string }>;
 }
 
 /**
@@ -1007,6 +1155,10 @@ export interface BufferedObservationChunkInput {
   currentTask?: string;
   /** Optional thread title from observer output */
   threadTitle?: string;
+  /** Values extracted during this buffered observation cycle. */
+  extractedValues?: Record<string, unknown>;
+  /** Extractor failures from this buffered observation cycle. */
+  extractionFailures?: Array<{ slug: string; error: string }>;
 }
 
 /**
@@ -1820,6 +1972,18 @@ export type StorageContentSource =
   | { type: 'managed'; mastraPath: string };
 
 /**
+ * A node in the skill file tree (folder or file with inline content).
+ * Used for round-tripping the full file structure through the UI.
+ */
+export interface StorageSkillFileNode {
+  id?: string;
+  name: string;
+  type: 'file' | 'folder';
+  content?: string;
+  children?: StorageSkillFileNode[];
+}
+
+/**
  * Skill version snapshot type containing ALL skill definition fields.
  * These fields live exclusively in version snapshot rows, not on the skill record.
  */
@@ -1844,6 +2008,8 @@ export interface StorageSkillSnapshotType {
   assets?: string[];
   /** Optional arbitrary metadata */
   metadata?: Record<string, unknown>;
+  /** Full file tree structure (folders, files with content) for round-tripping in the UI */
+  files?: StorageSkillFileNode[];
   /** Content-addressable file tree manifest for this skill version */
   tree?: SkillVersionTree;
 }
@@ -1861,6 +2027,16 @@ export interface StorageSkillType {
   activeVersionId?: string;
   /** Author identifier for multi-tenant filtering */
   authorId?: string;
+  /**
+   * Access control: 'private' = only owner/admins, 'public' = anyone.
+   * May be undefined for legacy records created before visibility was introduced.
+   */
+  visibility?: StorageVisibility;
+  /**
+   * Denormalized count of favorites on this skill. Maintained by the favorites
+   * storage domain. Optional; treat undefined as 0 for legacy rows.
+   */
+  favoriteCount?: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -1883,6 +2059,8 @@ export type StorageCreateSkillInput = {
   id: string;
   /** Author identifier for multi-tenant filtering */
   authorId?: string;
+  /** Access control visibility */
+  visibility?: StorageVisibility;
 } & StorageSkillSnapshotType;
 
 /**
@@ -1893,6 +2071,8 @@ export type StorageUpdateSkillInput = {
   id: string;
   /** Author identifier for multi-tenant filtering */
   authorId?: string;
+  /** Access control visibility */
+  visibility?: StorageVisibility;
   /** FK to skill_versions.id - the currently active version */
   activeVersionId?: string;
   /** Skill status */
@@ -1916,10 +2096,37 @@ export type StorageListSkillsInput = {
    */
   authorId?: string;
   /**
+   * Filter skills by visibility (exact match).
+   */
+  visibility?: StorageVisibility;
+  /**
+   * Filter skills by status (exact match).
+   */
+  status?: StorageSkillType['status'];
+  /**
    * Filter skills by metadata key-value pairs.
    * All specified key-value pairs must match (AND logic).
    */
   metadata?: Record<string, unknown>;
+  /**
+   * Restrict results to this set of skill IDs. Used by the favorites feature
+   * to fetch a specific subset of favorited skills. When provided as an
+   * empty array, the result is empty.
+   */
+  entityIds?: string[];
+  /**
+   * When set, skills favorited by this user are returned first, ordered
+   * by `(is_favorited DESC, <existing orderBy>, id ASC)` over the full
+   * candidate set before pagination. Implementations that don't support
+   * favorited-first sort treat this as undefined.
+   */
+  pinFavoritedFor?: string;
+  /**
+   * When true, only skills favorited by `pinFavoritedFor` are returned.
+   * Requires `pinFavoritedFor` to be set. SQL backends collapse this into
+   * the same JOIN used for favorited-first sort.
+   */
+  favoritedOnly?: boolean;
 };
 
 /** Paginated list output for thin skill records */
@@ -2000,11 +2207,13 @@ export interface StorageBlobEntry {
 
 /**
  * Workspace reference configuration stored in agent snapshots.
- * Can reference a stored workspace by ID or provide inline workspace config.
+ * Can reference a stored workspace by ID, provide inline workspace config,
+ * or name a registered workspace provider to build the entire workspace.
  */
 export type StorageWorkspaceRef =
   | { type: 'id'; workspaceId: string }
-  | { type: 'inline'; config: StorageWorkspaceSnapshotType };
+  | { type: 'inline'; config: StorageWorkspaceSnapshotType }
+  | { type: 'provider'; provider: string; config: Record<string, unknown> };
 
 // ============================================
 // Workflow Storage Types
@@ -2017,6 +2226,8 @@ export interface UpdateWorkflowStateOptions {
   suspendedPaths?: Record<string, number[]>;
   waitingPaths?: Record<string, number[]>;
   resumeLabels?: Record<string, { stepId: string; foreachIndex?: number }>;
+  activePaths?: Array<number>;
+  activeStepsPath?: Record<string, number[]>;
   /**
    * Tracing context for span continuity during suspend/resume.
    * Persisted when workflow suspends to enable linking resumed spans
@@ -2027,6 +2238,31 @@ export interface UpdateWorkflowStateOptions {
     spanId?: string;
     parentSpanId?: string;
   };
+  /**
+   * Optional compare-and-set guard. When provided, the update is applied only if the
+   * persisted snapshot's status matches one of these values. Otherwise the update is a
+   * no-op and `updateWorkflowState` resolves to `undefined`.
+   *
+   * This is only enforced atomically by stores that report `supportsConcurrentUpdates()`,
+   * because those stores load and write the snapshot inside a single critical section.
+   * Stores without concurrent update support apply it on a best-effort basis.
+   *
+   * This field is a guard only: it is never merged into the persisted snapshot.
+   */
+  expectedStatus?: WorkflowRunStatus | WorkflowRunStatus[];
+}
+
+/**
+ * Returns true when a snapshot's current status satisfies an `expectedStatus` guard.
+ * Stores call this inside their `updateWorkflowState` critical section.
+ */
+export function matchesExpectedWorkflowStatus(
+  currentStatus: WorkflowRunStatus | undefined,
+  expectedStatus: UpdateWorkflowStateOptions['expectedStatus'],
+): boolean {
+  if (expectedStatus === undefined) return true;
+  const expected = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
+  return currentStatus !== undefined && expected.includes(currentStatus);
 }
 
 function unwrapSchema(schema: z.ZodTypeAny): { base: z.ZodTypeAny; nullable: boolean } {
@@ -2160,6 +2396,67 @@ export function buildStorageSchema<Shape extends z.ZodRawShape>(
 }
 
 // ============================================
+// Browser Configuration Types
+// ============================================
+
+/**
+ * Browser configuration stored in agent snapshots.
+ *
+ * Only stable, declarative configuration is persisted here. Runtime/security
+ * concerns (cdpUrl, scope, profile, executablePath) belong in the BrowserProvider
+ * registration where they're set per-instance via `createBrowser`.
+ *
+ * Runtime-only options (onLaunch, onClose, cdpUrl as function) are never stored.
+ */
+export interface StorageBrowserConfig {
+  /** Provider type identifier (e.g., 'stagehand', 'playwright') — resolved by the editor's browser registry */
+  provider: string;
+
+  /**
+   * Whether to run the browser in headless mode (no visible UI).
+   * @default true
+   */
+  headless?: boolean;
+
+  /**
+   * Browser viewport dimensions.
+   * Controls the size of the browser window and how websites render.
+   */
+  viewport?: {
+    width: number;
+    height: number;
+  };
+
+  /**
+   * Default timeout in milliseconds for browser operations.
+   * @default 10000 (10 seconds)
+   */
+  timeout?: number;
+
+  /**
+   * Screencast options for streaming browser frames.
+   */
+  screencast?: {
+    /** Image format (default: 'jpeg') */
+    format?: 'jpeg' | 'png';
+    /** JPEG quality 0-100 (default: 80) */
+    quality?: number;
+    /** Max width in pixels (default: 1280) */
+    maxWidth?: number;
+    /** Max height in pixels (default: 720) */
+    maxHeight?: number;
+    /** Capture every Nth frame (default: 1) */
+    everyNthFrame?: number;
+  };
+}
+
+/**
+ * Browser reference configuration stored in agent snapshots.
+ * Provides inline browser config that the editor resolves at hydration time.
+ */
+export type StorageBrowserRef = { type: 'inline'; config: StorageBrowserConfig };
+
+// ============================================
 // Dataset Types
 // ============================================
 
@@ -2177,23 +2474,70 @@ export interface DatasetRecord {
   targetType?: TargetType | null;
   targetIds?: string[] | null;
   scorerIds?: string[] | null;
+  /** Multi-tenant organization/account scope. */
+  organizationId?: string | null;
+  /** Platform project scope. Pairs with {@link DatasetRecord.organizationId} to form the dataset's tenancy bucket. */
+  projectId?: string | null;
+  /** Recurring-problem fingerprint (e.g. detector-emitted candidate key). */
+  candidateKey?: string | null;
+  /** Incident-specific identifier minted by the detector. */
+  candidateId?: string | null;
   version: number;
   createdAt: Date;
   updatedAt: Date;
 }
 
 export interface DatasetItemSource {
-  type: 'csv' | 'json' | 'trace' | 'llm' | 'experiment-result';
+  type: 'csv' | 'json' | 'trace' | 'llm' | 'experiment-result' | 'candidate-screener';
   referenceId?: string;
+}
+
+/**
+ * A single static tool mock authored on a dataset item (output-only in v1).
+ * Structurally mirrors `ItemToolMock` in the experiment engine; kept local here
+ * to avoid a storage→datasets import cycle.
+ */
+export interface DatasetItemToolMock {
+  toolName: string;
+  args: Record<string, unknown>;
+  output: unknown;
+  /** Argument matching mode. `strict` (default) deep-equals args; `ignore` matches on toolName only. */
+  matchArgs?: 'strict' | 'ignore';
+}
+
+/**
+ * Diagnostic receipt for tool-mock usage on a single experiment result.
+ * Structurally mirrors `ToolMockReport` in the experiment engine.
+ */
+export type DatasetUnmockedToolPolicy = 'allow' | 'deny';
+
+export interface DatasetToolMockReport {
+  served: { mockIndex: number; toolName: string; args: unknown }[];
+  unconsumed: { mockIndex: number; toolName: string; args: unknown }[];
+  liveCalls: { toolName: string; args: unknown }[];
+  failure?: {
+    code: 'TOOL_MOCK_MISMATCH' | 'TOOL_MOCK_EXHAUSTED' | 'TOOL_MOCK_NOT_DECLARED';
+    toolName: string;
+    args: unknown;
+  };
 }
 
 export interface DatasetItem {
   id: string;
   datasetId: string;
   datasetVersion: number;
+  /** Caller-defined, dataset-local logical identity. Immutable after insertion. */
+  externalId?: string | null;
+  /** Inherited from the parent dataset at insert time. */
+  organizationId?: string | null;
+  /** Inherited from the parent dataset at insert time. */
+  projectId?: string | null;
   input: unknown;
   groundTruth?: unknown;
   expectedTrajectory?: unknown;
+  toolMocks?: DatasetItemToolMock[];
+  unmockedToolPolicy?: DatasetUnmockedToolPolicy;
+  scorerIds?: string[];
   requestContext?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   source?: DatasetItemSource;
@@ -2205,11 +2549,20 @@ export interface DatasetItemRow {
   id: string;
   datasetId: string;
   datasetVersion: number;
+  /** Caller-defined, dataset-local logical identity. Immutable across SCD-2 history. */
+  externalId?: string | null;
+  /** Inherited from the parent dataset at insert time. */
+  organizationId?: string | null;
+  /** Inherited from the parent dataset at insert time. */
+  projectId?: string | null;
   validTo: number | null;
   isDeleted: boolean;
   input: unknown;
   groundTruth?: unknown;
   expectedTrajectory?: unknown;
+  toolMocks?: DatasetItemToolMock[];
+  unmockedToolPolicy?: DatasetUnmockedToolPolicy;
+  scorerIds?: string[];
   requestContext?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   source?: DatasetItemSource;
@@ -2227,17 +2580,68 @@ export interface DatasetVersion {
 // Dataset CRUD Input/Output Types
 
 export interface CreateDatasetInput {
+  /**
+   * Optional caller-defined durable identity. When provided, storage adapters atomically create
+   * the dataset or return the compatible dataset that already owns this ID.
+   */
+  id?: string;
   name: string;
   description?: string;
   metadata?: Record<string, unknown>;
   inputSchema?: Record<string, unknown> | null;
   groundTruthSchema?: Record<string, unknown> | null;
   requestContextSchema?: Record<string, unknown> | null;
+  /**
+   * Discriminator for the target this dataset's items will be replayed against.
+   * Optional because a dataset can exist purely as a collection of items
+   * (e.g. emitted by a detector for a target kind OSS doesn't yet know how to
+   * run). Datasets created without a {@link TargetType} are **not
+   * experiment-eligible**: the experiment runner requires a non-null
+   * {@link CreateExperimentInput.targetType} to resolve an executor, so a
+   * downstream consumer must either set this on create or refuse to run an
+   * experiment against the dataset.
+   */
   targetType?: TargetType;
   targetIds?: string[];
   scorerIds?: string[];
+  /**
+   * Multi-tenant organization/account scope. Stamped onto every item inserted into this dataset.
+   * Immutable after create — items inherit this from the parent dataset on every write, so changing
+   * it later would corrupt SCD-2 tombstone history. Intentionally absent from {@link UpdateDatasetInput}.
+   */
+  organizationId?: string | null;
+  /**
+   * Platform project scope. Stamped onto every item inserted into this dataset.
+   * Pairs with {@link CreateDatasetInput.organizationId} to form the (organizationId, projectId)
+   * tenancy bucket. Immutable after create — see {@link CreateDatasetInput.organizationId}.
+   */
+  projectId?: string | null;
+  /**
+   * Recurring-problem fingerprint (e.g. detector-emitted candidate key).
+   * Immutable after create — pairs with {@link CreateDatasetInput.candidateId} to identify
+   * the dataset's source incident and must not drift over the dataset's lifetime.
+   */
+  candidateKey?: string | null;
+  /**
+   * Incident-specific identifier minted by the detector.
+   * Immutable after create — see {@link CreateDatasetInput.candidateKey}.
+   */
+  candidateId?: string | null;
 }
 
+/**
+ * Update input for a dataset. Tenancy ({@link CreateDatasetInput.organizationId},
+ * {@link CreateDatasetInput.projectId}) and candidate identity
+ * ({@link CreateDatasetInput.candidateKey}, {@link CreateDatasetInput.candidateId})
+ * are intentionally omitted from the payload: they are set once at create time and must
+ * remain immutable so item SCD-2 history (which inherits these fields per-write from the
+ * parent dataset) stays consistent across the dataset's lifetime.
+ *
+ * The optional `filters` field is a *read scope*, not a payload update — when provided,
+ * the update is only applied if the target dataset row also matches the tenancy filters.
+ * Callers that know the tenant should pass this to prevent cross-tenant updates via a
+ * leaked dataset ID.
+ */
 export interface UpdateDatasetInput {
   id: string;
   name?: string;
@@ -2250,31 +2654,107 @@ export interface UpdateDatasetInput {
   targetType?: TargetType | null;
   targetIds?: string[] | null;
   scorerIds?: string[] | null;
+  /** Tenancy read-scope. When set, the update only applies if the row matches; otherwise it is treated as NOT_FOUND. */
+  filters?: DatasetTenancyFilters;
 }
 
-export interface AddDatasetItemInput {
-  datasetId: string;
+/**
+ * The mutable, user-supplied payload portion of a dataset item.
+ *
+ * Identity (`id`, `datasetId`) and storage-managed audit fields (`datasetVersion`,
+ * `organizationId`, `projectId`, `createdAt`, `updatedAt`) live on {@link DatasetItem}
+ * and are not part of the payload.
+ *
+ * Used as the base shape for {@link AddDatasetItemInput} and
+ * {@link BatchInsertItemsInput.items}, and (as `Partial<…>`) for
+ * {@link UpdateDatasetItemInput}.
+ */
+export interface DatasetItemPayload {
+  /**
+   * Optional caller-defined identity scoped to this dataset. Reusing an identity
+   * with the originally accepted payload is idempotent; incompatible reuse fails.
+   */
+  externalId?: string;
   input: unknown;
   groundTruth?: unknown;
   expectedTrajectory?: unknown;
+  toolMocks?: DatasetItemToolMock[];
+  /** Overrides the experiment's handling of tool calls not declared in `toolMocks`. */
+  unmockedToolPolicy?: DatasetUnmockedToolPolicy;
+  scorerIds?: string[];
   requestContext?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   source?: DatasetItemSource;
 }
 
-export interface UpdateDatasetItemInput {
+export interface AddDatasetItemInput extends DatasetItemPayload {
+  datasetId: string;
+  /**
+   * Tenancy read-scope for the parent dataset. When set, the insert is rejected
+   * (NOT_FOUND) if the parent dataset row does not match the tenancy filters —
+   * prevents adding items to a dataset in another tenant via a leaked datasetId.
+   */
+  filters?: DatasetTenancyFilters;
+}
+
+/**
+ * Update input for a dataset item. All payload fields are optional; only the
+ * provided fields are patched.
+ *
+ * The optional `filters` field is a tenancy read-scope for the parent dataset;
+ * see {@link AddDatasetItemInput.filters}.
+ */
+export interface UpdateDatasetItemInput extends Partial<Omit<DatasetItemPayload, 'externalId' | 'scorerIds'>> {
   id: string;
   datasetId: string;
-  input?: unknown;
-  groundTruth?: unknown;
-  expectedTrajectory?: unknown;
-  requestContext?: Record<string, unknown>;
-  metadata?: Record<string, unknown>;
-  source?: DatasetItemSource;
+  scorerIds?: string[] | null;
+  filters?: DatasetTenancyFilters;
+}
+
+export interface DatasetItemIdentityConflictDetail {
+  index: number;
+  externalId: string;
+  existingItemId: string;
+  reason: 'payload_mismatch' | 'deleted';
+}
+
+/**
+ * Delete input for a single dataset item. The optional `filters` field is a
+ * tenancy read-scope for the parent dataset; see {@link AddDatasetItemInput.filters}.
+ */
+export interface DeleteDatasetItemInput {
+  id: string;
+  datasetId: string;
+  filters?: DatasetTenancyFilters;
+}
+
+export interface DatasetTenancyFilters {
+  organizationId?: string;
+  projectId?: string;
+}
+
+export interface ListDatasetsFilters extends DatasetTenancyFilters {
+  candidateKey?: string;
+  candidateId?: string;
+  /**
+   * Filter by dataset target type (agent | workflow | scorer | processor).
+   */
+  targetType?: TargetType;
+  /**
+   * Filter to datasets whose `targetIds` intersect this list. A dataset
+   * matches if any of its targetIds is in this array. An empty array is
+   * treated as "no filter" (matches all datasets), not "match none".
+   */
+  targetIds?: string[];
+  /**
+   * Substring match on dataset `name`, case-insensitive.
+   */
+  name?: string;
 }
 
 export interface ListDatasetsInput {
   pagination: StoragePagination;
+  filters?: ListDatasetsFilters;
 }
 
 export interface ListDatasetsOutput {
@@ -2287,6 +2767,7 @@ export interface ListDatasetItemsInput {
   version?: number;
   search?: string;
   pagination: StoragePagination;
+  filters?: DatasetTenancyFilters;
 }
 
 export interface ListDatasetItemsOutput {
@@ -2306,19 +2787,16 @@ export interface ListDatasetVersionsOutput {
 
 export interface BatchInsertItemsInput {
   datasetId: string;
-  items: Array<{
-    input: unknown;
-    groundTruth?: unknown;
-    expectedTrajectory?: unknown;
-    requestContext?: Record<string, unknown>;
-    metadata?: Record<string, unknown>;
-    source?: DatasetItemSource;
-  }>;
+  items: DatasetItemPayload[];
+  /** Tenancy read-scope for the parent dataset; see {@link AddDatasetItemInput.filters}. */
+  filters?: DatasetTenancyFilters;
 }
 
 export interface BatchDeleteItemsInput {
   datasetId: string;
   itemIds: string[];
+  /** Tenancy read-scope for the parent dataset; see {@link AddDatasetItemInput.filters}. */
+  filters?: DatasetTenancyFilters;
 }
 
 // ============================================
@@ -2327,21 +2805,118 @@ export interface BatchDeleteItemsInput {
 
 export type ExperimentStatus = 'pending' | 'running' | 'completed' | 'failed';
 
+/**
+ * Caller-provided information describing the source of an experiment execution.
+ *
+ * A typical mapping is source system, source-owned identifier, and revision. For
+ * example, `source: 'github'`, `sourceId: 'mastra-ai/mastra'`, and
+ * `sourceVersion: '<commit-sha>'`. These values are persisted as unverified
+ * caller claims; use {@link ExperimentRunnerAttestation} for trusted
+ * runner-generated execution identity.
+ *
+ * Provenance is assigned when an experiment is created and cannot be changed
+ * through the experiment update contract.
+ */
+export interface ExperimentProvenance {
+  /** Source system or source kind, such as `github`, `ci`, or `local`. */
+  source?: string;
+  /** Stable identifier owned by the source, such as a repository or benchmark definition. */
+  sourceId?: string;
+  /** Revision of the source, such as a commit SHA, release version, or configuration digest. */
+  sourceVersion?: string;
+  /** Additional caller-defined source context. */
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Caller-defined dimensions used to group related experiment executions.
+ *
+ * For a study comparing baseline and candidate variants across repeated trials:
+ * - `experimentSetId` identifies the overall study and is shared by every related run.
+ * - `comparisonId` identifies one controlled comparison within the study and is
+ *   shared by all variants and trials in that comparison.
+ * - `variantId` identifies an alternative within the comparison, such as
+ *   `baseline` or `candidate`.
+ * - `trialIndex` is the zero-based repetition index for that variant.
+ *
+ * The natural caller-defined identity is
+ * `(experimentSetId, comparisonId, variantId, trialIndex)`. Mastra does not
+ * enforce uniqueness or require every dimension, so callers own identifier scope
+ * and consistency. Grouping is assigned when an experiment is created and cannot
+ * be changed through the experiment update contract.
+ *
+ * @example
+ * ```ts
+ * const sharedGrouping = {
+ *   experimentSetId: 'support-agent-benchmark',
+ *   comparisonId: 'prompt-v1-vs-v2',
+ * };
+ *
+ * const runs = [
+ *   { ...sharedGrouping, variantId: 'baseline', trialIndex: 0 },
+ *   { ...sharedGrouping, variantId: 'baseline', trialIndex: 1 },
+ *   { ...sharedGrouping, variantId: 'candidate', trialIndex: 0 },
+ *   { ...sharedGrouping, variantId: 'candidate', trialIndex: 1 },
+ * ];
+ * ```
+ */
+export interface ExperimentGrouping {
+  /** Overall study or benchmark campaign identifier. */
+  experimentSetId?: string;
+  /** Controlled comparison identifier within the experiment set. */
+  comparisonId?: string;
+  /** Alternative identifier within the comparison. */
+  variantId?: string;
+  /** Zero-based repetition index for the variant. */
+  trialIndex?: number;
+}
+
+/** Trusted runner-generated execution identity. Not accepted by caller-facing run APIs. */
+export interface ExperimentRunnerAttestation {
+  runnerId: string;
+  invocationId: string;
+  runnerVersion?: string;
+}
+
 export interface Experiment {
   id: string;
   name?: string;
   description?: string;
   metadata?: Record<string, unknown>;
+  provenance?: ExperimentProvenance | null;
+  runnerAttestation?: ExperimentRunnerAttestation | null;
+  experimentSetId?: string | null;
+  comparisonId?: string | null;
+  variantId?: string | null;
+  trialIndex?: number | null;
   datasetId: string | null;
   datasetVersion: number | null;
-  targetType: TargetType;
-  targetId: string;
+  /**
+   * The kind of executor this experiment runs against (agent / workflow / scorer / processor).
+   *
+   * `null` for caller-driven ingestion experiments: the caller executes items
+   * itself and submits results, so there is no registered target to resolve.
+   * Runner-owned and item-run experiments always carry a non-null target.
+   */
+  targetType: TargetType | null;
+  targetId: string | null;
+  /**
+   * Run-level scorer IDs pinned at create time for caller-driven experiments.
+   * Acts as the highest-priority scorer source when Mastra executes items
+   * (`runExperimentItem`), mirroring the runner's `scorers` option. `null`
+   * falls through to item-level then dataset-level scorer IDs.
+   */
+  scorerIds?: string[] | null;
   status: ExperimentStatus;
   totalItems: number;
   succeededCount: number;
   failedCount: number;
   skippedCount: number;
   agentVersion?: string | null;
+  /** Multi-tenant organization/account scope. Hydrated from the parent dataset on create. */
+  organizationId?: string | null;
+  /** Platform project scope. Pairs with {@link Experiment.organizationId} to form the experiment's tenancy bucket. */
+  projectId?: string | null;
   startedAt: Date | null;
   completedAt: Date | null;
   createdAt: Date;
@@ -2358,13 +2933,28 @@ export interface ExperimentResult {
   input: unknown;
   output: unknown | null;
   groundTruth: unknown | null;
+  metadata: Record<string, unknown> | null;
   error: { message: string; stack?: string; code?: string } | null;
   startedAt: Date;
   completedAt: Date;
   retryCount: number;
+  /**
+   * Zero-based repetition index for this item within the experiment. Part of
+   * the natural result identity `(experimentId, itemId, attempt)` used by
+   * {@link ExperimentsStorage.upsertExperimentResult} so external runners can
+   * retry submissions safely (retries converge on one row) while repeated
+   * trials use distinct attempt values on purpose.
+   */
+  attempt: number;
   traceId: string | null;
   status: ExperimentResultStatus | null;
   tags: string[] | null;
+  comment?: string | null;
+  toolMockReport?: DatasetToolMockReport | null;
+  /** Multi-tenant organization/account scope. Denormalized from the parent experiment for efficient tenancy-scoped queries. */
+  organizationId?: string | null;
+  /** Platform project scope. Pairs with {@link ExperimentResult.organizationId} to form the result's tenancy bucket. */
+  projectId?: string | null;
   createdAt: Date;
 }
 
@@ -2374,6 +2964,7 @@ export interface UpdateExperimentResultInput {
   experimentId?: string;
   status?: ExperimentResultStatus | null;
   tags?: string[] | null;
+  comment?: string | null;
 }
 
 export interface CreateExperimentInput {
@@ -2381,12 +2972,37 @@ export interface CreateExperimentInput {
   name?: string;
   description?: string;
   metadata?: Record<string, unknown>;
+  provenance?: ExperimentProvenance;
+  runnerAttestation?: ExperimentRunnerAttestation;
+  experimentSetId?: string;
+  comparisonId?: string;
+  variantId?: string;
+  trialIndex?: number;
   datasetId: string | null;
   datasetVersion: number | null;
   agentVersion?: string;
-  targetType: TargetType;
-  targetId: string;
+  /**
+   * Discriminator for the target this experiment runs against. `null` for
+   * caller-driven ingestion experiments where the caller owns execution and
+   * submits results; non-null whenever Mastra executes items (runner loop or
+   * per-item `runExperimentItem`).
+   */
+  targetType: TargetType | null;
+  targetId: string | null;
+  /** Run-level scorer IDs pinned at create time. See {@link Experiment.scorerIds}. */
+  scorerIds?: string[] | null;
   totalItems: number;
+  /**
+   * Multi-tenant organization/account scope. Should be hydrated from the parent
+   * dataset on create so experiments inherit their dataset's tenancy bucket.
+   */
+  organizationId?: string | null;
+  /**
+   * Platform project scope. Pairs with {@link CreateExperimentInput.organizationId}
+   * to form the (organizationId, projectId) tenancy bucket. Hydrated from the
+   * parent dataset on create.
+   */
+  projectId?: string | null;
 }
 
 export interface UpdateExperimentInput {
@@ -2411,13 +3027,87 @@ export interface AddExperimentResultInput {
   input: unknown;
   output: unknown | null;
   groundTruth: unknown | null;
+  metadata?: Record<string, unknown> | null;
   error: { message: string; stack?: string; code?: string } | null;
   startedAt: Date;
   completedAt: Date;
   retryCount: number;
+  /**
+   * Zero-based repetition index. Defaults to `0`. See
+   * {@link ExperimentResult.attempt} for the identity contract.
+   */
+  attempt?: number;
   traceId?: string | null;
   status?: ExperimentResultStatus | null;
   tags?: string[] | null;
+  /**
+   * Tool mock diagnostics for this item run. `null`/`undefined` both mean "no
+   * report" (the item ran without tool mocks). A present report means the item
+   * ran with mocks — see `served`/`unconsumed`/`liveCalls`/`failure`.
+   */
+  toolMockReport?: DatasetToolMockReport | null;
+  /** Multi-tenant organization/account scope. Should be hydrated from the parent experiment on insert. */
+  organizationId?: string | null;
+  /** Platform project scope. Hydrated from the parent experiment on insert. */
+  projectId?: string | null;
+}
+
+/**
+ * Input for {@link ExperimentsStorage.upsertExperimentResult}. Identical to
+ * {@link AddExperimentResultInput} minus the caller-supplied `id`: the row is
+ * identified by the natural key `(experimentId, itemId, attempt)` instead.
+ * Submitting the same key twice converges on a single row (last write wins),
+ * which makes retried external submissions idempotent.
+ */
+export type UpsertExperimentResultInput = Omit<AddExperimentResultInput, 'id'>;
+
+/**
+ * Multi-tenant scoping filters for experiment queries. Mirrors
+ * {@link DatasetTenancyFilters} so the experiments domain can be queried
+ * within a tenancy bucket using the same shape.
+ */
+export interface ExperimentTenancyFilters {
+  organizationId?: string;
+  projectId?: string;
+}
+
+/**
+ * Multi-tenant scoping filters for score queries. Mirrors
+ * {@link DatasetTenancyFilters} so the scores domain can be queried
+ * within a tenancy bucket using the same shape.
+ */
+export interface ScoreTenancyFilters {
+  organizationId?: string;
+  projectId?: string;
+}
+
+export interface ListScoresByScorerIdInput {
+  scorerId: string;
+  pagination: StoragePagination;
+  entityId?: string;
+  entityType?: string;
+  source?: ScoringSource;
+  filters?: ScoreTenancyFilters;
+}
+
+export interface ListScoresByRunIdInput {
+  runId: string;
+  pagination: StoragePagination;
+  filters?: ScoreTenancyFilters;
+}
+
+export interface ListScoresByEntityIdInput {
+  entityId: string;
+  entityType: string;
+  pagination: StoragePagination;
+  filters?: ScoreTenancyFilters;
+}
+
+export interface ListScoresBySpanInput {
+  traceId: string;
+  spanId: string;
+  pagination: StoragePagination;
+  filters?: ScoreTenancyFilters;
 }
 
 export interface ListExperimentsInput {
@@ -2426,6 +3116,12 @@ export interface ListExperimentsInput {
   targetId?: string;
   agentVersion?: string;
   status?: ExperimentStatus;
+  experimentSetId?: string;
+  comparisonId?: string;
+  variantId?: string;
+  trialIndex?: number;
+  /** Multi-tenant scoping filters. See {@link ExperimentTenancyFilters}. */
+  filters?: ExperimentTenancyFilters;
   pagination: StoragePagination;
 }
 
@@ -2438,6 +3134,8 @@ export interface ListExperimentResultsInput {
   experimentId: string;
   traceId?: string;
   status?: ExperimentResultStatus;
+  /** Multi-tenant scoping filters. See {@link ExperimentTenancyFilters}. */
+  filters?: ExperimentTenancyFilters;
   pagination: StoragePagination;
 }
 
@@ -2453,3 +3151,131 @@ export interface ExperimentReviewCounts {
   reviewed: number;
   complete: number;
 }
+
+// ============================================
+// Favorites Storage Types
+// ============================================
+
+/**
+ * Entity types that can be favorited.
+ * Currently agents and skills; extend here when other entities opt in.
+ */
+export type StorageFavoriteEntityType = 'agent' | 'skill';
+
+export const STORAGE_FAVORITE_ENTITY_TYPES = ['agent', 'skill'] as const satisfies readonly StorageFavoriteEntityType[];
+
+/**
+ * A single favorite row: one user favoriting one entity. Composite primary key is
+ * `(userId, entityType, entityId)`. Idempotent — re-favoriting is a no-op.
+ */
+export interface StorageFavoriteType {
+  /** Caller identifier (matches authorId conventions used elsewhere). */
+  userId: string;
+  /** Type of entity being favorited. */
+  entityType: StorageFavoriteEntityType;
+  /** ID of the entity being favorited. */
+  entityId: string;
+  /** Timestamp the favorite was created. */
+  createdAt: Date;
+}
+
+/** Identifier for a favorite row, used by lookup and delete operations. */
+export type StorageFavoriteKey = {
+  userId: string;
+  entityType: StorageFavoriteEntityType;
+  entityId: string;
+};
+
+/**
+ * Input to look up which entities in a candidate set are favorited by a given
+ * user. Used to annotate list responses without N+1 queries.
+ */
+export type StorageIsFavoritedBatchInput = {
+  userId: string;
+  entityType: StorageFavoriteEntityType;
+  entityIds: string[];
+};
+
+/** Input to list all entity IDs favorited by a given user, optionally scoped by entity type. */
+export type StorageListFavoritesInput = {
+  userId: string;
+  entityType: StorageFavoriteEntityType;
+};
+
+/**
+ * Input to remove all favorites for a given entity. Called by hard-delete handlers
+ * so favorite rows do not orphan the deleted entity.
+ */
+export type StorageDeleteFavoritesForEntityInput = {
+  entityType: StorageFavoriteEntityType;
+  entityId: string;
+};
+
+/** Identity bucketing for a persisted tool provider connection row. */
+export type StorageToolProviderConnectionScope = 'shared' | 'per-author' | 'caller-supplied';
+
+/**
+ * A persisted tool provider connection row. Stores a per-author, provider-agnostic
+ * label so the UI can surface a stable name (e.g. "Work Gmail") for the same
+ * `connectionId` across agents. Unique on `(authorId, providerId, connectionId)`.
+ */
+export interface StorageToolProviderConnection {
+  /**
+   * Author/owner the connection belongs to. `'default'` when auth is disabled.
+   * Set to the shared bucket id when `scope === 'shared'`. When
+   * `scope === 'caller-supplied'`, this is a host-app end-user identifier
+   * forwarded via request context.
+   */
+  authorId: string;
+  /** Tool provider id, e.g. `'composio'`. */
+  providerId: string;
+  /** Toolkit slug, e.g. `'gmail'`. */
+  toolkit: string;
+  /** Adapter-native connection identifier (e.g. Composio `ca_...`). */
+  connectionId: string;
+  /** User-supplied display label. `null` when the user hasn't named it yet. */
+  label: string | null;
+  /**
+   * Identity bucketing. `'per-author'` is the default; `'shared'` makes the
+   * row visible to all callers regardless of resolved authorId; `'caller-supplied'`
+   * means `authorId` is a host-app end-user identifier forwarded via request context.
+   */
+  scope: StorageToolProviderConnectionScope;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** Input to upsert a tool provider connection row. Idempotent on `(authorId, providerId, connectionId)`. */
+export type StorageUpsertToolProviderConnectionInput = {
+  authorId: string;
+  providerId: string;
+  toolkit: string;
+  connectionId: string;
+  label: string | null;
+  /** Defaults to `'per-author'` when omitted. */
+  scope?: StorageToolProviderConnectionScope;
+};
+
+/** Lookup key for a single tool provider connection row. */
+export type StorageToolProviderConnectionKey = {
+  authorId: string;
+  providerId: string;
+  connectionId: string;
+};
+
+/** Input for listing tool provider connections, optionally scoped by author/provider/toolkit. */
+export type StorageListToolProviderConnectionsInput = {
+  /** Omit to list across all authors (admin cross-author listing). */
+  authorId?: string;
+  providerId?: string;
+  toolkit?: string;
+  /** Optional scope filter. Omit to list rows of any scope. */
+  scope?: StorageToolProviderConnectionScope;
+};
+
+/** Input for deleting a single tool provider connection row. */
+export type StorageDeleteToolProviderConnectionInput = {
+  authorId: string;
+  providerId: string;
+  connectionId: string;
+};

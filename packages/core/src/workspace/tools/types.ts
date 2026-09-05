@@ -55,6 +55,37 @@ export type DynamicToolConfigValue<TContext = ToolConfigContext> =
   | boolean
   | ((context: TContext) => boolean | Promise<boolean>);
 
+export interface WorkspaceToolHookContext {
+  /** The name exposed to the model after any per-tool `name` remap. */
+  toolName: string;
+  /** The built-in workspace tool name before any `name` remap. */
+  workspaceToolName: WorkspaceToolName;
+  /** Input passed to the tool. */
+  input: unknown;
+  /** Execution context passed to the tool. */
+  context: unknown;
+}
+
+export interface WorkspaceToolBeforeHookResult {
+  /** Set to false to skip the tool execution and return `output` instead. */
+  proceed: false;
+  output: unknown;
+}
+
+export interface WorkspaceToolAfterHookContext extends WorkspaceToolHookContext {
+  /** Tool output when execution completed. Undefined when execution failed before producing output. */
+  output?: unknown;
+  /** Error thrown by the tool, if execution failed. */
+  error?: unknown;
+}
+
+export interface WorkspaceToolHooks {
+  beforeToolCall?: (
+    context: WorkspaceToolHookContext,
+  ) => void | WorkspaceToolBeforeHookResult | Promise<void | WorkspaceToolBeforeHookResult>;
+  afterToolCall?: (context: WorkspaceToolAfterHookContext) => void | Promise<void>;
+}
+
 // =============================================================================
 // Tool Configuration Types
 // =============================================================================
@@ -121,6 +152,10 @@ export interface BackgroundProcessExitMeta extends BackgroundProcessMeta {
   exitCode: number;
   stdout: string;
   stderr: string;
+  stdoutTruncated?: boolean;
+  stderrTruncated?: boolean;
+  stdoutDroppedBytes?: number;
+  stderrDroppedBytes?: number;
 }
 
 /**
@@ -155,6 +190,100 @@ export interface BackgroundProcessConfig {
 export interface ExecuteCommandToolConfig extends WorkspaceToolConfig {
   /** Configuration for background process callbacks and abort behavior. */
   backgroundProcesses?: BackgroundProcessConfig;
+}
+
+/**
+ * Extended configuration for the read_file tool.
+ *
+ * Controls which mime types are surfaced to the model as media parts (image
+ * or file parts the model can natively consume). Text-like files are still
+ * read as text; non-text binaries that don't match fall back to a
+ * metadata-only result (path, size, mime type) so the agent knows about
+ * the file without dumping useless base64 into context.
+ *
+ * - **Array of globs** — e.g. `['image/*']`, `['image/*', 'application/pdf']`
+ * - **Function** — `(mimeType: string) => boolean`
+ * - **`false`** — disable media parts; non-text binaries fall back to
+ *   metadata-only output unless an explicit `encoding` is provided
+ *
+ * Only applies when the caller doesn't pass an explicit `encoding` (since an
+ * explicit encoding is a clear request for raw bytes/text).
+ *
+ * The default is the cross-provider-safe intersection of image formats
+ * (`image/png`, `image/jpeg`, `image/webp`) plus
+ * `application/pdf`. Use `['image/*']` (or a function) if you want to
+ * surface exotic subtypes like SVG/BMP/HEIC.
+ *
+ * @example
+ * ```ts
+ * // Surface any image (including SVG, BMP, HEIC) — may fail on some providers
+ * mastra_workspace_read_file: { mediaTypes: ['image/*'] }
+ *
+ * // Disable media parts entirely
+ * mastra_workspace_read_file: { mediaTypes: false }
+ *
+ * // Custom predicate
+ * mastra_workspace_read_file: { mediaTypes: (mime) => mime.startsWith('image/') }
+ *
+ * // Raise the inline-media size cap to 25 MiB
+ * mastra_workspace_read_file: { maxMediaBytes: 25 * 1024 * 1024 }
+ * ```
+ */
+export interface ReadFileToolConfig extends WorkspaceToolConfig {
+  /**
+   * Which mime types to surface to the model as media parts (file/image
+   * parts) rather than as text. Defaults to the cross-provider-safe set
+   * `['image/png', 'image/jpeg', 'image/webp', 'application/pdf']`.
+   * Pass `false` to disable media detection; non-text binaries then fall
+   * back to metadata-only output unless an explicit `encoding` is provided.
+   */
+  mediaTypes?: string[] | ((mimeType: string) => boolean) | false;
+  /**
+   * Maximum file size (in bytes) to read inline as a media part. Files
+   * larger than this fall back to metadata-only output rather than being
+   * fully base64-encoded into the model context and persisted in storage.
+   * Defaults to 10 MiB (10 * 1024 * 1024).
+   */
+  maxMediaBytes?: number;
+}
+
+/**
+ * Extended configuration for the computer (desktop) tools.
+ *
+ * Applies to the `mastra_workspace_computer_*` tools emitted when the
+ * workspace sandbox supports the computer capability.
+ *
+ * @example
+ * ```ts
+ * tools: {
+ *   // Don't attach a screenshot to click results
+ *   mastra_workspace_computer_click: { screenshotAfterAction: false },
+ *
+ *   // Require approval for typing on the desktop
+ *   mastra_workspace_computer_type: { requireApproval: true },
+ * }
+ * ```
+ */
+export interface ComputerToolConfig extends WorkspaceToolConfig {
+  /**
+   * For action tools (click/type/scroll/…): attach a fresh screenshot to the
+   * tool result after the action completes, so computer-use loops see the
+   * resulting desktop state without an extra screenshot call. Default: true.
+   * Ignored by the screenshot tool itself.
+   */
+  screenshotAfterAction?: boolean;
+  /**
+   * Delay (ms) between an action and its post-action screenshot, giving the
+   * UI time to react (menus, animations). Default: 500.
+   */
+  screenshotDelayMs?: number;
+  /**
+   * Maximum screenshot size (in bytes) to return inline as a media part.
+   * Larger screenshots fall back to text-only output rather than being
+   * fully base64-encoded into the model context and persisted in storage.
+   * Defaults to 10 MiB (10 * 1024 * 1024).
+   */
+  maxMediaBytes?: number;
 }
 
 // =============================================================================
@@ -205,6 +334,37 @@ export type WorkspaceToolsConfig = {
 
   /** Default: whether all tools require user approval (default: false if not specified) */
   requireApproval?: DynamicToolConfigValue<ToolConfigWithArgsContext>;
+
+  /**
+   * Optional hooks run around every enabled workspace tool after name remapping.
+   * If the owning agent also defines hooks, workspace hooks run inside the agent hook wrapper.
+   */
+  hooks?: WorkspaceToolHooks;
+
+  /**
+   * Maximum time (ms) a single write-tool call may hold the per-file write lock
+   * before it is rejected with a `write-lock timeout` error. Default: 30 000.
+   *
+   * The default suits a local filesystem, where a write is a sub-second
+   * operation. Raise it when writes go somewhere slower — a remote or
+   * cold-starting sandbox filesystem can legitimately take minutes to accept
+   * its first write, and the default rejects those before they ever land.
+   */
+  writeLockTimeoutMs?: number;
 } & {
   [K in typeof WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND]?: ExecuteCommandToolConfig;
-} & Partial<Record<Exclude<WorkspaceToolName, typeof WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND>, WorkspaceToolConfig>>;
+} & {
+  [K in typeof WORKSPACE_TOOLS.FILESYSTEM.READ_FILE]?: ReadFileToolConfig;
+} & {
+  [K in (typeof WORKSPACE_TOOLS.COMPUTER)[keyof typeof WORKSPACE_TOOLS.COMPUTER]]?: ComputerToolConfig;
+} & Partial<
+    Record<
+      Exclude<
+        WorkspaceToolName,
+        | typeof WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND
+        | typeof WORKSPACE_TOOLS.FILESYSTEM.READ_FILE
+        | (typeof WORKSPACE_TOOLS.COMPUTER)[keyof typeof WORKSPACE_TOOLS.COMPUTER]
+      >,
+      WorkspaceToolConfig
+    >
+  >;

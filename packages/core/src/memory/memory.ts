@@ -1,7 +1,7 @@
 import type { AssistantContent, UserContent, CoreMessage } from '@internal/ai-sdk-v4';
 import type { MastraDBMessage } from '../agent/message-list';
 import { MastraFGAPermissions } from '../auth/ee';
-import type { MastraFGAPermissionInput } from '../auth/ee';
+import type { MastraFGAPermissionInput, ActorSignal } from '../auth/ee';
 import { MastraBase } from '../base';
 import { ErrorDomain, MastraError } from '../error';
 import { ModelRouterEmbeddingModel } from '../llm/model';
@@ -303,13 +303,24 @@ https://mastra.ai/en/docs/memory/overview`,
             values: ['a'],
             ...(this.embedderOptions || {}),
           } as any);
-          return result.embeddings[0]?.length;
+          const dimension = result.embeddings[0]?.length;
+          if (!dimension) {
+            throw new Error('Embedder returned no usable embedding for the dimension probe.');
+          }
+          return dimension;
         } catch (e) {
-          console.warn(
-            `[Mastra Memory] Failed to probe embedder for dimension, falling back to default. ` +
-              `This may cause index name mismatches if the embedder uses non-default dimensions. Error: ${e}`,
+          throw new MastraError(
+            {
+              id: 'MASTRA_MEMORY_GET_EMBEDDING_DIMENSION_FAILED',
+              domain: ErrorDomain.MASTRA_VECTOR,
+              category: 'THIRD_PARTY',
+              text:
+                `Failed to determine the embedder's output dimension. Semantic recall cannot safely select a ` +
+                `vector index until the embedder returns a usable embedding. Check that the embedder is reachable ` +
+                `and correctly configured.`,
+            },
+            e,
           );
-          return undefined;
         }
       })();
     }
@@ -525,10 +536,47 @@ https://mastra.ai/en/docs/memory/overview`,
   }
 
   /**
+   * Helper method to update an existing thread
+   * @param id - The thread ID to update
+   * @param title - The new title for the thread
+   * @param metadata - The new metadata for the thread
+   * @param memoryConfig - Optional memory config
+   * @returns Promise resolving to the updated thread
+   */
+  abstract updateThread({
+    id,
+    title,
+    metadata,
+    memoryConfig,
+  }: {
+    id: string;
+    title?: string;
+    metadata?: Record<string, unknown>;
+    memoryConfig?: MemoryConfigInternal;
+  }): Promise<StorageThreadType>;
+
+  /**
    * Helper method to delete a thread
    * @param threadId - the id of the thread to delete
    */
   abstract deleteThread(threadId: string): Promise<void>;
+
+  /**
+   * Resolve once all background work this memory started has finished.
+   *
+   * Some memory work continues after an agent run returns, and it writes to storage.
+   * Callers that own the storage connection should await this before closing it,
+   * otherwise background statements can race the close.
+   *
+   * ```ts
+   * await agent.generate('hello', { memory: { thread, resource } });
+   * await memory.settled();
+   * await store.close();
+   * ```
+   *
+   * Implementations that do no background work can leave this as a no-op.
+   */
+  async settled(): Promise<void> {}
 
   /**
    * Helper method to add a single message to a thread
@@ -571,11 +619,12 @@ https://mastra.ai/en/docs/memory/overview`,
    */
   static async checkThreadFGA(options: {
     mastra?: Mastra;
-    user: Record<string, unknown>;
+    user?: Record<string, unknown>;
     threadId: string;
     resourceId?: string;
     requestContext?: RequestContext;
     permission?: MastraFGAPermissionInput;
+    actor?: ActorSignal;
   }): Promise<void> {
     const {
       mastra,
@@ -584,23 +633,29 @@ https://mastra.ai/en/docs/memory/overview`,
       resourceId,
       requestContext,
       permission = MastraFGAPermissions.MEMORY_READ,
+      actor,
     } = options;
     const fgaProvider = mastra?.getServer()?.fga;
     if (!fgaProvider) return;
 
-    const { checkFGA } = await import('../auth/ee/fga-check');
-    await checkFGA({
+    const { requireFGA } = await import('../auth/ee/fga-check');
+    await requireFGA({
       fgaProvider,
       user,
       resource: { type: 'thread', id: threadId },
       permission,
+      requestContext,
+      actor,
       context:
         resourceId || requestContext
           ? {
               resourceId,
-              requestContext,
             }
           : undefined,
+      metadata: {
+        threadId,
+        resourceId,
+      },
     });
   }
 
@@ -686,7 +741,14 @@ https://mastra.ai/en/docs/memory/overview`,
     const isWorkingMemoryEnabled =
       typeof effectiveConfig.workingMemory === 'object' && effectiveConfig.workingMemory.enabled !== false;
 
-    if (isWorkingMemoryEnabled) {
+    // When useStateSignals is opted in, the WorkingMemoryStateProcessor delivers
+    // working memory via the state-signal lane. Skip the legacy system-message
+    // injection so the model doesn't receive the WORKING_MEMORY_SYSTEM_INSTRUCTION
+    // block alongside the signal.
+    const useStateSignals =
+      typeof effectiveConfig.workingMemory === 'object' && effectiveConfig.workingMemory.useStateSignals === true;
+
+    if (isWorkingMemoryEnabled && !useStateSignals) {
       if (!memoryStore)
         throw new MastraError({
           category: 'USER',
@@ -1031,6 +1093,7 @@ https://mastra.ai/en/docs/memory/overview`,
         bufferActivation: obs.bufferActivation,
         blockAfter: obs.blockAfter,
         previousObserverTokens: obs.previousObserverTokens,
+        observeAttachments: obs.observeAttachments,
       };
       const obsModelId = extractModelIdString(obs.model);
       if (obsModelId) {

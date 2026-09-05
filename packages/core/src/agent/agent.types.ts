@@ -1,16 +1,22 @@
 import type { ModelMessage, ToolChoice } from '@internal/ai-sdk-v5';
-import type { MastraScorer, MastraScorers, ScoringSamplingConfig } from '../evals';
+import type { ActorSignal } from '../auth/ee';
+import type { WaitUntilFn } from '../channels/wait-until';
+import type { MastraScorer, MastraScorers, ScoringFilter, ScoringSamplingConfig } from '../evals';
 import type { SystemMessage } from '../llm';
 import type { ProviderOptions } from '../llm/model/provider-options';
-import type { MastraLanguageModel } from '../llm/model/shared.types';
+import type { MastraLanguageModel, MastraModelConfig } from '../llm/model/shared.types';
 import type { CompletionConfig, CompletionRunResult } from '../loop/network/validation';
-import type { LoopConfig, LoopOptions, PrepareStepFunction } from '../loop/types';
+import type { LoopConfig, LoopOptions, PrepareStepFunction, ToolCallConcurrency } from '../loop/types';
 import type { VersionOverrides } from '../mastra/types';
 import type { ObservabilityContext, TracingOptions } from '../observability';
 import type { ErrorProcessorOrWorkflow, InputProcessorOrWorkflow, OutputProcessorOrWorkflow } from '../processors';
 import type { RequestContext } from '../request-context';
-import type { OutputWriter } from '../workflows/types';
+import type { MastraStreamTransformOptions } from '../stream/types';
+import type { MCPToolExecutionContext, RequireToolApproval, ToolHooks, ToolPayloadTransformPolicy } from '../tools';
+import type { DynamicArgument } from '../types';
+import type { OutputWriter, WorkflowRunState } from '../workflows/types';
 import type { MessageListInput } from './message-list';
+import type { SubAgentGenerateResult } from './subagent';
 import type {
   AgentMemoryOption,
   ToolsetsInput,
@@ -101,6 +107,14 @@ export interface DelegationStartContext {
   toolCallId: string;
   /** Messages accumulated so far */
   messages: MastraDBMessage[];
+  /**
+   * The request context the delegated run will receive. Entries are shallowly
+   * copied from the parent run's context, excluding `MastraMemory` and the
+   * reserved thread/resource keys. Mutate it with `requestContext.set()` to add
+   * entries without modifying the parent's context map. Values must be
+   * JSON-serializable to work with durable agents.
+   */
+  requestContext: RequestContext;
 }
 
 /**
@@ -142,6 +156,32 @@ export interface DelegationCompleteContext {
     text: string;
     subAgentThreadId?: string;
     subAgentResourceId?: string;
+    /**
+     * Why the sub-agent stopped generating (e.g. 'stop', 'tool-calls').
+     * Use this to detect a sub-agent that stopped on a tool-calls step and
+     * returned empty text. Populated on the generate and stream paths for
+     * v2 models; undefined on legacy (v1) paths.
+     */
+    finishReason?: SubAgentGenerateResult['finishReason'];
+    /**
+     * Results of the tools the sub-agent executed during the delegation.
+     * Always attached on the generate and stream paths for v2 models.
+     */
+    subAgentToolResults?: Array<{
+      toolName: string;
+      toolCallId: string;
+      result?: unknown;
+      args?: unknown;
+      isError?: boolean;
+    }>;
+    /** Aggregate token usage from the sub-agent's execution */
+    usage?: {
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      reasoningTokens?: number;
+      cachedInputTokens?: number;
+    };
   };
   /** Duration of the delegation in milliseconds */
   duration: number;
@@ -174,6 +214,17 @@ export interface DelegationCompleteContext {
 export interface DelegationCompleteResult {
   /** Optional feedback to add to the conversation */
   feedback?: string;
+  /**
+   * Replaces the text the parent model sees as this delegation's tool result,
+   * within the current run.
+   *
+   * `feedback` is persisted to the parent's memory and therefore only reaches the
+   * model on the next turn. Use `resultText` when the sub-agent's own result would
+   * mislead the parent right now — for example when the sub-agent stopped on a
+   * tool-calls step and returned empty text, which reads to the model as a
+   * successful but empty delegation.
+   */
+  resultText?: string;
 }
 
 /**
@@ -182,6 +233,29 @@ export interface DelegationCompleteResult {
 export type OnDelegationCompleteHandler = (
   context: DelegationCompleteContext,
 ) => DelegationCompleteResult | void | Promise<DelegationCompleteResult | void>;
+
+/**
+ * A delegation lifecycle hook that threw.
+ *
+ * Recorded on the run's request context under `__mastra_delegationHookErrors`
+ * whenever a hook throws, regardless of the configured
+ * {@link DelegationConfig.hookErrorStrategy}, so callers can detect
+ * "delegation completed but the hook failed" without inspecting logs.
+ */
+export interface DelegationHookError {
+  /** Which hook threw */
+  hook: 'onDelegationStart' | 'onDelegationComplete' | 'messageFilter';
+  /** The ID of the delegated primitive */
+  primitiveId: string;
+  /** Tool call ID from the LLM */
+  toolCallId: string;
+  /** ID of the current run */
+  runId: string;
+  /** The error name */
+  name: string;
+  /** The error message */
+  message: string;
+}
 
 // ============================================================================
 // Iteration Hook Types
@@ -300,8 +374,21 @@ export interface DelegationConfig {
    * ```
    */
   messageFilter?: (context: MessageFilterContext) => MastraDBMessage[] | Promise<MastraDBMessage[]>;
-}
 
+  /**
+   * How a throwing delegation hook is handled.
+   *
+   * - `'warn'` (default): log the error and continue with unmodified values.
+   * - `'throw'`: fail the delegation. A throwing `onDelegationStart` blocks it,
+   *   and a throwing `messageFilter` or `onDelegationComplete` surfaces as a
+   *   tool failure to the parent agent.
+   *
+   * Regardless of the strategy, hook failures are recorded on the run's request
+   * context under `__mastra_delegationHookErrors` as {@link DelegationHookError}
+   * entries, so a completed-but-hook-failed delegation is always detectable.
+   */
+  hookErrorStrategy?: 'warn' | 'throw';
+}
 /**
  * Configuration for the routing agent's behavior.
  */
@@ -332,6 +419,9 @@ export interface NetworkRoutingConfig {
  * Full configuration options for agent.network() execution.
  */
 export type NetworkOptions<OUTPUT = undefined> = {
+  /** Model used by the routing agent for this execution */
+  model?: DynamicArgument<MastraModelConfig>;
+
   /** Memory configuration for conversation persistence and retrieval */
   memory?: AgentMemoryOption;
 
@@ -456,6 +546,20 @@ export type AgentExecutionOptionsBase<OUTPUT> = {
   /** Memory configuration for conversation persistence and retrieval */
   memory?: AgentMemoryOption;
 
+  /**
+   * Serverless runtime helpers. Use these when the platform freezes the
+   * isolate after the HTTP response so detached finish-time work (e.g. thread
+   * title generation) would otherwise be dropped.
+   */
+  serverless?: {
+    /**
+     * Platform `waitUntil` (Vercel `@vercel/functions`, Cloudflare
+     * `ExecutionContext.waitUntil`, etc.). Registers fire-and-forget finish
+     * work so the isolate stays alive until it settles.
+     */
+    waitUntil?: WaitUntilFn;
+  };
+
   /** Unique identifier for this execution run */
   runId?: string;
 
@@ -464,6 +568,12 @@ export type AgentExecutionOptionsBase<OUTPUT> = {
 
   /** Request Context containing dynamic configuration and state */
   requestContext?: RequestContext<any>; // @TODO: Figure out how to type this without breaking all the inner types
+
+  /** Trusted server-side signal for this agent FGA check. */
+  actor?: ActorSignal;
+
+  /** MCP protocol context forwarded to tools executed by this agent. */
+  mcp?: MCPToolExecutionContext;
 
   /**
    * Per-invocation version overrides for sub-agents (and future primitives).
@@ -515,6 +625,8 @@ export type AgentExecutionOptionsBase<OUTPUT> = {
   toolsets?: ToolsetsInput;
   /** Client-side tools available during execution */
   clientTools?: ToolsInput;
+  /** Per-execution hooks that run before and after tool calls, overriding matching agent-level hooks. */
+  hooks?: ToolHooks;
   /** Tool selection strategy: 'auto', 'none', 'required', or specific tools */
   toolChoice?: ToolChoice<any>;
 
@@ -522,7 +634,9 @@ export type AgentExecutionOptionsBase<OUTPUT> = {
   modelSettings?: LoopOptions['modelSettings'];
 
   /** Evaluation scorers to run on the execution results */
-  scorers?: MastraScorers | Record<string, { scorer: MastraScorer['name']; sampling?: ScoringSamplingConfig }>;
+  scorers?:
+    | MastraScorers
+    | Record<string, { scorer: MastraScorer['name']; sampling?: ScoringSamplingConfig; filter?: ScoringFilter }>;
   /** Whether to return detailed scoring data in the response */
   returnScorerData?: boolean;
   /** tracing options for starting new traces */
@@ -560,17 +674,46 @@ export type AgentExecutionOptionsBase<OUTPUT> = {
    */
   isTaskComplete?: StreamIsTaskCompleteConfig;
 
-  /** Require approval for all tool calls */
-  requireToolApproval?: boolean;
+  /**
+   * Require approval for tool calls. Pass `true` to require approval for every tool call,
+   * or a function evaluated per call (with the tool name, args, and request context) to
+   * decide conditionally — e.g. to gate approval by a regex on the tool name.
+   */
+  requireToolApproval?: RequireToolApproval;
 
   /** Automatically resume suspended tools */
   autoResumeSuspendedTools?: boolean;
 
-  /** Maximum number of tool calls to execute concurrently (default: 1 when approval may be required, otherwise 10) */
-  toolCallConcurrency?: number;
+  /**
+   * Controls how many tool calls execute concurrently.
+   *
+   * Pass a number to set the limit (default: 10). By default ("available"
+   * strategy) any registered approval/suspend-capable tool forces sequential
+   * execution (limit 1) for every step, even when the model did not call it.
+   *
+   * Pass an object to opt into the "called" strategy, which resolves
+   * concurrency from the tools the model actually called each step — a batch of
+   * only safe tools runs concurrently even while an approval/suspend tool stays
+   * registered, while a batch that calls an approval/suspend tool still runs
+   * sequentially:
+   *
+   * ```ts
+   * toolCallConcurrency: { limit: 8, strategy: 'called' }
+   * ```
+   */
+  toolCallConcurrency?: ToolCallConcurrency;
 
   /** Whether to include raw chunks in the stream output (not available on all model providers) */
   includeRawChunks?: boolean;
+
+  /**
+   * Experimental transforms applied to `MastraModelOutput.fullStream`.
+   * Transform factories create a fresh `TransformStream` for every consumer.
+   */
+  experimentalTransform?: MastraStreamTransformOptions<OUTPUT>;
+
+  /** Per-invocation transform policy for tool payloads in display and transcript serializers. */
+  transform?: ToolPayloadTransformPolicy;
 
   /**
    * Callback fired after each iteration (LLM call) completes.
@@ -624,10 +767,39 @@ export type AgentExecutionOptionsBase<OUTPUT> = {
   disableBackgroundTasks?: boolean;
 
   /**
+   * When set, keeps the stream open across background-task continuations.
+   * The agent will automatically re-invoke the LLM when background tasks
+   * complete, streaming those continuation turns through the same
+   * `fullStream`. The stream closes when no background tasks remain and
+   * no queued completions are pending.
+   *
+   * Pass `true` to enable with default settings (5 minute idle timeout),
+   * or pass an object to configure `maxIdleMs`.
+   *
+   * Requires memory to be configured on the agent (continuations need
+   * conversation persistence). Falls through to a regular `stream()` call
+   * if memory is not available.
+   *
+   * @example
+   * ```typescript
+   * const result = await agent.stream('Research solana for me', {
+   *   untilIdle: true,
+   *   memory: { thread: 't1', resource: 'u1' },
+   * });
+   *
+   * for await (const chunk of result.fullStream) {
+   *   // initial turn + continuation turns from bg task completions
+   * }
+   * ```
+   */
+  untilIdle?: boolean | { maxIdleMs?: number };
+
+  /**
    * @internal
    * When true, the in-loop `backgroundTaskCheckStep` returns immediately
    * without waiting for running tasks to complete. Set by
-   * `agent.streamUntilIdle`, which drives continuation from outside the loop.
+   * `agent.streamUntilIdle` / `stream({ untilIdle })`, which drives
+   * continuation from outside the loop.
    */
   _skipBgTaskWait?: boolean;
 } & Partial<ObservabilityContext>;
@@ -637,14 +809,22 @@ export type AgentExecutionOptionsBase<OUTPUT> = {
  * Use this type for public method signatures.
  */
 export type PublicAgentExecutionOptions<OUTPUT = unknown> = AgentExecutionOptionsBase<OUTPUT> &
-  (OUTPUT extends {} ? { structuredOutput: PublicStructuredOutputOptions<OUTPUT> } : { structuredOutput?: never });
+  ([NonNullable<OUTPUT>] extends [never]
+    ? { structuredOutput?: never }
+    : OUTPUT extends {}
+      ? { structuredOutput: PublicStructuredOutputOptions<OUTPUT> }
+      : { structuredOutput?: never });
 
 /**
  * Internal agent execution options that require StandardSchemaWithJSON.
  * Use this type internally after converting from PublicSchema.
  */
 export type AgentExecutionOptions<OUTPUT = unknown> = AgentExecutionOptionsBase<OUTPUT> &
-  (OUTPUT extends {} ? { structuredOutput: StructuredOutputOptions<OUTPUT> } : { structuredOutput?: never });
+  ([NonNullable<OUTPUT>] extends [never]
+    ? { structuredOutput?: never }
+    : OUTPUT extends {}
+      ? { structuredOutput: StructuredOutputOptions<OUTPUT> }
+      : { structuredOutput?: never });
 
 export type InnerAgentExecutionOptions<OUTPUT = unknown> = AgentExecutionOptionsBase<OUTPUT> & {
   outputWriter?: OutputWriter;
@@ -655,7 +835,11 @@ export type InnerAgentExecutionOptions<OUTPUT = unknown> = AgentExecutionOptions
   /** Internal: Whether the execution is a resume */
   resumeContext?: {
     resumeData: any;
-    snapshot: any;
+    snapshot: WorkflowRunState;
   };
   toolCallId?: string;
-} & (OUTPUT extends {} ? { structuredOutput: StructuredOutputOptions<OUTPUT> } : { structuredOutput?: never });
+} & ([NonNullable<OUTPUT>] extends [never]
+    ? { structuredOutput?: never }
+    : OUTPUT extends {}
+      ? { structuredOutput: StructuredOutputOptions<OUTPUT> }
+      : { structuredOutput?: never });

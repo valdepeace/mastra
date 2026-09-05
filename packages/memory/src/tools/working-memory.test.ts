@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { deepMergeWorkingMemory } from './working-memory';
+import { z } from 'zod';
+import { deepMergeWorkingMemory, updateWorkingMemoryTool } from './working-memory';
 
 describe('deepMergeWorkingMemory', () => {
   describe('null/undefined/empty update handling', () => {
@@ -96,6 +97,25 @@ describe('deepMergeWorkingMemory', () => {
 
       expect(result).toEqual({ a: 1, c: 3 });
     });
+
+    it('should drop null values on a first write when no existing memory exists', () => {
+      const result = deepMergeWorkingMemory(null, { name: 'Ada', role: null });
+
+      expect(result).toEqual({ name: 'Ada' });
+      expect('role' in result).toBe(false);
+    });
+
+    it('should drop null values on a first write when existing memory is undefined', () => {
+      const result = deepMergeWorkingMemory(undefined, { name: 'Ada', role: null });
+
+      expect(result).toEqual({ name: 'Ada' });
+    });
+
+    it('should return an empty object when a first write contains only nulls', () => {
+      const result = deepMergeWorkingMemory(null, { name: null, role: null });
+
+      expect(result).toEqual({});
+    });
   });
 
   describe('nested object merging', () => {
@@ -152,6 +172,23 @@ describe('deepMergeWorkingMemory', () => {
         name: 'Alice',
         work: { company: 'Acme', role: 'Engineer' },
       });
+    });
+
+    it('should drop nulls inside a nested object that did not exist before', () => {
+      const existing = { name: 'Ada' };
+      const update = { work: { company: 'Acme', manager: null } };
+      const result = deepMergeWorkingMemory(existing, update);
+
+      expect(result).toEqual({ name: 'Ada', work: { company: 'Acme' } });
+      expect('manager' in (result.work as Record<string, unknown>)).toBe(false);
+    });
+
+    it('should drop nulls in deeply nested branches that did not exist before', () => {
+      const result = deepMergeWorkingMemory(null, {
+        profile: { work: { company: 'Acme', manager: null }, alias: null },
+      });
+
+      expect(result).toEqual({ profile: { work: { company: 'Acme' } } });
     });
   });
 
@@ -247,5 +284,109 @@ describe('deepMergeWorkingMemory', () => {
 
       expect(update).toEqual(updateCopy);
     });
+
+    it('should not return the update object by reference when existing is null', () => {
+      const update = { name: 'Ada', nested: { key: 'value' } };
+      const result = deepMergeWorkingMemory(null, update);
+
+      expect(result).toEqual(update);
+      expect(result).not.toBe(update);
+      expect(result.nested).not.toBe(update.nested);
+
+      (result as { name: string }).name = 'Grace';
+      expect(update.name).toBe('Ada');
+    });
+  });
+});
+
+describe('updateWorkingMemoryTool schema validation (issue #17301)', () => {
+  const makeTool = () =>
+    updateWorkingMemoryTool({
+      workingMemory: { enabled: true, schema: z.object({ name: z.string(), age: z.number() }) },
+    } as any);
+
+  it('validates a Zod working-memory schema without code generation (new Function/eval)', async () => {
+    const inputSchema = makeTool().inputSchema as any;
+
+    const OriginalFunction = globalThis.Function;
+    const originalEval = globalThis.eval;
+    let codegenUsed = false;
+    const blowUp = () => {
+      codegenUsed = true;
+      throw new Error('Code generation from strings disallowed (e.g. Cloudflare Workers)');
+    };
+    // Emulate a runtime that forbids dynamic code generation. An AJV-compiled validator
+    // calls `new Function` synchronously inside validate(); the native Zod validator must not.
+    globalThis.Function = blowUp as unknown as FunctionConstructor;
+    globalThis.eval = blowUp as unknown as typeof eval;
+
+    let result: any;
+    try {
+      result = inputSchema['~standard'].validate({ memory: { name: 'Ada', age: 36 } });
+    } finally {
+      globalThis.Function = OriginalFunction;
+      globalThis.eval = originalEval;
+    }
+
+    const resolved = await result;
+    expect('issues' in resolved && resolved.issues).toBeFalsy();
+    expect(resolved.value).toEqual({ memory: { name: 'Ada', age: 36 } });
+    expect(codegenUsed).toBe(false);
+  });
+
+  it('returns issues for input that does not match the schema', async () => {
+    const inputSchema = makeTool().inputSchema as any;
+    const resolved = await inputSchema['~standard'].validate({ memory: { name: 'Ada', age: 'not-a-number' } });
+    expect('issues' in resolved && resolved.issues).toBeTruthy();
+  });
+
+  it('accepts the inner object when the model omits the `memory` wrapper', async () => {
+    const inputSchema = makeTool().inputSchema as any;
+    const resolved = await inputSchema['~standard'].validate({ name: 'Grace', age: 42 });
+    expect('issues' in resolved && resolved.issues).toBeFalsy();
+    expect(resolved.value).toEqual({ memory: { name: 'Grace', age: 42 } });
+  });
+
+  describe('null padding from strict-mode providers', () => {
+    const makePartialTool = () =>
+      updateWorkingMemoryTool({
+        workingMemory: {
+          enabled: true,
+          schema: z.object({
+            people: z.array(z.string()).optional(),
+            work: z.object({ company: z.string() }).optional(),
+          }),
+        },
+      } as any);
+
+    it('drops nulls for optional fields in the wrapped payload', async () => {
+      const inputSchema = makePartialTool().inputSchema as any;
+      const resolved = await inputSchema['~standard'].validate({
+        memory: { people: null, work: { company: 'TechStartup Inc' } },
+      });
+
+      expect('issues' in resolved && resolved.issues).toBeFalsy();
+      expect(resolved.value).toEqual({ memory: { work: { company: 'TechStartup Inc' } } });
+    });
+
+    it('drops nulls for optional fields in the unwrapped payload', async () => {
+      const inputSchema = makePartialTool().inputSchema as any;
+      const resolved = await inputSchema['~standard'].validate({
+        people: null,
+        work: { company: 'TechStartup Inc' },
+      });
+
+      expect('issues' in resolved && resolved.issues).toBeFalsy();
+      expect(resolved.value).toEqual({ memory: { work: { company: 'TechStartup Inc' } } });
+    });
+  });
+});
+
+describe('deepMergeWorkingMemory undefined padding', () => {
+  it('leaves existing values untouched when the update sends undefined', () => {
+    const existing = { people: ['Alice', 'Bob'], work: { company: 'Old Co' } };
+    const merged = deepMergeWorkingMemory(existing, { people: undefined, work: { company: 'TechStartup Inc' } });
+
+    expect(merged).toEqual({ people: ['Alice', 'Bob'], work: { company: 'TechStartup Inc' } });
   });
 });

@@ -1,34 +1,46 @@
-import {
-  Button,
-  ButtonWithTooltip,
-  ErrorState,
-  ListSearch,
-  NoDataPageLayout,
-  PageHeader,
-  PageLayout,
-  PermissionDenied,
-  SessionExpired,
-  is401UnauthorizedError,
-  is403ForbiddenError,
-} from '@mastra/playground-ui';
-import { BookIcon, FileTextIcon, Plus } from 'lucide-react';
-import { useState } from 'react';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { ErrorState } from '@mastra/playground-ui/components/ErrorState';
+import { ListSearch } from '@mastra/playground-ui/components/ListSearch';
+import { NoDataPageLayout, PageLayout } from '@mastra/playground-ui/components/PageLayout';
+import { PermissionDenied } from '@mastra/playground-ui/components/PermissionDenied';
+import { SessionExpired } from '@mastra/playground-ui/components/SessionExpired';
+import { is401UnauthorizedError, is403ForbiddenError } from '@mastra/playground-ui/utils/errors';
+import { Plus } from 'lucide-react';
+import { useCallback, useState } from 'react';
 import { Link } from 'react-router';
 import { useIsCmsAvailable } from '@/domains/cms/hooks/use-is-cms-available';
 import { useStoredPromptBlocks, PromptsList, NoPromptBlocksInfo } from '@/domains/prompt-blocks';
 import { useLinkComponent } from '@/lib/framework';
 
+const PROMPT_BLOCKS_PER_PAGE = 50;
+
 export default function PromptBlocks() {
   const { paths } = useLinkComponent();
-  const { data, isLoading, error } = useStoredPromptBlocks();
   const { isCmsAvailable } = useIsCmsAvailable();
   const [search, setSearch] = useState('');
+  const [page, setPage] = useState(0);
+  const { data, isLoading, error, isPlaceholderData } = useStoredPromptBlocks({
+    page,
+    perPage: PROMPT_BLOCKS_PER_PAGE,
+  });
 
   const promptBlocks = data?.promptBlocks ?? [];
+  const hasMore = data?.hasMore ?? false;
+
+  const handleNextPage = useCallback(() => {
+    if (!isPlaceholderData) setPage(p => p + 1);
+  }, [isPlaceholderData]);
+  const handlePrevPage = useCallback(() => {
+    if (!isPlaceholderData) setPage(p => Math.max(0, p - 1));
+  }, [isPlaceholderData]);
+  const handleSearchChange = useCallback((value: string) => {
+    setSearch(value);
+    setPage(0);
+  }, []);
 
   if (error && is401UnauthorizedError(error)) {
     return (
-      <NoDataPageLayout title="Prompts" icon={<FileTextIcon />}>
+      <NoDataPageLayout>
         <SessionExpired />
       </NoDataPageLayout>
     );
@@ -36,7 +48,7 @@ export default function PromptBlocks() {
 
   if (error && is403ForbiddenError(error)) {
     return (
-      <NoDataPageLayout title="Prompts" icon={<FileTextIcon />}>
+      <NoDataPageLayout>
         <PermissionDenied resource="prompt blocks" />
       </NoDataPageLayout>
     );
@@ -44,55 +56,49 @@ export default function PromptBlocks() {
 
   if (error) {
     return (
-      <NoDataPageLayout title="Prompts" icon={<FileTextIcon />}>
+      <NoDataPageLayout>
         <ErrorState title="Failed to load prompt blocks" message={error.message} />
       </NoDataPageLayout>
     );
   }
 
-  if (promptBlocks.length === 0 && !isLoading) {
+  if (promptBlocks.length === 0 && !isLoading && page === 0) {
     return (
-      <NoDataPageLayout title="Prompts" icon={<FileTextIcon />}>
+      <NoDataPageLayout>
         <NoPromptBlocksInfo />
       </NoDataPageLayout>
     );
   }
 
   return (
-    <PageLayout>
+    <PageLayout height="full">
       <PageLayout.TopArea>
-        <PageLayout.Row>
-          <PageLayout.Column>
-            <PageHeader>
-              <PageHeader.Title isLoading={isLoading}>
-                <FileTextIcon /> Prompts
-              </PageHeader.Title>
-            </PageHeader>
-          </PageLayout.Column>
-          <PageLayout.Column className="flex justify-end gap-2">
-            <ButtonWithTooltip
-              as="a"
-              href="https://mastra.ai/en/docs/agents/agent-instructions#prompt-blocks"
-              target="_blank"
-              rel="noopener noreferrer"
-              tooltipContent="Go to Prompts documentation"
-            >
-              <BookIcon />
-            </ButtonWithTooltip>
-            {isCmsAvailable && (
-              <Button as={Link} to={paths.cmsPromptBlockCreateLink()} variant="primary">
-                <Plus />
-                Create Prompt
-              </Button>
-            )}
-          </PageLayout.Column>
+        <PageLayout.Row align="center" stack="responsive">
+          <div className="max-w-120 flex-1">
+            <ListSearch
+              onSearch={handleSearchChange}
+              label="Filter prompts"
+              placeholder="Filter by name or description"
+            />
+          </div>
+          {isCmsAvailable && (
+            <Button as={Link} to={paths.cmsPromptBlockCreateLink()} variant="primary" className="shrink-0">
+              <Plus />
+              Create Prompt
+            </Button>
+          )}
         </PageLayout.Row>
-        <div className="max-w-120">
-          <ListSearch onSearch={setSearch} label="Filter prompts" placeholder="Filter by name or description" />
-        </div>
       </PageLayout.TopArea>
 
-      <PromptsList promptBlocks={promptBlocks} isLoading={isLoading} search={search} />
+      <PromptsList
+        promptBlocks={promptBlocks}
+        isLoading={isLoading}
+        search={search}
+        currentPage={page}
+        hasMore={hasMore}
+        onNextPage={handleNextPage}
+        onPrevPage={handlePrevPage}
+      />
     </PageLayout>
   );
 }

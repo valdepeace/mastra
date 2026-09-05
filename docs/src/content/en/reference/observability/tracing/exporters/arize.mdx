@@ -1,6 +1,6 @@
 ---
 title: "Reference: ArizeExporter | Observability"
-description: Arize exporter for Tracing using OpenInference
+description: "Configure ArizeExporter for Mastra tracing with Arize Phoenix or Arize AX, plus OpenTelemetry platforms supporting OpenInference semantic conventions."
 packages:
   - "@mastra/arize"
 ---
@@ -9,11 +9,11 @@ import PropertiesTable from "@site/src/components/PropertiesTable";
 
 # ArizeExporter
 
-Sends Tracing data to Arize Phoenix, Arize AX, or any OpenTelemetry-compatible observability platform that supports OpenInference semantic conventions.
+Sends Tracing data to Arize Phoenix or Arize AX, as well as any OpenTelemetry-compatible observability platform that supports OpenInference semantic conventions.
 
 ## Constructor
 
-```typescript prettier:false
+```typescript oxfmt:false
 new ArizeExporter(config: ArizeExporterConfig)
 ```
 
@@ -50,7 +50,8 @@ Non-reserved span attributes are serialized into the OpenInference `metadata` pa
   {
     name: 'endpoint',
     type: 'string',
-    description: 'Collector endpoint for trace exports. Falls back to PHOENIX_ENDPOINT env var. Required for Phoenix.',
+    description:
+      'Collector endpoint for trace exports. Falls back to PHOENIX_COLLECTOR_ENDPOINT env var. Required for Phoenix.',
     required: false,
   },
   {
@@ -108,7 +109,7 @@ Non-reserved span attributes are serialized into the OpenInference `metadata` pa
 
 ### `exportTracingEvent`
 
-```typescript prettier:false
+```typescript oxfmt:false
 async exportTracingEvent(event: TracingEvent): Promise<void>
 ```
 
@@ -116,7 +117,7 @@ Exports a tracing event to the configured endpoint.
 
 ### export
 
-```typescript prettier:false
+```typescript oxfmt:false
 async export(spans: ReadOnlySpan[]): Promise<void>
 ```
 
@@ -124,7 +125,7 @@ Batch exports spans using OpenTelemetry with OpenInference semantic conventions.
 
 ### flush
 
-```typescript prettier:false
+```typescript oxfmt:false
 async flush(): Promise<void>
 ```
 
@@ -132,7 +133,7 @@ Force flushes any buffered spans to the configured endpoint without shutting dow
 
 ### shutdown
 
-```typescript prettier:false
+```typescript oxfmt:false
 async shutdown(): Promise<void>
 ```
 
@@ -145,7 +146,7 @@ Flushes pending data and shuts down the client.
 ```typescript
 import { ArizeExporter } from '@mastra/arize'
 
-// For Phoenix: Set PHOENIX_ENDPOINT, PHOENIX_API_KEY, PHOENIX_PROJECT_NAME
+// For Phoenix: Set PHOENIX_COLLECTOR_ENDPOINT, PHOENIX_API_KEY, PHOENIX_PROJECT_NAME
 // For Arize AX: Set ARIZE_SPACE_ID, ARIZE_API_KEY, ARIZE_PROJECT_NAME
 const exporter = new ArizeExporter()
 ```
@@ -204,6 +205,6 @@ Tags are stored using the OpenInference `tag.tags` attribute:
 
 ## Related
 
-- [ArizeExporter Documentation](/docs/observability/tracing/exporters/arize)
+- [ArizeExporter Documentation](/integrations/observability/arize)
 - [Phoenix Documentation](https://docs.arize.com/phoenix)
 - [Arize AX Documentation](https://docs.arize.com/)

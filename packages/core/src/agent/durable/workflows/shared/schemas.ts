@@ -17,6 +17,7 @@ export const modelConfigSchema = z.object({
   modelId: z.string(),
   specificationVersion: z.string().optional(),
   settings: z.record(z.string(), z.any()).optional(),
+  providerOptions: z.record(z.string(), z.any()).optional(),
 });
 
 /**
@@ -29,6 +30,7 @@ export const modelListEntrySchema = z.object({
     modelId: z.string(),
     specificationVersion: z.string().optional(),
     originalConfig: z.union([z.string(), z.record(z.string(), z.any())]).optional(),
+    providerOptions: z.record(z.string(), z.any()).optional(),
   }),
   maxRetries: z.number(),
   enabled: z.boolean(),
@@ -89,6 +91,11 @@ export const baseIterationStateSchema = z.object({
   options: z.any(),
   state: z.any(),
   messageId: z.string(),
+  // JSON-safe snapshot of the caller's requestContext.entries(), carried
+  // across every iteration so steps that rebuild runtime state from the Mastra
+  // instance resolve with the same request context on iteration N as on
+  // iteration 1. Dropping it here silently falls back to an empty context.
+  requestContextEntries: z.record(z.string(), z.any()).optional(),
   // Iteration tracking
   iterationCount: z.number(),
   accumulatedSteps: z.array(z.any()),
@@ -97,6 +104,14 @@ export const baseIterationStateSchema = z.object({
   lastStepResult: z.any().optional(),
   // Background task tracking
   backgroundTaskPending: z.boolean().optional(),
+  // Set when a delegation hook calls ctx.bail() — signals the loop to stop
+  delegationBailed: z.boolean().optional(),
+  // Set when onIterationComplete returns { continue: false, feedback } — allows
+  // one more LLM turn with the feedback, then stops on the next predicate eval.
+  pendingFeedbackStop: z.boolean().optional(),
+  // Span data, carried unchanged so every iteration shares one trace
+  agentSpanData: z.any().optional(),
+  modelSpanData: z.any().optional(),
 });
 
 /**

@@ -1,7 +1,7 @@
 import { SpanType, TracingEventType } from '@mastra/core/observability';
 import type { AnyExportedSpan } from '@mastra/core/observability';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { LangfuseExporter } from './tracing';
+import { LangfuseExporter, LANGFUSE_DEFAULT_BASE_URL } from './tracing';
 
 type Mutable<T> = { -readonly [P in keyof T]: T[P] };
 
@@ -182,6 +182,9 @@ describe('LangfuseExporter', () => {
         publicKey: 'pk-test',
         secretKey: 'sk-test',
         baseUrl: 'https://custom.langfuse.com',
+        additionalHeaders: {
+          'x-custom-header': 'custom-value',
+        },
         environment: 'production',
         release: '1.0.0',
       });
@@ -191,6 +194,9 @@ describe('LangfuseExporter', () => {
           publicKey: 'pk-test',
           secretKey: 'sk-test',
           baseUrl: 'https://custom.langfuse.com',
+          additionalHeaders: {
+            'x-custom-header': 'custom-value',
+          },
           environment: 'production',
           release: '1.0.0',
           exportMode: 'batched',
@@ -233,6 +239,9 @@ describe('LangfuseExporter', () => {
         publicKey: 'pk-test',
         secretKey: 'sk-test',
         baseUrl: 'https://custom.langfuse.com',
+        additionalHeaders: {
+          'x-custom-header': 'custom-value',
+        },
       });
 
       expect(clientConstructorArgs[0]).toEqual(
@@ -240,6 +249,9 @@ describe('LangfuseExporter', () => {
           publicKey: 'pk-test',
           secretKey: 'sk-test',
           baseUrl: 'https://custom.langfuse.com',
+          additionalHeaders: {
+            'x-custom-header': 'custom-value',
+          },
         }),
       );
     });
@@ -307,6 +319,81 @@ describe('LangfuseExporter', () => {
       expect(attrs['mastra.metadata.langfuse']).toBeUndefined();
     });
 
+    it('forwards custom mastra.metadata.langfuse.* keys to langfuse.trace.metadata.*', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+      await exportSpan(
+        exporter,
+        makeSpan({
+          metadata: {
+            langfuse: {
+              prompt: { name: 'customer-support', version: 2 },
+              customerId: 'abc',
+              tier: 'enterprise',
+              seats: 42,
+              isVip: true,
+              nested: { plan: 'pro' },
+            },
+          },
+        }),
+      );
+
+      const attrs = processedSpans[0].attributes;
+      // prompt linking still works
+      expect(attrs['langfuse.observation.prompt.name']).toBe('customer-support');
+      expect(attrs['langfuse.observation.prompt.version']).toBe(2);
+      // custom top-level keys are forwarded as filterable trace metadata
+      expect(attrs['langfuse.trace.metadata.customerId']).toBe('abc');
+      expect(attrs['langfuse.trace.metadata.tier']).toBe('enterprise');
+      // Langfuse maps trace.metadata.* as string attributes, so numbers,
+      // booleans, and objects are serialized with JSON before export
+      // (Langfuse restores their original types on ingestion).
+      expect(attrs['langfuse.trace.metadata.seats']).toBe('42');
+      expect(attrs['langfuse.trace.metadata.isVip']).toBe('true');
+      expect(attrs['langfuse.trace.metadata.nested']).toBe(JSON.stringify({ plan: 'pro' }));
+      // the prompt key itself is not forwarded as trace metadata
+      expect(attrs['langfuse.trace.metadata.prompt']).toBeUndefined();
+      expect(attrs['mastra.metadata.langfuse']).toBeUndefined();
+    });
+
+    it('forwards custom langfuse metadata even when no prompt is present', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+      await exportSpan(
+        exporter,
+        makeSpan({
+          metadata: {
+            langfuse: { customerId: 'abc' },
+          },
+        }),
+      );
+
+      const attrs = processedSpans[0].attributes;
+      expect(attrs['langfuse.trace.metadata.customerId']).toBe('abc');
+      expect(attrs['langfuse.observation.prompt.name']).toBeUndefined();
+      expect(attrs['mastra.metadata.langfuse']).toBeUndefined();
+    });
+
+    it('lets reserved root-span identity keys take precedence over custom langfuse metadata', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+      await exportSpan(
+        exporter,
+        makeSpan({
+          type: SpanType.AGENT_RUN,
+          isRootSpan: true,
+          entityId: 'weather-agent',
+          entityName: 'Weather Agent',
+          metadata: {
+            langfuse: { agentId: 'user-supplied', customerId: 'abc' },
+          },
+        }),
+      );
+
+      const attrs = processedSpans[0].attributes;
+      // root-span identity wins over a user-supplied collision
+      expect(attrs['langfuse.trace.metadata.agentId']).toBe('weather-agent');
+      // non-colliding custom keys are still forwarded
+      expect(attrs['langfuse.trace.metadata.customerId']).toBe('abc');
+    });
+
     it('maps completionStartTime to langfuse.observation.completion_start_time', async () => {
       exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
       const ttftTime = new Date('2025-01-01T00:00:00.500Z');
@@ -343,6 +430,64 @@ describe('LangfuseExporter', () => {
       const attrs = processedSpans[0].attributes;
       expect(attrs['session.id']).toBe('session-456');
       expect(attrs['mastra.metadata.sessionId']).toBeUndefined();
+    });
+
+    it('maps root-span input/output to langfuse.trace.input/output', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+      await exportSpan(
+        exporter,
+        makeSpan({
+          isRootSpan: true,
+          type: SpanType.AGENT_RUN,
+          input: { parts: [{ type: 'text', text: 'Hello' }] },
+          output: { text: 'Hi there' },
+        } as any),
+      );
+
+      const attrs = processedSpans[0].attributes;
+      expect(attrs['langfuse.trace.input']).toBe(JSON.stringify({ parts: [{ type: 'text', text: 'Hello' }] }));
+      expect(attrs['langfuse.trace.output']).toBe(JSON.stringify({ text: 'Hi there' }));
+    });
+
+    it('passes string root-span input/output through without re-serializing', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+      await exportSpan(
+        exporter,
+        makeSpan({ isRootSpan: true, input: 'plain question', output: 'plain answer' } as any),
+      );
+
+      const attrs = processedSpans[0].attributes;
+      expect(attrs['langfuse.trace.input']).toBe('plain question');
+      expect(attrs['langfuse.trace.output']).toBe('plain answer');
+    });
+
+    it('does not set trace input/output for non-root spans', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+      await exportSpan(exporter, makeSpan({ isRootSpan: false } as any));
+
+      const attrs = processedSpans[0].attributes;
+      expect(attrs['langfuse.trace.input']).toBeUndefined();
+      expect(attrs['langfuse.trace.output']).toBeUndefined();
+    });
+
+    it('omits trace input/output that cannot be serialized instead of failing the export', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+      const circular: Record<string, unknown> = {};
+      circular.self = circular;
+      await exportSpan(exporter, makeSpan({ isRootSpan: true, input: circular, output: { text: 'ok' } } as any));
+
+      const attrs = processedSpans[0].attributes;
+      expect(attrs['langfuse.trace.input']).toBeUndefined();
+      expect(attrs['langfuse.trace.output']).toBe(JSON.stringify({ text: 'ok' }));
+    });
+
+    it('omits trace input/output when the root span has none', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+      await exportSpan(exporter, makeSpan({ isRootSpan: true, input: undefined, output: undefined } as any));
+
+      const attrs = processedSpans[0].attributes;
+      expect(attrs['langfuse.trace.input']).toBeUndefined();
+      expect(attrs['langfuse.trace.output']).toBeUndefined();
     });
 
     it('maps tags to langfuse.trace.tags', async () => {
@@ -419,6 +564,97 @@ describe('LangfuseExporter', () => {
       expect(attrs['langfuse.observation.metadata.operationName']).toBeUndefined();
     });
 
+    it('scopes trace name and metadata to the agent on root AGENT_RUN spans', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+      await exportSpan(
+        exporter,
+        makeSpan({
+          type: SpanType.AGENT_RUN,
+          isRootSpan: true,
+          entityId: 'weather-agent',
+          entityName: 'Weather Agent',
+        } as any),
+      );
+
+      const attrs = processedSpans[0].attributes;
+      expect(attrs['langfuse.trace.name']).toBe('Weather Agent');
+      expect(attrs['langfuse.trace.metadata.agentId']).toBe('weather-agent');
+      expect(attrs['langfuse.trace.metadata.agentName']).toBe('Weather Agent');
+    });
+
+    it('falls back to entityId for trace name when entityName is missing', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+      await exportSpan(
+        exporter,
+        makeSpan({
+          type: SpanType.AGENT_RUN,
+          isRootSpan: true,
+          entityId: 'weather-agent',
+          entityName: undefined,
+        } as any),
+      );
+
+      const attrs = processedSpans[0].attributes;
+      expect(attrs['langfuse.trace.name']).toBe('weather-agent');
+      expect(attrs['langfuse.trace.metadata.agentId']).toBe('weather-agent');
+      expect(attrs['langfuse.trace.metadata.agentName']).toBeUndefined();
+    });
+
+    it('preserves user-provided traceName over the agent default', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+      await exportSpan(
+        exporter,
+        makeSpan({
+          type: SpanType.AGENT_RUN,
+          isRootSpan: true,
+          entityId: 'weather-agent',
+          entityName: 'Weather Agent',
+          metadata: { traceName: 'custom-trace-name' },
+        } as any),
+      );
+
+      const attrs = processedSpans[0].attributes;
+      expect(attrs['langfuse.trace.name']).toBe('custom-trace-name');
+      expect(attrs['langfuse.trace.metadata.agentId']).toBe('weather-agent');
+      expect(attrs['langfuse.trace.metadata.agentName']).toBe('Weather Agent');
+    });
+
+    it('does not set trace identity on non-root agent spans', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+      await exportSpan(
+        exporter,
+        makeSpan({
+          type: SpanType.AGENT_RUN,
+          isRootSpan: false,
+          entityId: 'weather-agent',
+          entityName: 'Weather Agent',
+        } as any),
+      );
+
+      const attrs = processedSpans[0].attributes;
+      expect(attrs['langfuse.trace.name']).toBeUndefined();
+      expect(attrs['langfuse.trace.metadata.agentId']).toBeUndefined();
+      expect(attrs['langfuse.trace.metadata.agentName']).toBeUndefined();
+    });
+
+    it('scopes trace name and metadata to the workflow on root WORKFLOW_RUN spans', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+      await exportSpan(
+        exporter,
+        makeSpan({
+          type: SpanType.WORKFLOW_RUN,
+          isRootSpan: true,
+          entityId: 'order-workflow',
+          entityName: 'Order Workflow',
+        } as any),
+      );
+
+      const attrs = processedSpans[0].attributes;
+      expect(attrs['langfuse.trace.name']).toBe('Order Workflow');
+      expect(attrs['langfuse.trace.metadata.workflowId']).toBe('order-workflow');
+      expect(attrs['langfuse.trace.metadata.workflowName']).toBe('Order Workflow');
+    });
+
     it('sets langfuse.environment and langfuse.release on spans', async () => {
       exporter = new LangfuseExporter({
         publicKey: 'pk-test',
@@ -448,7 +684,7 @@ describe('LangfuseExporter', () => {
     });
   });
 
-  describe('addScoreToTrace', () => {
+  describe('addScoreToTrace (deprecated)', () => {
     it('calls LangfuseClient score.create with correct payload', async () => {
       exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
 
@@ -504,6 +740,87 @@ describe('LangfuseExporter', () => {
     });
   });
 
+  describe('onScoreEvent', () => {
+    const baseScore = {
+      scoreId: 'score-xyz',
+      timestamp: new Date('2026-01-01T00:00:00Z'),
+      traceId: 'trace-1',
+      spanId: 'span-1',
+      scorerId: 'accuracy',
+      scorerName: 'Accuracy Scorer',
+      scoreSource: 'live',
+      score: 0.95,
+      reason: 'Good response',
+      metadata: { sessionId: 'session-1' },
+    };
+
+    it('forwards a ScoreEvent to LangfuseClient.score.create', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+
+      await exporter.onScoreEvent({ type: 'score', score: { ...baseScore } } as any);
+
+      expect(mockScoreCreate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 'score-xyz',
+          traceId: 'trace-1',
+          observationId: 'span-1',
+          name: 'Accuracy Scorer',
+          value: 0.95,
+          comment: 'Good response',
+          metadata: { sessionId: 'session-1' },
+          dataType: 'NUMERIC',
+        }),
+      );
+    });
+
+    it('falls back to scorerId when scorerName is missing', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+
+      await exporter.onScoreEvent({
+        type: 'score',
+        score: { ...baseScore, scorerName: undefined },
+      } as any);
+
+      expect(mockScoreCreate).toHaveBeenCalledWith(expect.objectContaining({ name: 'accuracy' }));
+    });
+
+    it('includes the configured environment on the score', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test', environment: 'production' });
+
+      await exporter.onScoreEvent({ type: 'score', score: { ...baseScore } } as any);
+
+      expect(mockScoreCreate).toHaveBeenCalledWith(expect.objectContaining({ environment: 'production' }));
+    });
+
+    it('falls back to LANGFUSE_TRACING_ENVIRONMENT when no environment is configured', async () => {
+      process.env.LANGFUSE_TRACING_ENVIRONMENT = 'staging';
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+
+      await exporter.onScoreEvent({ type: 'score', score: { ...baseScore } } as any);
+
+      expect(mockScoreCreate).toHaveBeenCalledWith(expect.objectContaining({ environment: 'staging' }));
+    });
+
+    it('omits environment when none is configured', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+
+      await exporter.onScoreEvent({ type: 'score', score: { ...baseScore } } as any);
+
+      expect(mockScoreCreate.mock.calls[0][0]).not.toHaveProperty('environment');
+    });
+
+    it('omits the call when traceId is missing', async () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+
+      await exporter.onScoreEvent({
+        type: 'score',
+        score: { ...baseScore, traceId: undefined },
+      } as any);
+
+      expect(mockScoreCreate).not.toHaveBeenCalled();
+    });
+  });
+
   describe('flush and shutdown', () => {
     it('flushes both processor and client', async () => {
       exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
@@ -519,6 +836,73 @@ describe('LangfuseExporter', () => {
 
       expect(mockShutdown).toHaveBeenCalled();
       expect(mockClientShutdown).toHaveBeenCalled();
+    });
+  });
+
+  describe('processor configuration', () => {
+    it('uses default base URL when none provided', () => {
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+
+      expect(processorConstructorArgs[0]).toEqual(
+        expect.objectContaining({
+          baseUrl: LANGFUSE_DEFAULT_BASE_URL,
+        }),
+      );
+    });
+
+    it('uses custom baseUrl', () => {
+      exporter = new LangfuseExporter({
+        publicKey: 'pk-test',
+        secretKey: 'sk-test',
+        baseUrl: 'https://my-langfuse.example.com',
+      });
+
+      expect(processorConstructorArgs[0]).toEqual(
+        expect.objectContaining({
+          baseUrl: 'https://my-langfuse.example.com',
+        }),
+      );
+    });
+
+    it('strips trailing slashes from baseUrl', () => {
+      exporter = new LangfuseExporter({
+        publicKey: 'pk-test',
+        secretKey: 'sk-test',
+        baseUrl: 'https://my-langfuse.example.com///',
+      });
+
+      expect(processorConstructorArgs[0]).toEqual(
+        expect.objectContaining({
+          baseUrl: 'https://my-langfuse.example.com',
+        }),
+      );
+    });
+
+    it('reads baseUrl from LANGFUSE_BASE_URL environment variable', () => {
+      process.env.LANGFUSE_BASE_URL = 'https://env-langfuse.example.com';
+      exporter = new LangfuseExporter({ publicKey: 'pk-test', secretKey: 'sk-test' });
+
+      expect(processorConstructorArgs[0]).toEqual(
+        expect.objectContaining({
+          baseUrl: 'https://env-langfuse.example.com',
+        }),
+      );
+    });
+
+    it('passes environment and release to processor', () => {
+      exporter = new LangfuseExporter({
+        publicKey: 'pk-test',
+        secretKey: 'sk-test',
+        environment: 'staging',
+        release: '2.0.0',
+      });
+
+      expect(processorConstructorArgs[0]).toEqual(
+        expect.objectContaining({
+          environment: 'staging',
+          release: '2.0.0',
+        }),
+      );
     });
   });
 });

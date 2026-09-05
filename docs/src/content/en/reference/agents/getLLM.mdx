@@ -1,6 +1,6 @@
 ---
 title: "Reference: Agent.getLLM() | Agents"
-description: "Documentation for the `Agent.getLLM()` method in Mastra agents, which retrieves the language model instance and supports request-scoped model overrides."
+description: "The .getLLM() method retrieves the language model instance configured for an agent, resolving it if it's a function."
 packages:
   - "@mastra/core"
 ---
@@ -17,7 +17,7 @@ await agent.getLLM()
 
 ```typescript
 await agent.getLLM({
-  model: 'openai/gpt-5.4',
+  model: '__GATEWAY_OPENAI_MODEL__',
 })
 ```
 
@@ -74,7 +74,7 @@ await agent.getLLM({
 ```typescript
 await agent.getLLM({
   requestContext: new RequestContext(),
-  model: 'openai/gpt-5.4',
+  model: '__GATEWAY_OPENAI_MODEL__',
 })
 ```
 

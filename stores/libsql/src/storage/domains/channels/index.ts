@@ -1,4 +1,3 @@
-import type { Client } from '@libsql/client';
 import {
   ChannelsStorage,
   TABLE_CHANNEL_INSTALLATIONS,
@@ -9,6 +8,7 @@ import type { ChannelInstallation, ChannelConfig } from '@mastra/core/storage';
 
 import { LibSQLDB, resolveClient } from '../../db';
 import type { LibSQLDomainConfig } from '../../db';
+import type { SqliteClient as Client } from '../../db/client';
 
 export class ChannelsLibSQL extends ChannelsStorage {
   #db: LibSQLDB;
@@ -34,11 +34,18 @@ export class ChannelsLibSQL extends ChannelsStorage {
     });
 
     // Indexes
-    await this.#client.execute(
-      `CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_installations_webhook ON "${TABLE_CHANNEL_INSTALLATIONS}" ("webhookId")`,
-    );
-    await this.#client.execute(
-      `CREATE INDEX IF NOT EXISTS idx_channel_installations_platform_agent ON "${TABLE_CHANNEL_INSTALLATIONS}" ("platform", "agentId")`,
+    await this.#client.batch(
+      [
+        {
+          sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_installations_webhook ON "${TABLE_CHANNEL_INSTALLATIONS}" ("webhookId")`,
+          args: [],
+        },
+        {
+          sql: `CREATE INDEX IF NOT EXISTS idx_channel_installations_platform_agent ON "${TABLE_CHANNEL_INSTALLATIONS}" ("platform", "agentId")`,
+          args: [],
+        },
+      ],
+      'write',
     );
   }
 

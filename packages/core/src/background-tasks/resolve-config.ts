@@ -54,7 +54,13 @@ export function resolveBackgroundConfig({
   const agentToolConfig = resolveAgentToolConfig(toolName, agentConfig);
 
   // --- enabled ---
-  const enabled = llmOverride?.enabled ?? agentToolConfig?.enabled ?? toolConfig?.enabled ?? false;
+  // The LLM `_background` override is a modifier on tools the developer has
+  // already opted in at the tool or agent layer — it is NOT a standalone
+  // opt-in. A foreground-only tool must stay foreground regardless of what
+  // the model emits, so `agent.generate()` / `agent.stream()` keep returning
+  // real tool results for deterministic tools. See issue #16783.
+  const baseEnabled = agentToolConfig?.enabled ?? toolConfig?.enabled ?? false;
+  const enabled = baseEnabled ? (llmOverride?.enabled ?? true) : false;
 
   // --- timeoutMs ---
   const timeoutMs =
@@ -69,6 +75,27 @@ export function resolveBackgroundConfig({
     llmOverride?.maxRetries ?? toolConfig?.maxRetries ?? managerConfig?.defaultRetries?.maxRetries ?? 0;
 
   return { runInBackground: enabled, timeoutMs, maxRetries };
+}
+
+/**
+ * Whether a tool is background-eligible: i.e. whether `resolveBackgroundConfig`
+ * could ever dispatch it to the background. This is the same base-enabled
+ * expression the runtime resolver uses (the LLM `_background` override is a
+ * modifier only, never a standalone opt-in — see issue #16783), so advertising
+ * paths (schema injection, system prompt) and dispatch cannot disagree.
+ */
+export function isToolBackgroundEligible({
+  toolName,
+  toolConfig,
+  agentConfig,
+}: {
+  toolName: string;
+  toolConfig?: ToolBackgroundConfig;
+  agentConfig?: AgentBackgroundConfig;
+}): boolean {
+  if (agentConfig?.disabled) return false;
+  const agentToolConfig = resolveAgentToolConfig(toolName, agentConfig);
+  return agentToolConfig?.enabled ?? toolConfig?.enabled ?? false;
 }
 
 function resolveAgentToolConfig(

@@ -1,7 +1,7 @@
-import { spawnSync } from 'node:child_process';
-import { cp, mkdir } from 'node:fs/promises';
+import { cp, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { installWithRetry, runOrThrow } from '../_local-registry-setup/install.js';
 
 /**
  *
@@ -18,21 +18,22 @@ export async function setupDeployerProject(pathToStoreFiles, tag, pkgManager, de
 
   await mkdir(newPath, { recursive: true });
   await cp(projectPath, newPath, { recursive: true });
+  await writeFile(join(newPath, '.npmrc'), 'minimum-release-age=0\n');
+  await writeFile(
+    join(newPath, 'pnpm-workspace.yaml'),
+    "packages:\n  - '.'\nallowBuilds:\n  esbuild: true\n  sharp: true\n  protobufjs: true\n  workerd: true\n  bufferutil: true\n  utf-8-validate: true\n",
+  );
+
+  const installArgs = pkgManager === 'pnpm' ? ['install', '--config.minimum-release-age=0'] : ['install'];
+  const env = {
+    ...process.env,
+    pnpm_config_minimum_release_age: '0',
+  };
 
   console.log('Directory:', newPath);
   console.log('Installing dependencies...');
-  spawnSync(pkgManager, ['install'], {
-    cwd: newPath,
-    stdio: 'inherit',
-    shell: true,
-    env: process.env,
-  });
+  installWithRetry(pkgManager, installArgs, { cwd: newPath, env });
 
   console.log('building mastra...');
-  spawnSync(pkgManager, ['build'], {
-    cwd: newPath,
-    stdio: 'inherit',
-    shell: true,
-    env: process.env,
-  });
+  runOrThrow(pkgManager, ['build'], { cwd: newPath, env });
 }

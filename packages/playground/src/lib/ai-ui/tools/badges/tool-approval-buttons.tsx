@@ -1,5 +1,7 @@
-import { Button, Icon } from '@mastra/playground-ui';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { Icon } from '@mastra/playground-ui/icons/Icon';
 import { Check, X } from 'lucide-react';
+import { SectionLabel } from './section-label';
 import { useToolCall } from '@/services/tool-call-provider';
 
 export interface ToolApprovalButtonsProps {
@@ -66,8 +68,8 @@ export const ToolApprovalButtons = ({
   if (toolApprovalMetadata && !toolCalled) {
     return (
       <div>
-        <p className="font-medium pb-2">Approval required</p>
-        <div className="flex gap-2 items-center">
+        <SectionLabel>Approval required</SectionLabel>
+        <div className="flex items-center gap-2">
           <Button
             onClick={handleApprove}
             disabled={isRunning || !!toolCallApprovalStatus}

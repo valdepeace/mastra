@@ -19,7 +19,9 @@ export type {
   ReasoningChunk,
   SourceChunk,
   ToolCallChunk,
+  PendingToolCall,
   ToolResultChunk,
+  ToolOutputDeniedChunk,
 
   // Result Types
   LLMStepResult,
@@ -31,12 +33,22 @@ export type {
   DynamicToolResultPayload,
   ToolCallPayload,
   ToolResultPayload,
+  ToolOutputDeniedPayload,
   ReasoningDeltaPayload,
   ReasoningStartPayload,
   TextDeltaPayload,
   TextStartPayload,
   FilePayload,
   SourcePayload,
+  IsTaskCompletePayload,
+  GoalEvaluationPayload,
+  TripwirePayload,
+
+  // Callback Types
+  MastraOnFinishCallback,
+  MastraOnFinishCallbackArgs,
+  MastraStreamTransform,
+  MastraStreamTransformOptions,
 
   // JSON & Data Types
   JSONArray,
@@ -69,3 +81,9 @@ export { convertFullStreamChunkToUIMessageStream } from './aisdk/v5/compat';
 // ============================================================================
 export type { CachingTransformStreamOptions } from './caching-transform-stream';
 export { createCachingTransformStream, createReplayStream, withStreamCaching } from './caching-transform-stream';
+
+// ============================================================================
+// Stream Smoothing
+// ============================================================================
+export type { SmoothStreamChunkDetector, SmoothStreamOptions } from './smooth-stream';
+export { smoothStream } from './smooth-stream';

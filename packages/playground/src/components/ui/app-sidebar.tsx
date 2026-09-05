@@ -1,201 +1,28 @@
-import {
-  AgentIcon,
-  LogoWithoutText,
-  MainSidebar,
-  McpServerIcon,
-  SettingsIcon,
-  ToolsIcon,
-  WorkflowIcon,
-  cn,
-  useMainSidebar,
-} from '@mastra/playground-ui';
-import type { NavLink, NavSection } from '@mastra/playground-ui';
-import {
-  EyeIcon,
-  GlobeIcon,
-  BookIcon,
-  FileTextIcon,
-  FolderIcon,
-  Cpu,
-  BarChart3Icon,
-  LogsIcon,
-  DatabaseIcon,
-  FlaskConical,
-  GaugeIcon,
-} from 'lucide-react';
+import { Badge } from '@mastra/playground-ui/components/Badge';
+import { LogoWithoutText } from '@mastra/playground-ui/components/Logo';
+import { MainSidebar, useMainSidebar } from '@mastra/playground-ui/components/MainSidebar';
+import type { NavLink } from '@mastra/playground-ui/components/MainSidebar';
+import { useKeyboardShortcutLabel } from '@mastra/playground-ui/hooks/use-keyboard-shortcut-label';
+import { cn } from '@mastra/playground-ui/utils/cn';
+import { Search, Wrench } from 'lucide-react';
 import { useLocation } from 'react-router';
+import { useAgentBuilderSidebarVisibility } from '@/domains/agent-builder/hooks/use-agent-builder-sidebar-visibility';
 import { AuthStatus } from '@/domains/auth/components/auth-status';
+import { ImpersonationBanner } from '@/domains/auth/components/impersonation-banner';
 import { useAuthCapabilities } from '@/domains/auth/hooks/use-auth-capabilities';
 import { usePermissions } from '@/domains/auth/hooks/use-permissions';
+import { getPermissionForRoute, hasRoutePermission } from '@/domains/auth/route-permissions';
 import { isAuthenticated } from '@/domains/auth/types';
 import { useIsCmsAvailable } from '@/domains/cms/hooks/use-is-cms-available';
 import { MastraVersionFooter } from '@/domains/configuration/components/mastra-version-footer';
+import { useFeedbackInboxCount } from '@/domains/feedback/hooks/use-feedback';
+import { useInboxDatasetReviewCount } from '@/domains/review/hooks/use-inbox-review-items';
+import { useNavigationCommand } from '@/lib/command';
 import { useLinkComponent } from '@/lib/framework';
 import { useMastraPlatform } from '@/lib/mastra-platform/hooks/use-mastra-platform';
-
-type SidebarLink = NavLink & {
-  requiredPermission?: string;
-  requiredAnyPermission?: string[];
-  requiresExperimentalFeatures?: boolean;
-  activePaths?: string[];
-};
-
-type SidebarSection = Omit<NavSection, 'links'> & {
-  links: SidebarLink[];
-};
-
-const mainNavigation: SidebarSection[] = [
-  {
-    key: 'primitives',
-    title: 'Primitives',
-    href: '/primitives',
-    links: [
-      {
-        name: 'Agents',
-        url: '/agents',
-        icon: <AgentIcon />,
-        isOnMastraPlatform: true,
-        indent: true,
-        requiredPermission: 'agents:read',
-      },
-      {
-        name: 'Prompts',
-        url: '/prompts',
-        icon: <FileTextIcon />,
-        isOnMastraPlatform: true,
-        indent: true,
-      },
-      {
-        name: 'Workflows',
-        url: '/workflows',
-        icon: <WorkflowIcon />,
-        isOnMastraPlatform: true,
-        indent: true,
-        requiredPermission: 'workflows:read',
-      },
-      {
-        name: 'Processors',
-        url: '/processors',
-        icon: <Cpu />,
-        isOnMastraPlatform: false,
-        indent: true,
-        requiredPermission: 'processors:read',
-      },
-      {
-        name: 'MCP Servers',
-        url: '/mcps',
-        icon: <McpServerIcon />,
-        isOnMastraPlatform: true,
-        indent: true,
-        requiredPermission: 'mcps:read',
-      },
-      {
-        name: 'Tools',
-        url: '/tools',
-        icon: <ToolsIcon />,
-        isOnMastraPlatform: true,
-        indent: true,
-        requiredPermission: 'tools:read',
-      },
-      {
-        name: 'Workspaces',
-        url: '/workspaces',
-        icon: <FolderIcon />,
-        isOnMastraPlatform: true,
-        indent: true,
-        requiredPermission: 'workspaces:read',
-      },
-      {
-        name: 'Request Context',
-        url: '/request-context',
-        icon: <GlobeIcon />,
-        isOnMastraPlatform: true,
-        indent: true,
-      },
-    ],
-  },
-  {
-    key: 'evaluation',
-    title: 'Evaluation',
-    href: '/evaluation',
-    links: [
-      {
-        name: 'Scorers',
-        url: '/scorers',
-        icon: <GaugeIcon />,
-        isOnMastraPlatform: true,
-        indent: true,
-        requiredPermission: 'scorers:read',
-      },
-      {
-        name: 'Datasets',
-        url: '/datasets',
-        icon: <DatabaseIcon />,
-        isOnMastraPlatform: true,
-        indent: true,
-        requiredAnyPermission: ['datasets:read'],
-      },
-      {
-        name: 'Experiments',
-        url: '/experiments',
-        icon: <FlaskConical />,
-        isOnMastraPlatform: true,
-        indent: true,
-        requiredAnyPermission: ['datasets:read'],
-      },
-    ],
-  },
-  {
-    key: 'observability',
-    title: 'Observability',
-    href: '/observability-overview',
-    links: [
-      {
-        name: 'Metrics',
-        url: '/metrics',
-        icon: <BarChart3Icon />,
-        isOnMastraPlatform: true,
-        indent: true,
-        requiredPermission: 'observability:read',
-      },
-      {
-        name: 'Traces',
-        url: '/observability',
-        activePaths: ['/traces'],
-        icon: <EyeIcon />,
-        isOnMastraPlatform: true,
-        indent: true,
-        requiredPermission: 'observability:read',
-      },
-      {
-        name: 'Logs',
-        url: '/logs',
-        icon: <LogsIcon />,
-        isOnMastraPlatform: true,
-        indent: true,
-        requiredPermission: 'observability:read',
-      },
-    ],
-  },
-  {
-    key: 'bottom',
-    separator: true,
-    links: [
-      {
-        name: 'Settings',
-        url: '/settings',
-        icon: <SettingsIcon />,
-        isOnMastraPlatform: false,
-      },
-      {
-        name: 'Resources',
-        url: '/resources',
-        icon: <BookIcon />,
-        isOnMastraPlatform: true,
-      },
-    ],
-  },
-];
+import { getIsLinkActive } from '@/lib/nav/get-is-link-active';
+import { bottomNav, mainNav } from '@/lib/nav/nav-items';
+import type { NavItem } from '@/lib/nav/nav-items';
 
 declare global {
   interface Window {
@@ -204,16 +31,16 @@ declare global {
   }
 }
 
-function getIsLinkActive(link: SidebarLink, pathname: string): boolean {
-  // Exact match or sub-path match (with / boundary to avoid /observability matching /observability-overview)
-  const matches = (url: string) => pathname === url || pathname.startsWith(url + '/');
-  if (matches(link.url)) return true;
-  return link.activePaths?.some(matches) ?? false;
+function toSidebarLink(item: NavItem): NavLink {
+  const { Icon } = item;
+  return { name: item.name, url: item.url, icon: <Icon /> };
 }
 
 export function AppSidebar() {
   const { Link } = useLinkComponent();
-  const { state, isMobile } = useMainSidebar();
+  const { state, isMobile, setOpenMobile } = useMainSidebar();
+  const { setOpen: setNavigationCommandOpen } = useNavigationCommand({ enableShortcut: false });
+  const commandShortcutLabel = useKeyboardShortcutLabel('K');
 
   const location = useLocation();
   const pathname = location.pathname;
@@ -221,52 +48,55 @@ export function AppSidebar() {
   const { isMastraPlatform } = useMastraPlatform();
   const { data: authCapabilities } = useAuthCapabilities();
   const { isCmsAvailable, isLoading: isCmsLoading } = useIsCmsAvailable();
-  const {
-    hasPermission,
-    hasAnyPermission,
-    rbacEnabled,
-    isAuthenticated: isPermissionsAuthenticated,
-    isLoading: isPermissionsLoading,
-  } = usePermissions();
+  const { hasPermission, hasAnyPermission, isLoading: isPermissionsLoading } = usePermissions();
+  const canReadInbox =
+    !isPermissionsLoading && hasRoutePermission(getPermissionForRoute('/inbox'), hasPermission, hasAnyPermission);
+  const feedbackInboxCountQuery = useFeedbackInboxCount({ enabled: canReadInbox });
+  const datasetReviewCountQuery = useInboxDatasetReviewCount({ enabled: canReadInbox });
+  const hasInboxItems =
+    (feedbackInboxCountQuery.data?.pagination?.total ?? 0) > 0 || (datasetReviewCountQuery.data ?? 0) > 0;
 
-  // Check if user is authenticated (small avatar) vs not (wide login button)
   const isUserAuthenticated = authCapabilities && isAuthenticated(authCapabilities);
   const cmsOnlyLinks = new Set(['/prompts']);
+  const { isVisible: isAgentBuilderVisible } = useAgentBuilderSidebarVisibility();
+  const isAgentBuilderActive = pathname === '/agent-builder' || pathname.startsWith('/agent-builder/');
 
-  const filterSidebarLink = (link: SidebarLink) => {
-    // 1) CMS link gating
-    if (cmsOnlyLinks.has(link.url) && !isCmsAvailable && !isCmsLoading) {
+  const openNavigationCommand = () => {
+    if (isMobile) setOpenMobile(false);
+    setNavigationCommandOpen(true);
+  };
+
+  const filterItem = (item: NavItem) => {
+    if (item.hidden) return false;
+    if (cmsOnlyLinks.has(item.url) && !isCmsAvailable && !isCmsLoading) return false;
+    if (isMastraPlatform && !item.isOnMastraPlatform) return false;
+    // While the user's permissions are still loading, hide permission-gated
+    // links. Being permissive here would briefly flash links the user may not
+    // be allowed to see. We can't yet know rbacEnabled/isAuthenticated during
+    // this window (auth capabilities are still resolving), so we gate purely on
+    // the loading state and only reveal a link once permissions have resolved.
+    // The authoritative permission patterns are already loaded and validated by
+    // RoutePermissionsGate before the sidebar renders.
+    if (isPermissionsLoading) {
+      const pending = getPermissionForRoute(item.url);
+      // Public/unknown routes have no permission requirement — keep showing them.
+      if (pending && pending !== 'public') return false;
+    }
+    const requiredPermission = getPermissionForRoute(item.url);
+    if (!hasRoutePermission(requiredPermission, hasPermission, hasAnyPermission)) {
       return false;
     }
-
-    // 2) Mastra platform link gating
-    if (isMastraPlatform && !link.isOnMastraPlatform) {
-      return false;
-    }
-
-    // 3) RBAC link gating
-    // Avoid hiding during transient permission loading to prevent nav flicker.
-    if (rbacEnabled && isPermissionsAuthenticated && isPermissionsLoading) {
-      return true;
-    }
-
-    if (link.requiredPermission && !hasPermission(link.requiredPermission)) {
-      return false;
-    }
-
-    if (link.requiredAnyPermission && !hasAnyPermission(link.requiredAnyPermission)) {
-      return false;
-    }
-
     return true;
   };
 
+  const filteredBottom = bottomNav.filter(filterItem);
+
   return (
     <MainSidebar>
-      <div className="pt-3 mb-4">
+      <div className="mb-1.5 pt-2.5">
         {state === 'collapsed' ? (
-          <div className="flex flex-col gap-3 items-center">
-            <div className="relative grid place-items-center size-9">
+          <div className="flex flex-col items-center gap-2">
+            <div className="relative grid size-9 place-items-center">
               <LogoWithoutText
                 className={cn(
                   'h-[1.5rem] w-[1.5rem] shrink-0 transition-opacity duration-150',
@@ -282,53 +112,113 @@ export function AppSidebar() {
             {isUserAuthenticated && <AuthStatus />}
           </div>
         ) : isUserAuthenticated ? (
-          <span className="flex items-center justify-between pl-3 pr-2">
-            <span className="flex items-center gap-2 flex-1 min-w-0">
+          <span className="flex h-7 items-center justify-between pr-2 pl-3">
+            <span className="flex min-w-0 flex-1 items-center gap-2">
               <LogoWithoutText className="h-[1.5rem] w-[1.5rem] shrink-0" />
-              <span className="font-serif text-sm whitespace-nowrap truncate">Mastra Studio</span>
+              <span className="font-display truncate text-sm font-semibold tracking-tight whitespace-nowrap">
+                Mastra Studio
+              </span>
               {!isMobile && <MainSidebar.Trigger />}
             </span>
             <AuthStatus />
           </span>
         ) : (
-          <span className="flex items-center gap-2 pl-3 pr-2">
+          <span className="flex h-7 items-center gap-2 pr-2 pl-3">
             <LogoWithoutText className="h-[1.5rem] w-[1.5rem] shrink-0" />
-            <span className="font-serif text-sm whitespace-nowrap truncate">Mastra Studio</span>
+            <span className="font-display truncate text-sm font-semibold tracking-tight whitespace-nowrap">
+              Mastra Studio
+            </span>
             {!isMobile && <MainSidebar.Trigger />}
           </span>
         )}
       </div>
 
-      <MainSidebar.Nav>
-        {mainNavigation.map(section => {
-          const filteredLinks = section.links.filter(filterSidebarLink);
-          const showSeparator = filteredLinks.length > 0 && section?.separator;
+      {!isMobile && (
+        <div className="mb-2">
+          <MainSidebar.NavList>
+            <MainSidebar.NavLink
+              asChild
+              state={state}
+              link={{
+                name: 'Search',
+                url: '#',
+                icon: <Search />,
+              }}
+            >
+              <button
+                type="button"
+                onClick={openNavigationCommand}
+                aria-label="Search and navigate"
+                className="border-border1 bg-surface3 text-neutral5 hover:bg-surface4 hover:text-neutral6 active:bg-surface5 [&_svg]:text-neutral4 [&:hover_svg]:text-neutral5 border"
+              >
+                <Search />
+                <MainSidebar.NavLabel state={state}>Search</MainSidebar.NavLabel>
+                {state !== 'collapsed' && (
+                  <kbd
+                    aria-hidden="true"
+                    className="border-border1 bg-surface4 text-neutral3 ml-auto rounded border px-1.5 py-0.5 font-mono text-[10px] leading-none"
+                  >
+                    {commandShortcutLabel}
+                  </kbd>
+                )}
+              </button>
+            </MainSidebar.NavLink>
+          </MainSidebar.NavList>
+        </div>
+      )}
 
-          const anySubLinkActive = filteredLinks.some(link => getIsLinkActive(link, pathname));
-          const isHeaderActive = !!(section.href && pathname === section.href && !anySubLinkActive);
+      {isAgentBuilderVisible && (
+        <div className="mb-1">
+          <MainSidebar.NavList>
+            <MainSidebar.NavLink
+              LinkComponent={Link}
+              state={state}
+              link={{
+                name: 'Agent Builder',
+                url: '/agent-builder',
+                icon: <Wrench />,
+              }}
+              isActive={isAgentBuilderActive}
+            />
+          </MainSidebar.NavList>
+        </div>
+      )}
+
+      <ImpersonationBanner />
+
+      <MainSidebar.Nav>
+        {mainNav.map(section => {
+          const filtered = section.items.filter(filterItem);
+          const anySubActive = filtered.some(item => getIsLinkActive(item, pathname));
+          const isHeaderActive = !!(section.href && pathname === section.href && !anySubActive);
 
           return (
             <MainSidebar.NavSection key={section.key}>
-              {section?.title ? (
+              {section.title ? (
                 <MainSidebar.NavHeader LinkComponent={Link} state={state} href={section.href} isActive={isHeaderActive}>
                   {section.title}
                 </MainSidebar.NavHeader>
-              ) : (
-                <>{showSeparator && <MainSidebar.NavSeparator />}</>
-              )}
+              ) : null}
               <MainSidebar.NavList>
-                {filteredLinks.map(link => {
-                  const isActive = getIsLinkActive(link, pathname);
-                  return (
-                    <MainSidebar.NavLink
-                      key={link.name}
-                      LinkComponent={Link}
-                      state={state}
-                      link={link}
-                      isActive={isActive}
-                    />
-                  );
-                })}
+                {filtered.map(item => (
+                  <MainSidebar.NavLink
+                    key={item.name}
+                    LinkComponent={Link}
+                    state={state}
+                    link={toSidebarLink(item)}
+                    isActive={getIsLinkActive(item, pathname, filtered)}
+                  >
+                    {item.url === '/inbox' && hasInboxItems && state !== 'collapsed' ? (
+                      <Badge
+                        variant="yellow"
+                        size="sm"
+                        indicator="dot"
+                        className="ml-auto"
+                        aria-label="Items need review"
+                      />
+                    ) : null}
+                  </MainSidebar.NavLink>
+                ))}
               </MainSidebar.NavList>
             </MainSidebar.NavSection>
           );
@@ -336,9 +226,22 @@ export function AppSidebar() {
       </MainSidebar.Nav>
 
       <MainSidebar.Bottom className="pb-3">
+        {filteredBottom.length > 0 && (
+          <MainSidebar.NavList>
+            {filteredBottom.map(item => (
+              <MainSidebar.NavLink
+                key={item.name}
+                LinkComponent={Link}
+                state={state}
+                link={toSidebarLink(item)}
+                isActive={getIsLinkActive(item, pathname)}
+              />
+            ))}
+          </MainSidebar.NavList>
+        )}
         {state !== 'collapsed' && (
           <>
-            <MainSidebar.NavSeparator />
+            <hr className="bg-border1 mx-6 my-2 h-px border-0" />
             <MastraVersionFooter collapsed={false} />
           </>
         )}

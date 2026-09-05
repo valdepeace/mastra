@@ -11,7 +11,7 @@ export { LocalSandbox, type LocalSandboxOptions } from './sandbox';
 
 // Base Classes for External Providers
 export { MastraFilesystem, type FilesystemLifecycleHook, type MastraFilesystemOptions } from './filesystem';
-export { MastraSandbox, SandboxProcessManager, ProcessHandle } from './sandbox';
+export { MastraSandbox, SandboxProcessManager, ProcessHandle, UnsupportedStdinCloseError } from './sandbox';
 
 // Errors
 export * from './errors';
@@ -34,12 +34,17 @@ export {
   type WorkspaceToolConfig,
   type WorkspaceToolsConfig,
   type ExecuteCommandToolConfig,
+  type ComputerToolConfig,
   type BackgroundProcessConfig,
   type BackgroundProcessMeta,
   type BackgroundProcessExitMeta,
   type ToolConfigContext,
   type ToolConfigWithArgsContext,
   type DynamicToolConfigValue,
+  type WorkspaceToolHookContext,
+  type WorkspaceToolBeforeHookResult,
+  type WorkspaceToolAfterHookContext,
+  type WorkspaceToolHooks,
   type ResolvedToolConfig,
   // Individual standalone tools
   readFileTool,
@@ -79,15 +84,25 @@ export type {
 export type { FilesystemMountConfig, MountResult, FilesystemIcon } from './filesystem';
 
 // Sandbox
-export { MountManager } from './sandbox';
+export { MountManager, supportsNetworking, supportsComputer } from './sandbox';
 export type {
   WorkspaceSandbox,
+  SandboxNetworking,
+  SandboxComputer,
+  ComputerScreenshot,
+  ComputerScreenSize,
+  ComputerPosition,
+  SandboxFileInput,
+  SandboxCloneOptions,
+  SandboxStartOutcome,
+  SandboxStartResult,
   ExecutionResult,
   CommandOptions,
   CommandResult,
   ExecuteCommandOptions,
   SandboxInfo,
   SandboxLifecycleHook,
+  SandboxStartHook,
   MastraSandboxOptions,
   // Process management types
   ProcessInfo,
@@ -101,6 +116,9 @@ export { detectIsolation, isIsolationAvailable, getRecommendedIsolation } from '
 
 // Constants
 export { WORKSPACE_TOOLS_PREFIX, WORKSPACE_TOOLS, type WorkspaceToolName } from './constants';
+
+// Search types
+export type { TokenizeOptions } from './search';
 
 // Shared types
 export type { InstructionsOption } from './types';
@@ -128,7 +146,7 @@ export type {
 } from './skills';
 
 // Skill Tools
-export { createSkillTools } from './skills';
+export { createSkillTools, formatSkillActivation } from './skills';
 
 // Skill Publishing
 export type { SkillPublishResult } from './skills';

@@ -1,5 +1,6 @@
-import { Combobox, toast } from '@mastra/playground-ui';
-import type { ComboboxProps } from '@mastra/playground-ui';
+import { Combobox } from '@mastra/playground-ui/components/Combobox';
+import type { ComboboxProps } from '@mastra/playground-ui/components/Combobox';
+import { toast } from '@mastra/playground-ui/utils/toast';
 import { useEffect } from 'react';
 import { useAgents } from '../../agents/hooks/use-agents';
 import { useTools } from '../hooks/use-all-tools';
@@ -14,6 +15,7 @@ export interface ToolComboboxProps {
   className?: string;
   disabled?: boolean;
   variant?: ComboboxProps['variant'];
+  size?: ComboboxProps['size'];
 }
 
 export function ToolCombobox({
@@ -24,7 +26,8 @@ export function ToolCombobox({
   emptyText = 'No tools found.',
   className,
   disabled = false,
-  variant = 'default',
+  variant,
+  size,
 }: ToolComboboxProps) {
   const { data: tools = {}, isLoading: isLoadingTools, isError: isErrorTools, error: errorTools } = useTools();
   const { data: agents = {}, isLoading: isLoadingAgents, isError: isErrorAgents, error: errorAgents } = useAgents();
@@ -88,6 +91,7 @@ export function ToolCombobox({
       className={className}
       disabled={disabled || isLoadingTools || isLoadingAgents || isErrorTools || isErrorAgents}
       variant={variant}
+      size={size}
     />
   );
 }

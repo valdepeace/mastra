@@ -11,6 +11,7 @@ import {
   FilesystemNotAvailableError,
   SandboxNotAvailableError,
   SearchNotAvailableError,
+  WorkspaceNotReadyError,
 } from './errors';
 import { CompositeFilesystem, LocalFilesystem } from './filesystem';
 import { LSPManager } from './lsp';
@@ -504,6 +505,209 @@ Line 3 conclusion`;
       // All special chars should be replaced with underscores
       expect(capturedIndexName).toBe('my_workspace_123_search');
       expect(capturedIndexName).toMatch(SQL_IDENTIFIER_PATTERN);
+    });
+
+    it('should release the search index on destroy', async () => {
+      const filesystem = new LocalFilesystem({ basePath: tempDir });
+      const workspace = new Workspace({
+        filesystem,
+        bm25: true,
+      });
+
+      await workspace.index('/doc1.txt', 'The quick brown fox jumps over the lazy dog');
+      expect((await workspace.search('lazy')).length).toBeGreaterThan(0);
+
+      await workspace.destroy();
+
+      // The indexed document text must not survive destroy(): otherwise the
+      // whole index stays reachable for the lifetime of the process.
+      expect(await workspace.search('lazy')).toEqual([]);
+    });
+
+    it('stop() stops the sandbox but keeps the workspace usable', async () => {
+      const filesystem = new LocalFilesystem({ basePath: tempDir });
+      const sandbox = new LocalSandbox({ workingDirectory: tempDir });
+      const workspace = new Workspace({ filesystem, sandbox, bm25: true });
+
+      await workspace.index('/doc1.txt', 'The quick brown fox jumps over the lazy dog');
+      await sandbox._start();
+      expect(sandbox.status).toBe('running');
+
+      await workspace.stop();
+
+      expect(sandbox.status).toBe('stopped');
+      // Not a teardown: the search index survives and the workspace stays usable.
+      expect((await workspace.search('quick')).length).toBeGreaterThan(0);
+    });
+
+    it('coalesces concurrent stop() calls onto one in-flight teardown', async () => {
+      let stops = 0;
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => {
+        release = resolve;
+      });
+      const sandbox = {
+        provider: 'fake',
+        stop: async () => {
+          stops += 1;
+          await gate;
+        },
+      } as any;
+      const workspace = new Workspace({
+        filesystem: new LocalFilesystem({ basePath: tempDir }),
+        sandbox,
+      });
+
+      const first = workspace.stop();
+      const second = workspace.stop();
+      release();
+      await Promise.all([first, second]);
+
+      expect(stops).toBe(1);
+    });
+
+    it('destroy() waits for an in-flight stop() and wins', async () => {
+      let stopStarted!: () => void;
+      const stopStartedGate = new Promise<void>(resolve => {
+        stopStarted = resolve;
+      });
+      let releaseStop!: () => void;
+      const stopGate = new Promise<void>(resolve => {
+        releaseStop = resolve;
+      });
+      const order: string[] = [];
+      const sandbox = {
+        provider: 'fake',
+        stop: async () => {
+          order.push('stop:start');
+          stopStarted();
+          await stopGate;
+          order.push('stop:end');
+        },
+        destroy: async () => {
+          order.push('destroy');
+        },
+      } as any;
+      const workspace = new Workspace({
+        filesystem: new LocalFilesystem({ basePath: tempDir }),
+        sandbox,
+      });
+
+      const stopping = workspace.stop();
+      await stopStartedGate;
+      const destroying = workspace.destroy();
+      releaseStop();
+      await Promise.all([stopping, destroying]);
+
+      // The destroy must not interleave with the stop's teardown.
+      expect(order).toEqual(['stop:start', 'stop:end', 'destroy']);
+      expect(workspace.status).toBe('destroyed');
+    });
+
+    it('concurrent destroy() calls during an in-flight stop() destroy once', async () => {
+      let stopStarted!: () => void;
+      const stopStartedGate = new Promise<void>(resolve => {
+        stopStarted = resolve;
+      });
+      let releaseStop!: () => void;
+      const stopGate = new Promise<void>(resolve => {
+        releaseStop = resolve;
+      });
+      let destroys = 0;
+      const sandbox = {
+        provider: 'fake',
+        stop: async () => {
+          stopStarted();
+          await stopGate;
+        },
+        destroy: async () => {
+          destroys += 1;
+        },
+      } as any;
+      const workspace = new Workspace({
+        filesystem: new LocalFilesystem({ basePath: tempDir }),
+        sandbox,
+      });
+
+      const stopping = workspace.stop();
+      await stopStartedGate;
+      const firstDestroy = workspace.destroy();
+      const secondDestroy = workspace.destroy();
+      releaseStop();
+      await Promise.all([stopping, firstDestroy, secondDestroy]);
+
+      expect(destroys).toBe(1);
+      expect(workspace.status).toBe('destroyed');
+    });
+
+    it('should release the search index even when a resource fails to destroy', async () => {
+      const filesystem = new LocalFilesystem({ basePath: tempDir });
+      const workspace = new Workspace({
+        filesystem,
+        bm25: true,
+      });
+
+      await workspace.index('/doc1.txt', 'The quick brown fox jumps over the lazy dog');
+
+      // `callLifecycle` prefers the `_destroy` wrapper over `destroy`
+      vi.spyOn(filesystem as any, '_destroy').mockRejectedValueOnce(new Error('fs teardown failed'));
+      await expect(workspace.destroy()).rejects.toThrow('fs teardown failed');
+
+      expect(await workspace.search('lazy')).toEqual([]);
+    });
+
+    it('should release loaded skills and reject skill access after destroy', async () => {
+      await createSkillFixtures(tempDir);
+
+      const filesystem = new LocalFilesystem({ basePath: tempDir });
+      const workspace = new Workspace({ filesystem, skills: ['skills'], bm25: true });
+      const skills = workspace.skills!;
+
+      await skills.list();
+      expect((await workspace.search('travel')).length).toBeGreaterThan(0);
+
+      await workspace.destroy();
+
+      // The loaded skill sources must not stay reachable through the workspace,
+      // and neither a fresh getter access nor a retained handle may reload them.
+      expect((workspace as any)._skills).toBeUndefined();
+      expect(() => workspace.skills).toThrow(WorkspaceNotReadyError);
+      await expect(skills.list()).rejects.toThrow(WorkspaceNotReadyError);
+      expect(await workspace.search('travel')).toEqual([]);
+    });
+
+    it('should reject search writes once the workspace is destroyed', async () => {
+      const filesystem = new LocalFilesystem({ basePath: tempDir });
+      const workspace = new Workspace({
+        filesystem,
+        bm25: true,
+      });
+
+      await workspace.index('/doc1.txt', 'The quick brown fox jumps over the lazy dog');
+      await workspace.destroy();
+
+      // Without this guard a late caller could repopulate the index that
+      // destroy() just released.
+      await expect(workspace.index('/doc2.txt', 'a lazy cat sleeps all day')).rejects.toThrow(WorkspaceNotReadyError);
+      expect(await workspace.search('lazy')).toEqual([]);
+    });
+
+    it('should keep rejecting search writes after a failed destroy', async () => {
+      const filesystem = new LocalFilesystem({ basePath: tempDir });
+      const workspace = new Workspace({
+        filesystem,
+        bm25: true,
+      });
+
+      await workspace.index('/doc1.txt', 'The quick brown fox jumps over the lazy dog');
+
+      vi.spyOn(filesystem as any, '_destroy').mockRejectedValueOnce(new Error('fs teardown failed'));
+      await expect(workspace.destroy()).rejects.toThrow('fs teardown failed');
+
+      // A failed teardown leaves status 'error', but the index has already been
+      // released — writes must stay blocked rather than repopulating it.
+      await expect(workspace.index('/doc2.txt', 'a lazy cat sleeps all day')).rejects.toThrow(WorkspaceNotReadyError);
+      expect(await workspace.search('lazy')).toEqual([]);
     });
   });
 
@@ -1320,6 +1524,53 @@ Line 3 conclusion`;
   // Auto-indexing (rebuildSearchIndex via init)
   // ===========================================================================
   describe('auto-indexing', () => {
+    it('should rebuild configured autoIndexPaths without starting the sandbox', async () => {
+      await fs.mkdir(path.join(tempDir, 'docs'), { recursive: true });
+      await fs.writeFile(path.join(tempDir, 'docs', 'readme.txt'), 'Welcome to the project');
+
+      const filesystem = new LocalFilesystem({ basePath: tempDir });
+      const sandbox = new LocalSandbox({ workingDirectory: tempDir });
+      const startSpy = vi.spyOn(sandbox, 'start');
+      const workspace = new Workspace({
+        filesystem,
+        sandbox,
+        bm25: true,
+        autoIndexPaths: ['docs'],
+      });
+
+      await workspace.rebuildSearchIndex();
+
+      const results = await workspace.search('project');
+      expect(results.some(r => r.id === 'docs/readme.txt')).toBe(true);
+      expect(startSpy).not.toHaveBeenCalled();
+
+      await workspace.destroy();
+    });
+
+    it('should use explicit paths instead of configured autoIndexPaths when rebuilding', async () => {
+      await fs.mkdir(path.join(tempDir, 'docs'), { recursive: true });
+      await fs.mkdir(path.join(tempDir, 'support'), { recursive: true });
+      await fs.writeFile(path.join(tempDir, 'docs', 'api.txt'), 'API reference documentation');
+      await fs.writeFile(path.join(tempDir, 'support', 'faq.txt'), 'Frequently asked questions');
+
+      const filesystem = new LocalFilesystem({ basePath: tempDir });
+      const workspace = new Workspace({
+        filesystem,
+        bm25: true,
+        autoIndexPaths: ['docs'],
+      });
+
+      await workspace.rebuildSearchIndex(['support']);
+
+      const faqResults = await workspace.search('frequently asked');
+      expect(faqResults.some(r => r.id === 'support/faq.txt')).toBe(true);
+
+      const docsResults = await workspace.search('API reference');
+      expect(docsResults.some(r => r.id === 'docs/api.txt')).toBe(false);
+
+      await workspace.destroy();
+    });
+
     it('should auto-index files during init when autoIndexPaths configured', async () => {
       // Create test files on disk
       await fs.mkdir(path.join(tempDir, 'docs'), { recursive: true });
@@ -2312,6 +2563,375 @@ Line 3 conclusion`;
       // Should not throw — no static filesystem instance to set logger on
       expect(() => workspace.__setLogger(mockLogger)).not.toThrow();
     });
+
+    it('should resolve filesystem instructions asynchronously from requestContext', async () => {
+      const dirA = await fs.mkdtemp(path.join(os.tmpdir(), 'ws-fs-instructions-a-'));
+      const dirB = await fs.mkdtemp(path.join(os.tmpdir(), 'ws-fs-instructions-b-'));
+      try {
+        const workspace = new Workspace({
+          filesystem: ({ requestContext }) => {
+            return requestContext.get('role') === 'admin'
+              ? new LocalFilesystem({ basePath: dirA })
+              : new LocalFilesystem({ basePath: dirB });
+          },
+        });
+
+        const adminInstructions = await workspace.getInstructionsAsync({
+          requestContext: new RequestContext([['role', 'admin']]),
+        });
+        const userInstructions = await workspace.getInstructionsAsync({
+          requestContext: new RequestContext([['role', 'user']]),
+        });
+
+        expect(adminInstructions).toContain(dirA);
+        expect(userInstructions).toContain(dirB);
+      } finally {
+        await fs.rm(dirA, { recursive: true, force: true });
+        await fs.rm(dirB, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // ===========================================================================
+  // Dynamic Sandbox (resolver function)
+  // ===========================================================================
+  describe('dynamic sandbox', () => {
+    it('should accept a sandbox resolver function', () => {
+      const resolver = ({ requestContext }: { requestContext: RequestContext }) => {
+        const role = requestContext.get('role') as string;
+        return new LocalSandbox({ workingDirectory: tempDir + '/' + role });
+      };
+      const workspace = new Workspace({ sandbox: resolver });
+
+      expect(workspace.hasSandboxConfig()).toBe(true);
+      // Static getter returns undefined when using resolver
+      expect(workspace.sandbox).toBeUndefined();
+    });
+
+    it('should resolve different sandboxes based on requestContext', async () => {
+      const dirA = await fs.mkdtemp(path.join(os.tmpdir(), 'ws-sb-dyn-a-'));
+      const dirB = await fs.mkdtemp(path.join(os.tmpdir(), 'ws-sb-dyn-b-'));
+      try {
+        const resolver = ({ requestContext }: { requestContext: RequestContext }) => {
+          const role = requestContext.get('role') as string;
+          return role === 'admin'
+            ? new LocalSandbox({ workingDirectory: dirA })
+            : new LocalSandbox({ workingDirectory: dirB });
+        };
+        const workspace = new Workspace({ sandbox: resolver });
+
+        const adminCtx = new RequestContext([['role', 'admin']]);
+        const userCtx = new RequestContext([['role', 'user']]);
+
+        const adminSb = await workspace.resolveSandbox({ requestContext: adminCtx });
+        const userSb = await workspace.resolveSandbox({ requestContext: userCtx });
+
+        expect((adminSb as LocalSandbox).workingDirectory).toBe(dirA);
+        expect((userSb as LocalSandbox).workingDirectory).toBe(dirB);
+      } finally {
+        await fs.rm(dirA, { recursive: true, force: true });
+        await fs.rm(dirB, { recursive: true, force: true });
+      }
+    });
+
+    it('should support async resolver functions', async () => {
+      const resolver = async ({ requestContext: _requestContext }: { requestContext: RequestContext }) => {
+        // Simulate async work (e.g., looking up config)
+        await new Promise(resolve => setTimeout(resolve, 1));
+        return new LocalSandbox({ workingDirectory: tempDir });
+      };
+      const workspace = new Workspace({ sandbox: resolver });
+
+      const ctx = new RequestContext();
+      const resolved = await workspace.resolveSandbox({ requestContext: ctx });
+
+      expect(resolved).toBeDefined();
+      expect(resolved!.provider).toBe('local');
+    });
+
+    it('should fall back to static sandbox in resolveSandbox', async () => {
+      const staticSandbox = new LocalSandbox({ workingDirectory: tempDir });
+      const workspace = new Workspace({ sandbox: staticSandbox });
+
+      const ctx = new RequestContext();
+      const resolved = await workspace.resolveSandbox({ requestContext: ctx });
+
+      expect(resolved).toBe(staticSandbox);
+    });
+
+    it('should throw when using both sandbox resolver and mounts', () => {
+      const resolver = () => new LocalSandbox({ workingDirectory: tempDir });
+      expect(
+        () =>
+          new Workspace({
+            sandbox: resolver,
+            mounts: {
+              '/a': new LocalFilesystem({ basePath: tempDir }),
+            },
+          }),
+      ).toThrow('Cannot use "mounts" with a dynamic sandbox resolver');
+    });
+
+    it('should warn and disable LSP when combined with a sandbox resolver', () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const workspace = new Workspace({
+          sandbox: () => new LocalSandbox({ workingDirectory: tempDir }),
+          lsp: true,
+        });
+
+        expect(workspace.lsp).toBeUndefined();
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('incompatible with a dynamic sandbox resolver'));
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it('should not throw NO_PROVIDERS when only sandbox resolver is provided', () => {
+      const resolver = () => new LocalSandbox({ workingDirectory: tempDir });
+      const workspace = new Workspace({ sandbox: resolver });
+
+      expect(workspace.hasSandboxConfig()).toBe(true);
+      expect(workspace.status).toBe('pending');
+    });
+
+    it('should return undefined from resolveSandbox when no sandbox configured', async () => {
+      const filesystem = new LocalFilesystem({ basePath: tempDir });
+      const workspace = new Workspace({ filesystem });
+
+      const ctx = new RequestContext();
+      const resolved = await workspace.resolveSandbox({ requestContext: ctx });
+
+      expect(resolved).toBeUndefined();
+    });
+
+    it('should not propagate logger when using resolver', () => {
+      const resolver = () => new LocalSandbox({ workingDirectory: tempDir });
+      const workspace = new Workspace({ sandbox: resolver });
+
+      const mockLogger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as any;
+      // Should not throw — no static sandbox instance to set logger on
+      expect(() => workspace.__setLogger(mockLogger)).not.toThrow();
+    });
+
+    it('should skip sandbox lifecycle (start/destroy) when using resolver', async () => {
+      let resolverCalls = 0;
+      const resolver = () => {
+        resolverCalls++;
+        return new LocalSandbox({ workingDirectory: tempDir });
+      };
+      const workspace = new Workspace({ sandbox: resolver });
+
+      await workspace.init();
+      expect(workspace.status).toBe('ready');
+      await workspace.destroy();
+      expect(workspace.status).toBe('destroyed');
+
+      // Resolver is only called when a tool runs, not by lifecycle.
+      expect(resolverCalls).toBe(0);
+    });
+
+    it('should not call the sandbox resolver to build instructions by default', async () => {
+      // Default 'placeholder' — building the prompt must not provision a sandbox.
+      let resolverCalls = 0;
+      const workspace = new Workspace({
+        sandbox: () => {
+          resolverCalls++;
+          return new LocalSandbox({ workingDirectory: tempDir });
+        },
+      });
+
+      const instructions = await workspace.getInstructionsAsync({ requestContext: new RequestContext() });
+
+      expect(resolverCalls).toBe(0);
+      expect(instructions).toContain('Dynamic sandbox configured');
+    });
+
+    it('should resolve concrete sandbox instructions when dynamicSandbox is "resolve"', async () => {
+      const workspace = new Workspace({
+        sandbox: ({ requestContext }) => {
+          const role = requestContext.get('role') as string;
+          return new LocalSandbox({ workingDirectory: path.join(tempDir, role) });
+        },
+        instructions: { dynamicSandbox: 'resolve' },
+      });
+
+      const adminInstructions = await workspace.getInstructionsAsync({
+        requestContext: new RequestContext([['role', 'admin']]),
+      });
+      const userInstructions = await workspace.getInstructionsAsync({
+        requestContext: new RequestContext([['role', 'user']]),
+      });
+
+      expect(adminInstructions).toContain(path.join(tempDir, 'admin'));
+      expect(userInstructions).toContain(path.join(tempDir, 'user'));
+    });
+
+    it('should use a custom dynamicSandbox instructions function without resolving', async () => {
+      let resolverCalls = 0;
+      const workspace = new Workspace({
+        sandbox: () => {
+          resolverCalls++;
+          return new LocalSandbox({ workingDirectory: tempDir });
+        },
+        instructions: {
+          dynamicSandbox: ({ requestContext }) => `Sandbox for tenant ${requestContext.get('tenant')}`,
+        },
+      });
+
+      const instructions = await workspace.getInstructionsAsync({
+        requestContext: new RequestContext([['tenant', 'acme']]),
+      });
+
+      expect(resolverCalls).toBe(0);
+      expect(instructions).toContain('Sandbox for tenant acme');
+    });
+
+    it('should forward the synthesized requestContext to provider instruction hooks', async () => {
+      // When the caller omits opts.requestContext, getInstructionsAsync synthesizes one
+      // to invoke resolvers — and must pass that same context to the provider's own
+      // getInstructions hook so per-request customization stays consistent.
+      let seenContext: RequestContext | undefined;
+      const workspace = new Workspace({
+        sandbox: () =>
+          new LocalSandbox({
+            workingDirectory: tempDir,
+            instructions: ({ requestContext }) => {
+              seenContext = requestContext;
+              return 'sandbox instructions';
+            },
+          }),
+        instructions: { dynamicSandbox: 'resolve' },
+      });
+
+      await workspace.getInstructionsAsync();
+
+      expect(seenContext).toBeInstanceOf(RequestContext);
+    });
+
+    it('should memoize resolved sandboxes by sandboxCacheKey across RequestContext instances', async () => {
+      let resolverCalls = 0;
+      const workspace = new Workspace({
+        sandbox: () => {
+          resolverCalls++;
+          return new LocalSandbox({ workingDirectory: tempDir });
+        },
+        sandboxCacheKey: ({ requestContext }) => requestContext.get('thread-id') as string | undefined,
+      });
+
+      // Two distinct RequestContext objects, same logical thread id → one sandbox.
+      const first = await workspace.resolveSandbox({ requestContext: new RequestContext([['thread-id', 't1']]) });
+      const second = await workspace.resolveSandbox({ requestContext: new RequestContext([['thread-id', 't1']]) });
+      // A different thread id resolves its own sandbox.
+      const other = await workspace.resolveSandbox({ requestContext: new RequestContext([['thread-id', 't2']]) });
+
+      expect(resolverCalls).toBe(2);
+      expect(first).toBe(second);
+      expect(other).not.toBe(first);
+    });
+
+    it('should retry sandbox resolver after a failure for the same RequestContext', async () => {
+      let resolverCalls = 0;
+      const workspace = new Workspace({
+        sandbox: () => {
+          resolverCalls++;
+          if (resolverCalls === 1) {
+            throw new Error('temporary sandbox failure');
+          }
+          return new LocalSandbox({ workingDirectory: tempDir });
+        },
+      });
+      const requestContext = new RequestContext();
+
+      await expect(workspace.resolveSandbox({ requestContext })).rejects.toThrow('temporary sandbox failure');
+      const resolved = await workspace.resolveSandbox({ requestContext });
+
+      expect(resolverCalls).toBe(2);
+      expect(resolved).toBeDefined();
+      expect(resolved!.provider).toBe('local');
+    });
+
+    it('should retry sandbox resolver after a failure for the same sandboxCacheKey', async () => {
+      let resolverCalls = 0;
+      const workspace = new Workspace({
+        sandbox: () => {
+          resolverCalls++;
+          if (resolverCalls === 1) {
+            return Promise.reject(new Error('temporary keyed sandbox failure'));
+          }
+          return new LocalSandbox({ workingDirectory: tempDir });
+        },
+        sandboxCacheKey: ({ requestContext }) => requestContext.get('thread-id') as string | undefined,
+      });
+
+      await expect(
+        workspace.resolveSandbox({ requestContext: new RequestContext([['thread-id', 't1']]) }),
+      ).rejects.toThrow('temporary keyed sandbox failure');
+      const resolved = await workspace.resolveSandbox({
+        requestContext: new RequestContext([['thread-id', 't1']]),
+      });
+
+      expect(resolverCalls).toBe(2);
+      expect(resolved).toBeDefined();
+      expect(resolved!.provider).toBe('local');
+    });
+
+    it('should clear cached sandboxes by sandboxCacheKey', async () => {
+      let resolverCalls = 0;
+      const workspace = new Workspace({
+        sandbox: () => {
+          resolverCalls++;
+          return new LocalSandbox({ workingDirectory: tempDir });
+        },
+        sandboxCacheKey: ({ requestContext }) => requestContext.get('thread-id') as string | undefined,
+      });
+
+      const t1 = new RequestContext([['thread-id', 't1']]);
+      const t2 = new RequestContext([['thread-id', 't2']]);
+
+      const first = await workspace.resolveSandbox({ requestContext: t1 });
+      const other = await workspace.resolveSandbox({ requestContext: t2 });
+
+      workspace.clearSandboxCache('t1');
+
+      const afterClear = await workspace.resolveSandbox({ requestContext: new RequestContext([['thread-id', 't1']]) });
+      const otherStillCached = await workspace.resolveSandbox({
+        requestContext: new RequestContext([['thread-id', 't2']]),
+      });
+
+      expect(resolverCalls).toBe(3);
+      expect(afterClear).not.toBe(first);
+      expect(otherStillCached).toBe(other);
+    });
+
+    it('should clear all cached sandboxes on destroy without destroying resolver-owned sandboxes', async () => {
+      let resolverCalls = 0;
+      const destroy = vi.fn();
+      const workspace = new Workspace({
+        sandbox: () => {
+          resolverCalls++;
+          return {
+            id: `sandbox-${resolverCalls}`,
+            name: `Sandbox ${resolverCalls}`,
+            provider: 'test',
+            status: 'running',
+            destroy,
+          } as any;
+        },
+        sandboxCacheKey: ({ requestContext }) => requestContext.get('thread-id') as string | undefined,
+      });
+
+      const requestContext = new RequestContext([['thread-id', 't1']]);
+      const first = await workspace.resolveSandbox({ requestContext });
+
+      await workspace.destroy();
+
+      const second = await workspace.resolveSandbox({ requestContext: new RequestContext([['thread-id', 't1']]) });
+
+      expect(resolverCalls).toBe(2);
+      expect(second).not.toBe(first);
+      expect(destroy).not.toHaveBeenCalled();
+    });
   });
 
   // ===========================================================================
@@ -2359,6 +2979,19 @@ Line 3 conclusion`;
       const workspace = new Workspace({ sandbox, lsp: true });
 
       expect(workspace.lsp).toBeInstanceOf(LSPManager);
+    });
+
+    it('keeps the LSP manager usable after stop()', async () => {
+      const sandbox = new LocalSandbox({ workingDirectory: tempDir });
+      const workspace = new Workspace({ sandbox, lsp: true });
+      const before = workspace.lsp;
+      expect(before).toBeInstanceOf(LSPManager);
+
+      await workspace.stop();
+
+      // shutdownAll() drains and resets the manager, so the same instance
+      // spawns clients again on the next diagnostics request.
+      expect(workspace.lsp).toBe(before);
     });
 
     it('does not create LSPManager when lsp is not configured', async () => {

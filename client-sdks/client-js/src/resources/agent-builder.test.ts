@@ -131,6 +131,20 @@ describe('AgentBuilder.runs', () => {
     expect(params.get('page')).toBe('10');
     expect(params.get('resourceId')).toBe('test-resource-456');
   });
+
+  it('stream should require a runId and serialize it as a query param', async () => {
+    await agentBuilder.stream({ inputData: { foo: 'bar' } }, 'run-stream-1');
+
+    expect(lastRequest.method).toBe('POST');
+    expect(lastRequest.url).toBe('/api/agent-builder/test-action-id/stream?runId=run-stream-1');
+  });
+
+  it('stream should throw when runId is missing', async () => {
+    await expect(
+      // @ts-expect-error: runId is now required, the cast intentionally exercises the runtime guard
+      agentBuilder.stream({ inputData: { foo: 'bar' } }, undefined),
+    ).rejects.toThrow(/runId is required/);
+  });
 });
 
 describe('AgentBuilder Streaming Methods (fetch-mocked)', () => {
@@ -204,6 +218,34 @@ describe('AgentBuilder Streaming Methods (fetch-mocked)', () => {
     // Verify correct endpoint was called
     const call = fetchMock.mock.calls.find((args: any[]) => String(args[0]).includes('/observe?runId='));
     expect(call).toBeTruthy();
+  });
+
+  it('streams agent builder records split across network chunks', async () => {
+    const encoded = new TextEncoder().encode('{"type":"live","payload":{"message":"mañana"}}\x1E');
+    const splitAt = encoded.indexOf(0xc3) + 1;
+    fetchMock.mockImplementationOnce(() =>
+      Promise.resolve(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(encoded.slice(0, splitAt));
+              controller.enqueue(encoded.slice(splitAt));
+              controller.close();
+            },
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    const stream = await agentBuilder.observeStream({ runId: 'run-fragmented' });
+    const reader = (stream as ReadableStream<any>).getReader();
+
+    await expect(reader.read()).resolves.toMatchObject({
+      done: false,
+      value: { type: 'live', payload: { message: 'mañana' } },
+    });
+    await expect(reader.read()).resolves.toMatchObject({ done: true });
   });
 
   it('observeStreamLegacy returns ReadableStream with legacy streaming', async () => {

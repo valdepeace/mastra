@@ -1,6 +1,6 @@
 import type { LanguageModelUsage, ProviderMetadata } from '@mastra/core/stream';
 import { describe, it, expect } from 'vitest';
-import { extractUsageMetrics } from './usage';
+import { addUsageStats, extractUsageMetrics } from './usage';
 
 describe('extractUsageMetrics', () => {
   describe('basic usage extraction', () => {
@@ -107,6 +107,57 @@ describe('extractUsageMetrics', () => {
       expect(result.inputDetails?.cacheRead).toBe(800);
       expect(result.inputDetails?.cacheWrite).toBe(200);
       expect(result.outputDetails?.text).toBe(50);
+    });
+
+    it('should preserve Anthropic cache creation TTL buckets', () => {
+      const usage: LanguageModelUsage = {
+        inputTokens: 100,
+        outputTokens: 50,
+      };
+
+      const providerMetadata: ProviderMetadata = {
+        anthropic: {
+          cacheCreation: {
+            ephemeral_5m_input_tokens: 125,
+            ephemeral_1h_input_tokens: 75,
+          },
+        },
+      };
+
+      const result = extractUsageMetrics(usage, providerMetadata);
+
+      expect(result.inputTokens).toBe(300);
+      expect(result.inputDetails?.text).toBe(100);
+      expect(result.inputDetails?.cacheWrite).toBe(200);
+      expect(result.inputDetails?.cacheWrite5m).toBe(125);
+      expect(result.inputDetails?.cacheWrite1h).toBe(75);
+    });
+
+    it('should prefer aggregated Anthropic cache creation TTL buckets', () => {
+      const usage: LanguageModelUsage = {
+        inputTokens: 300,
+        outputTokens: 50,
+        cacheCreationInputTokens: 200,
+        cacheCreationInputTokens5m: 120,
+        cacheCreationInputTokens1h: 80,
+      };
+
+      const providerMetadata: ProviderMetadata = {
+        anthropic: {
+          cacheCreationInputTokens: 30,
+          cacheCreation: {
+            ephemeral_5m_input_tokens: 20,
+            ephemeral_1h_input_tokens: 10,
+          },
+        },
+      };
+
+      const result = extractUsageMetrics(usage, providerMetadata);
+
+      expect(result.inputTokens).toBe(300);
+      expect(result.inputDetails?.cacheWrite).toBe(200);
+      expect(result.inputDetails?.cacheWrite5m).toBe(120);
+      expect(result.inputDetails?.cacheWrite1h).toBe(80);
     });
 
     it('should handle Anthropic with only cache read tokens', () => {
@@ -521,5 +572,61 @@ describe('extractUsageMetrics', () => {
       expect(result.inputDetails).toEqual({ text: 100 });
       expect(result.outputDetails).toEqual({ text: 50 });
     });
+  });
+});
+
+describe('addUsageStats', () => {
+  it('returns a copy of b when accumulator is undefined', () => {
+    const result = addUsageStats(undefined, { inputTokens: 10, outputTokens: 5 });
+    expect(result).toEqual({ inputTokens: 10, outputTokens: 5 });
+  });
+
+  it('does not mutate the accumulator', () => {
+    const a = { inputTokens: 5, outputTokens: 2 };
+    const result = addUsageStats(a, { inputTokens: 3, outputTokens: 1 });
+    expect(a).toEqual({ inputTokens: 5, outputTokens: 2 });
+    expect(result).toEqual({ inputTokens: 8, outputTokens: 3 });
+  });
+
+  it('sums top-level token counts', () => {
+    const result = addUsageStats({ inputTokens: 100, outputTokens: 50 }, { inputTokens: 25, outputTokens: 75 });
+    expect(result.inputTokens).toBe(125);
+    expect(result.outputTokens).toBe(125);
+  });
+
+  it('keeps undefined fields undefined when both sides omit them', () => {
+    const result = addUsageStats({ inputTokens: 10 }, { outputTokens: 5 });
+    expect(result.inputTokens).toBe(10);
+    expect(result.outputTokens).toBe(5);
+  });
+
+  it('merges inputDetails and outputDetails per-field', () => {
+    const result = addUsageStats(
+      {
+        inputDetails: { text: 90, cacheRead: 10 },
+        outputDetails: { text: 40, reasoning: 5 },
+      },
+      {
+        inputDetails: { text: 30, cacheWrite: 8 },
+        outputDetails: { text: 10, audio: 2 },
+      },
+    );
+    expect(result.inputDetails).toEqual({ text: 120, cacheRead: 10, cacheWrite: 8 });
+    expect(result.outputDetails).toEqual({ text: 50, reasoning: 5, audio: 2 });
+  });
+
+  it('preserves aggregate and TTL buckets when rolling up mixed cache-write usage', () => {
+    const result = addUsageStats(
+      { inputDetails: { cacheWrite: 500, cacheWrite5m: 500 } },
+      { inputDetails: { cacheWrite: 1_000 } },
+    );
+
+    expect(result.inputDetails).toEqual({ cacheWrite: 1_500, cacheWrite5m: 500 });
+  });
+
+  it('preserves details from one side when the other has none', () => {
+    const result = addUsageStats({ inputTokens: 10 }, { inputTokens: 5, inputDetails: { text: 5 } });
+    expect(result.inputTokens).toBe(15);
+    expect(result.inputDetails).toEqual({ text: 5 });
   });
 });

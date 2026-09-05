@@ -335,6 +335,63 @@ describe('BatchPartsProcessor', () => {
       });
       expect(result).toBeNull();
     });
+
+    it('returns the batched text and stashes the non-text part for reprocessing (issue #17094)', async () => {
+      processor = new BatchPartsProcessor({ batchSize: 10 });
+
+      // A writer being present signals that we're running inside the processor
+      // chain, so the non-text part is stashed for the runner to re-drive
+      // through the chain rather than deferred to a next call that may never come.
+      const writer = { custom: async () => {} };
+
+      const chunks: ChunkType[] = [
+        { type: 'text-delta', payload: { text: 'Hello', id: 'text-1' }, runId: '1', from: ChunkFrom.AGENT },
+        { type: 'text-delta', payload: { text: ' world', id: 'text-1' }, runId: '1', from: ChunkFrom.AGENT },
+        { type: 'object', object: { key: 'value' }, runId: '1', from: ChunkFrom.AGENT },
+      ];
+
+      const state: BatchPartsState = { batch: [], timeoutId: undefined, timeoutTriggered: false };
+
+      const abort = () => {
+        throw new Error('abort');
+      };
+
+      // Buffer two text deltas (batch size not reached).
+      expect(
+        await processor.processOutputStream({ part: chunks[0], streamParts: [chunks[0]], state, abort, writer }),
+      ).toBeNull();
+      expect(
+        await processor.processOutputStream({ part: chunks[1], streamParts: [chunks[1]], state, abort, writer }),
+      ).toBeNull();
+
+      // Non-text part arrives: the batched text is returned (so it flows through
+      // downstream processors) and the non-text part is stashed under the
+      // reprocess key for the runner to re-drive — NOT deferred — so nothing is
+      // lost even if the stream stops on this part.
+      const result = await processor.processOutputStream({
+        part: chunks[2],
+        streamParts: [chunks[2]],
+        state,
+        abort,
+        writer,
+      });
+
+      expect(result).toEqual({
+        type: 'text-delta',
+        runId: '1',
+        from: ChunkFrom.AGENT,
+        payload: { text: 'Hello world', id: 'text-1' },
+      });
+      expect((state as Record<string, unknown>).__mastraReprocessPart).toEqual({
+        type: 'object',
+        object: { key: 'value' },
+        runId: '1',
+        from: ChunkFrom.AGENT,
+      });
+      // Nothing should be left in the legacy deferral field.
+      expect((state as Record<string, unknown>).pendingNonText).toBeUndefined();
+      expect(state.batch).toEqual([]);
+    });
   });
 
   describe('timeout functionality', () => {
@@ -442,6 +499,62 @@ describe('BatchPartsProcessor', () => {
       });
       expect(result).toBeNull();
     });
+
+    it('stashes the non-text part for reprocessing even when maxWaitTime is set (issue #17094)', async () => {
+      // maxWaitTime must not interfere with the writer-present stash path: a
+      // non-text part arriving before the timeout still flushes the batch and
+      // stashes the non-text part rather than deferring it.
+      processor = new BatchPartsProcessor({ batchSize: 10, maxWaitTime: 1000 });
+      const writer = { custom: async () => {} };
+      const abort = () => {
+        throw new Error('abort');
+      };
+
+      const text1: ChunkType = {
+        type: 'text-delta',
+        payload: { text: 'Hello', id: 'text-1' },
+        runId: '1',
+        from: ChunkFrom.AGENT,
+      };
+      const text2: ChunkType = {
+        type: 'text-delta',
+        payload: { text: ' world', id: 'text-1' },
+        runId: '1',
+        from: ChunkFrom.AGENT,
+      };
+      const nonText: ChunkType = { type: 'object', object: { key: 'value' }, runId: '1', from: ChunkFrom.AGENT };
+
+      const state: BatchPartsState = { batch: [], timeoutId: undefined, timeoutTriggered: false };
+
+      // Buffer two text deltas (this also arms the maxWaitTime timeout).
+      expect(
+        await processor.processOutputStream({ part: text1, streamParts: [text1], state, abort, writer }),
+      ).toBeNull();
+      expect(
+        await processor.processOutputStream({ part: text2, streamParts: [text2], state, abort, writer }),
+      ).toBeNull();
+
+      // Non-text part arrives before the timeout fires: batch is returned and the
+      // non-text part is stashed for reprocessing (not deferred).
+      const result = await processor.processOutputStream({
+        part: nonText,
+        streamParts: [nonText],
+        state,
+        abort,
+        writer,
+      });
+
+      expect(result).toEqual({
+        type: 'text-delta',
+        runId: '1',
+        from: ChunkFrom.AGENT,
+        payload: { text: 'Hello world', id: 'text-1' },
+      });
+      expect((state as Record<string, unknown>).__mastraReprocessPart).toEqual(nonText);
+      expect((state as Record<string, unknown>).pendingNonText).toBeUndefined();
+      // The pending timeout was cleared by the flush.
+      expect(state.timeoutId).toBeUndefined();
+    });
   });
 
   describe('flush functionality', () => {
@@ -488,6 +601,47 @@ describe('BatchPartsProcessor', () => {
       processor = new BatchPartsProcessor();
       const result = processor.flush();
       expect(result).toBeNull();
+    });
+
+    it('should not drop non-text parts buffered alongside text when emitOnNonText is false', async () => {
+      processor = new BatchPartsProcessor({ batchSize: 5, emitOnNonText: false });
+      const state: BatchPartsState = { batch: [], timeoutId: undefined, timeoutTriggered: false };
+
+      const parts = [
+        { type: 'text-delta', payload: { text: 'Hello ', id: 'text-1' }, runId: '1', from: ChunkFrom.AGENT },
+        {
+          type: 'tool-call',
+          runId: '1',
+          from: ChunkFrom.AGENT,
+          payload: { toolCallId: 'tc-1', toolName: 'search', args: {} },
+        },
+        { type: 'text-delta', payload: { text: 'world', id: 'text-1' }, runId: '1', from: ChunkFrom.AGENT },
+      ] as ChunkType[];
+
+      for (const part of parts) {
+        await processor.processOutputStream({
+          part,
+          streamParts: [part],
+          state,
+          abort: () => {
+            throw new Error('abort');
+          },
+        });
+      }
+
+      // Drain everything the processor buffered.
+      const emitted: ChunkType[] = [];
+      let chunk = processor.flush(state);
+      let guard = 0;
+      while (chunk && guard++ < 10) {
+        emitted.push(chunk);
+        chunk = processor.flush(state);
+      }
+
+      // The buffered non-text tool-call must survive (not be dropped) and order is preserved.
+      expect(emitted.map(p => p.type)).toEqual(['text-delta', 'tool-call', 'text-delta']);
+      const toolCall = emitted.find(p => p.type === 'tool-call');
+      expect(toolCall).toMatchObject({ type: 'tool-call', payload: { toolCallId: 'tc-1' } });
     });
   });
 

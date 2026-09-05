@@ -1,8 +1,9 @@
-import pMap from 'p-map';
 import { ErrorCategory, ErrorDomain, MastraError } from '../error';
 import { saveScorePayloadSchema } from '../evals';
 import type { ScoringHookInput } from '../evals/types';
+import { isScorerHookForMastra } from '../hooks/scorer-owner';
 import type { Mastra } from '../mastra';
+import { resolveAgentById } from '../mastra/resolve-agent';
 import { EntityType } from '../observability';
 import type { MastraStorage } from '../storage';
 
@@ -19,6 +20,10 @@ function toScorerTargetEntityType(entityType: string): EntityType | undefined {
 
 export function createOnScorerHook(mastra: Mastra) {
   return async (hookData: ScoringHookInput) => {
+    if (!isScorerHookForMastra(hookData, mastra)) {
+      return;
+    }
+
     const storage = mastra.getStorage();
 
     if (!storage) {
@@ -58,7 +63,7 @@ export function createOnScorerHook(mastra: Mastra) {
       const spanId = currentSpan?.isValid ? currentSpan.id : undefined;
       const targetCorrelationContext = currentSpan?.isValid ? currentSpan.getCorrelationContext?.() : undefined;
       const targetMetadata = currentSpan?.isValid && currentSpan.metadata ? { ...currentSpan.metadata } : undefined;
-      const runResult = (await scorerToUse.scorer.run({
+      const runResult = await scorerToUse.scorer.run({
         ...rest,
         input,
         output,
@@ -69,7 +74,7 @@ export function createOnScorerHook(mastra: Mastra) {
         targetSpanId: spanId,
         targetCorrelationContext,
         targetMetadata,
-      } as any)) as Record<string, unknown>;
+      } as any);
 
       const payload = {
         ...rest,
@@ -87,33 +92,10 @@ export function createOnScorerHook(mastra: Mastra) {
         },
       };
       // Legacy score-store emission. This path is being deprecated.
+      // ScoreEvent emission already happens inside MastraScorer.run() (see
+      // packages/core/src/evals/base.ts). The hook must not republish or every
+      // exporter would receive the same score twice.
       await validateAndSaveScore(storage, payload);
-
-      if (currentSpan && spanId && traceId) {
-        await pMap(
-          currentSpan.observabilityInstance.getExporters(),
-          async exporter => {
-            if (exporter.addScoreToTrace) {
-              try {
-                await exporter.addScoreToTrace({
-                  traceId: traceId,
-                  spanId: spanId,
-                  score: runResult.score as number,
-                  reason: runResult.reason as string,
-                  scorerName: scorerToUse.scorer.id,
-                  metadata: {
-                    ...(currentSpan.metadata ?? {}),
-                  },
-                });
-              } catch (error) {
-                // Log error but don't fail the hook if exporter fails
-                mastra.getLogger()?.error(`Failed to add score to trace via exporter: ${error}`);
-              }
-            }
-          },
-          { concurrency: 3 },
-        );
-      }
     } catch (error) {
       const mastraError = new MastraError(
         {
@@ -154,32 +136,20 @@ export async function validateAndSaveScore(storage: MastraStorage, payload: unkn
 async function findScorer(mastra: Mastra, entityId: string, entityType: string, scorerId: string) {
   let scorerToUse;
   if (entityType === 'AGENT') {
-    // Try code-defined agents first
     try {
-      const agent = mastra.getAgentById(entityId);
-      const scorers = await agent.listScorers();
-      for (const [_, scorer] of Object.entries(scorers)) {
-        if (scorer.scorer.id === scorerId) {
-          scorerToUse = scorer;
-          break;
+      // Registry first, then stored agents via the editor.
+      const resolved = await resolveAgentById(mastra, entityId);
+      if (resolved.status === 'found') {
+        const scorers = await resolved.agent.listScorers();
+        for (const [_, scorer] of Object.entries(scorers)) {
+          if (scorer.scorer.id === scorerId) {
+            scorerToUse = scorer;
+            break;
+          }
         }
       }
     } catch {
-      // Agent not found in code-defined agents, try stored agents via editor
-      try {
-        const storedAgent = (await mastra.getEditor()?.agent.getById(entityId)) ?? null;
-        if (storedAgent) {
-          const scorers = await storedAgent.listScorers();
-          for (const [_, scorer] of Object.entries(scorers) as [string, any][]) {
-            if (scorer.scorer.id === scorerId) {
-              scorerToUse = scorer;
-              break;
-            }
-          }
-        }
-      } catch {
-        // Stored agent also not found, will fall back to mastra-registered scorer
-      }
+      // Resolution or scorer listing failed — fall back to mastra-registered scorer
     }
   } else if (entityType === 'WORKFLOW') {
     const scorers = await mastra.getWorkflowById(entityId).listScorers();

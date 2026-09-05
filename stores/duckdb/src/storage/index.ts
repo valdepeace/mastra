@@ -1,4 +1,5 @@
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
+import { coreFeatures } from '@mastra/core/features';
 import type { StorageDomains } from '@mastra/core/storage';
 import { MastraCompositeStore, ObservabilityStorage as CoreObservabilityStorage } from '@mastra/core/storage';
 
@@ -10,6 +11,9 @@ import type {
 
 const OBSERVABILITY_UPGRADE_MESSAGE =
   'DuckDB observability storage requires `@mastra/core` with observability storage support. Upgrade `@mastra/core` to use this store.';
+const OBSERVABILITY_DELTA_POLLING_FEATURE = 'observability-delta-polling';
+const DUCKDB_OBSERVABILITY_FEATURES = ['metrics', 'logs', 'trace-query'] as const;
+const DUCKDB_OBSERVABILITY_DELTA_FEATURES = ['metrics', 'logs', 'delta-polling', 'trace-query'] as const;
 
 function isObservabilityCompatibilityError(error: unknown): boolean {
   if (!(error instanceof Error)) {
@@ -112,6 +116,16 @@ export class ObservabilityStorageDuckDB extends CoreObservabilityStorage {
     return this.delegate?.tracingStrategy ?? this.observabilityStrategy;
   }
 
+  getFeatures(): ReturnType<ObservabilityStoreImpl['getFeatures']> {
+    // Deliberately mirrored here so the lazy facade can advertise DuckDB's
+    // static observability features before the delegate is instantiated.
+    if (!coreFeatures.has(OBSERVABILITY_DELTA_POLLING_FEATURE)) {
+      return DUCKDB_OBSERVABILITY_FEATURES;
+    }
+
+    return DUCKDB_OBSERVABILITY_DELTA_FEATURES;
+  }
+
   async init(...args: Parameters<ObservabilityStoreImpl['init']>): ReturnType<ObservabilityStoreImpl['init']> {
     const delegate = await this.loadDelegate();
     if (!delegate) {
@@ -187,6 +201,20 @@ export class ObservabilityStorageDuckDB extends CoreObservabilityStorage {
   ): ReturnType<ObservabilityStoreImpl['listTraces']> {
     const delegate = await this.requireDelegate();
     return delegate.listTraces(...args);
+  }
+
+  async queryTraces(
+    ...args: Parameters<ObservabilityStoreImpl['queryTraces']>
+  ): ReturnType<ObservabilityStoreImpl['queryTraces']> {
+    const delegate = await this.requireDelegate();
+    return delegate.queryTraces(...args);
+  }
+
+  async listTracesLight(
+    ...args: Parameters<ObservabilityStoreImpl['listTracesLight']>
+  ): ReturnType<ObservabilityStoreImpl['listTracesLight']> {
+    const delegate = await this.requireDelegate();
+    return delegate.listTracesLight(...args);
   }
 
   async listBranches(
@@ -404,6 +432,13 @@ export class ObservabilityStorageDuckDB extends CoreObservabilityStorage {
     return delegate.listFeedback(...args);
   }
 
+  async updateFeedbackReviewStatus(
+    ...args: Parameters<ObservabilityStoreImpl['updateFeedbackReviewStatus']>
+  ): ReturnType<ObservabilityStoreImpl['updateFeedbackReviewStatus']> {
+    const delegate = await this.requireDelegate();
+    return delegate.updateFeedbackReviewStatus(...args);
+  }
+
   async getFeedbackAggregate(
     ...args: Parameters<ObservabilityStoreImpl['getFeedbackAggregate']>
   ): ReturnType<ObservabilityStoreImpl['getFeedbackAggregate']> {
@@ -443,6 +478,19 @@ export interface DuckDBStoreConfig {
    * Use ':memory:' for an ephemeral in-memory database.
    */
   path?: string;
+  /**
+   * Maximum memory DuckDB may use (e.g. '2GB', '512MB').
+   * @default '2GB'
+   * DuckDB's own default is 80% of system RAM, which is far too aggressive
+   * for a store embedded in an application server.
+   */
+  memoryLimit?: string;
+  /**
+   * Number of threads DuckDB may use. Defaults to DuckDB's default (one per
+   * CPU core). Lower this to keep queries from monopolizing all cores of a
+   * shared application server.
+   */
+  threads?: number;
 }
 
 /**
@@ -477,7 +525,7 @@ export class DuckDBStore extends MastraCompositeStore {
     const id = config.id ?? 'duckdb';
     super({ id, name: 'DuckDBStore' });
 
-    this.db = new DuckDBConnection({ path: config.path });
+    this.db = new DuckDBConnection({ path: config.path, memoryLimit: config.memoryLimit, threads: config.threads });
     this.observabilityStore = new ObservabilityStorageDuckDB({ db: this.db });
 
     this.stores = {
@@ -488,5 +536,16 @@ export class DuckDBStore extends MastraCompositeStore {
   /** Convenience accessor for the observability domain. */
   get observability(): ObservabilityStorageDuckDB {
     return this.observabilityStore;
+  }
+
+  /**
+   * Release the underlying DuckDB instance so the file lock is freed.
+   * Called automatically by Mastra.shutdown(). Without this, the DuckDB
+   * native write lock persists past process exit during dev hot reloads,
+   * causing "Conflicting lock is held" errors on the next start.
+   * Safe to call more than once; subsequent calls are no-ops.
+   */
+  async close(): Promise<void> {
+    await this.db.close();
   }
 }

@@ -14,7 +14,7 @@ import type {
 } from '../types';
 import { cleanStepResult, hydrateSerializedStepErrors } from '../utils';
 import type { WorkflowEventProcessor } from './workflow-event-processor';
-import { getStep } from './workflow-event-processor/utils';
+import { getStepId } from './workflow-event-processor/utils';
 
 export class EventedExecutionEngine extends ExecutionEngine {
   protected eventProcessor: WorkflowEventProcessor;
@@ -44,9 +44,9 @@ export class EventedExecutionEngine extends ExecutionEngine {
    * branches need access to the workflow's step graph by id, so prefer the
    * internal registry when present.
    */
-  private resolveWorkflow(workflowId: string) {
-    if (this.mastra?.__hasInternalWorkflow(workflowId)) {
-      return this.mastra.__getInternalWorkflow(workflowId);
+  private resolveWorkflow(workflowId: string, runId?: string) {
+    if (this.mastra?.__hasInternalWorkflow(workflowId, runId)) {
+      return this.mastra.__getInternalWorkflow(workflowId, runId);
     }
     return this.mastra!.getWorkflow(workflowId);
   }
@@ -134,8 +134,8 @@ export class EventedExecutionEngine extends ExecutionEngine {
     // Wrap in try/catch to ensure proper cleanup and rejection on errors
     try {
       if (params.resume) {
-        const prevStep = getStep(this.resolveWorkflow(params.workflowId), params.resume.resumePath);
-        const prevResult = params.resume.stepResults[prevStep?.id ?? 'input'];
+        const prevStepId = getStepId(this.resolveWorkflow(params.workflowId, params.runId), params.resume.resumePath);
+        const prevResult = params.resume.stepResults[prevStepId ?? 'input'];
         // Extract state from stepResults.__state or use initialState
         const resumeState = params.resume.stepResults?.__state ?? params.initialState ?? {};
 
@@ -150,7 +150,7 @@ export class EventedExecutionEngine extends ExecutionEngine {
             resumeSteps: params.resume.steps,
             prevResult: { status: 'success', output: prevResult?.payload },
             resumeData: params.resume.resumePayload,
-            requestContext: Object.fromEntries(params.requestContext.entries()),
+            requestContext: params.requestContext.toJSON(),
             format: params.format,
             perStep: params.perStep,
             initialState: resumeState,
@@ -160,8 +160,11 @@ export class EventedExecutionEngine extends ExecutionEngine {
           },
         });
       } else if (params.timeTravel) {
-        const prevStep = getStep(this.resolveWorkflow(params.workflowId), params.timeTravel.executionPath);
-        const prevResult = params.timeTravel.stepResults[prevStep?.id ?? 'input'];
+        const prevStepId = getStepId(
+          this.resolveWorkflow(params.workflowId, params.runId),
+          params.timeTravel.executionPath,
+        );
+        const prevResult = params.timeTravel.stepResults[prevStepId ?? 'input'];
         await pubsub.publish('workflows', {
           type: 'workflow.start',
           runId: params.runId,
@@ -172,9 +175,29 @@ export class EventedExecutionEngine extends ExecutionEngine {
             stepResults: params.timeTravel.stepResults,
             timeTravel: params.timeTravel,
             prevResult: { status: 'success', output: prevResult?.payload },
-            requestContext: Object.fromEntries(params.requestContext.entries()),
+            requestContext: params.requestContext.toJSON(),
             format: params.format,
             perStep: params.perStep,
+            state: params.timeTravel.state,
+          },
+        });
+      } else if (params.restart) {
+        const prevStepId = getStepId(this.resolveWorkflow(params.workflowId, params.runId), params.restart.activePaths);
+        const prevResult = params.restart.stepResults[prevStepId ?? 'input'];
+        await pubsub.publish('workflows', {
+          type: 'workflow.start',
+          runId: params.runId,
+          data: {
+            workflowId: params.workflowId,
+            runId: params.runId,
+            executionPath: params.restart.activePaths,
+            stepResults: params.restart.stepResults,
+            restart: params.restart,
+            prevResult: { status: 'success', output: prevResult?.payload },
+            requestContext: params.requestContext.toJSON(),
+            format: params.format,
+            perStep: params.perStep,
+            state: params.restart.state,
           },
         });
       } else {
@@ -185,7 +208,7 @@ export class EventedExecutionEngine extends ExecutionEngine {
             workflowId: params.workflowId,
             runId: params.runId,
             prevResult: { status: 'success', output: params.input },
-            requestContext: Object.fromEntries(params.requestContext.entries()),
+            requestContext: params.requestContext.toJSON(),
             format: params.format,
             perStep: params.perStep,
             initialState: params.initialState,
@@ -209,10 +232,16 @@ export class EventedExecutionEngine extends ExecutionEngine {
     // Strip __state from stepResults at top level
     const { __state: _removedState, ...stepResultsWithoutTopLevelState } = resultData.stepResults ?? {};
 
-    // Recursively clean each step result to remove internal properties (__state, nestedRunId)
-    // This handles both object and array step results (e.g., forEach outputs)
+    // Recursively clean each step result to remove internal properties (__state, nestedRunId).
+    // This handles both object and array step results (e.g., forEach outputs).
+    // `skipped` entries are internal bookkeeping for un-taken conditional branches (used to
+    // know when every branch has reported in) — the default engine never surfaces them, so
+    // they're dropped from the user-facing step results too.
     const cleanStepResults: Record<string, any> = {};
     for (const [stepId, stepResult] of Object.entries(stepResultsWithoutTopLevelState)) {
+      if ((stepResult as any)?.status === 'skipped') {
+        continue;
+      }
       cleanStepResults[stepId] = cleanStepResult(stepResult);
     }
 

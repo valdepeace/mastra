@@ -1,16 +1,11 @@
-import {
-  Button,
-  ErrorState,
-  NoDataPageLayout,
-  PageHeader,
-  PageLayout,
-  PermissionDenied,
-  SessionExpired,
-  Txt,
-  is401UnauthorizedError,
-  is403ForbiddenError,
-} from '@mastra/playground-ui';
-import { ArrowLeftIcon, CalendarClockIcon, PauseIcon, PlayIcon } from 'lucide-react';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { ErrorState } from '@mastra/playground-ui/components/ErrorState';
+import { NoDataPageLayout, PageLayout } from '@mastra/playground-ui/components/PageLayout';
+import { PermissionDenied } from '@mastra/playground-ui/components/PermissionDenied';
+import { SessionExpired } from '@mastra/playground-ui/components/SessionExpired';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { is401UnauthorizedError, is403ForbiddenError } from '@mastra/playground-ui/utils/errors';
+import { ArrowLeftIcon, PauseIcon, PlayIcon } from 'lucide-react';
 import { Link, useParams } from 'react-router';
 import { ScheduleStatusText } from '@/domains/schedules/components/schedule-status-badge';
 import { ScheduleTriggersList } from '@/domains/schedules/components/schedule-triggers-list';
@@ -23,7 +18,7 @@ import { useLinkComponent } from '@/lib/framework';
 function MetaItem({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="flex flex-col gap-1">
-      <Txt variant="ui-xs" className="text-neutral4 uppercase tracking-wide">
+      <Txt variant="ui-xs" className="text-neutral4 tracking-wide uppercase">
         {label}
       </Txt>
       <div className="text-ui-md">{children}</div>
@@ -34,7 +29,7 @@ function MetaItem({ label, children }: { label: string; children: React.ReactNod
 export default function SchedulePage() {
   const { scheduleId } = useParams<{ scheduleId: string }>();
   const { paths } = useLinkComponent();
-  const { data: schedule, isLoading, error } = useSchedule(scheduleId);
+  const { data: schedule, error } = useSchedule(scheduleId);
   const {
     data: triggers,
     isLoading: triggersLoading,
@@ -47,7 +42,7 @@ export default function SchedulePage() {
 
   if (error && is401UnauthorizedError(error)) {
     return (
-      <NoDataPageLayout title="Schedule" icon={<CalendarClockIcon />}>
+      <NoDataPageLayout>
         <SessionExpired />
       </NoDataPageLayout>
     );
@@ -55,7 +50,7 @@ export default function SchedulePage() {
 
   if (error && is403ForbiddenError(error)) {
     return (
-      <NoDataPageLayout title="Schedule" icon={<CalendarClockIcon />}>
+      <NoDataPageLayout>
         <PermissionDenied resource="schedules" />
       </NoDataPageLayout>
     );
@@ -63,26 +58,19 @@ export default function SchedulePage() {
 
   if (error) {
     return (
-      <NoDataPageLayout title="Schedule" icon={<CalendarClockIcon />}>
+      <NoDataPageLayout>
         <ErrorState title="Failed to load schedule" message={error.message} />
       </NoDataPageLayout>
     );
   }
 
-  const workflowId = schedule?.target.type === 'workflow' ? schedule.target.workflowId : undefined;
+  const workflowId = schedule?.workflowId;
+  const agentId = schedule?.agentId;
 
   return (
     <PageLayout>
       <PageLayout.TopArea>
-        <PageLayout.Row>
-          <PageLayout.Column>
-            <PageHeader>
-              <PageHeader.Title isLoading={isLoading}>
-                <CalendarClockIcon />
-                <span className="font-mono">{schedule?.id ?? scheduleId}</span>
-              </PageHeader.Title>
-            </PageHeader>
-          </PageLayout.Column>
+        <PageLayout.Row className="justify-end">
           <PageLayout.Column className="flex justify-end gap-2">
             <Button as={Link} to={paths.schedulesLink()} variant="ghost">
               <ArrowLeftIcon />
@@ -117,20 +105,24 @@ export default function SchedulePage() {
       </PageLayout.TopArea>
 
       {schedule ? (
-        <div className="grid gap-6 h-full overflow-hidden grid-cols-[minmax(0,20rem)_1fr]">
-          <div className="flex flex-col gap-4 border border-border1 rounded-md p-4 h-fit">
-            <MetaItem label="Workflow">
+        <div className="grid h-full grid-cols-[minmax(0,20rem)_1fr] gap-6 overflow-hidden">
+          <div className="border-border1 flex h-fit flex-col gap-4 rounded-md border p-4">
+            <MetaItem label={agentId ? 'Agent' : 'Workflow'}>
               {workflowId ? (
                 <Link to={paths.workflowLink(workflowId)} className="text-accent1 hover:underline">
                   {workflowId}
+                </Link>
+              ) : agentId ? (
+                <Link to={paths.agentLink(agentId)} className="text-accent1 hover:underline">
+                  {agentId}
                 </Link>
               ) : (
                 '—'
               )}
             </MetaItem>
             <MetaItem label="Cron">
-              <code className="font-mono text-ui-md">{schedule.cron}</code>
-              {schedule.timezone ? <span className="text-neutral4 ml-2 text-ui-sm">{schedule.timezone}</span> : null}
+              <code className="text-ui-md font-mono">{schedule.cron}</code>
+              {schedule.timezone ? <span className="text-neutral4 text-ui-sm ml-2">{schedule.timezone}</span> : null}
             </MetaItem>
             <MetaItem label="Status">
               <ScheduleStatusText status={schedule.status} />

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AIV5Type } from '../types';
-import { addStartStepPartsForAIV5, sanitizeV5UIMessages } from './output-converter';
+import { addStartStepPartsForAIV5, aiV5UIMessagesToAIV5ModelMessages, sanitizeV5UIMessages } from './output-converter';
 
 /**
  * Tests for provider-executed tool handling in sanitizeV5UIMessages.
@@ -38,7 +38,7 @@ describe('sanitizeV5UIMessages — provider-executed tool handling', () => {
       }),
     ]);
 
-    const result = sanitizeV5UIMessages([msg], true);
+    const result = sanitizeV5UIMessages([msg], 'prompt');
 
     // Message should be dropped entirely — its only part was filtered out
     expect(result).toHaveLength(0);
@@ -55,7 +55,7 @@ describe('sanitizeV5UIMessages — provider-executed tool handling', () => {
       }),
     ]);
 
-    const result = sanitizeV5UIMessages([msg], true);
+    const result = sanitizeV5UIMessages([msg], 'prompt');
 
     // Deferred provider tool should be kept — the provider API needs to see
     // the server_tool_use block in the conversation history
@@ -74,7 +74,7 @@ describe('sanitizeV5UIMessages — provider-executed tool handling', () => {
       }),
     ]);
 
-    const result = sanitizeV5UIMessages([msg], true);
+    const result = sanitizeV5UIMessages([msg], 'prompt');
 
     expect(result).toHaveLength(1);
     expect(result[0]!.parts).toHaveLength(1);
@@ -92,7 +92,7 @@ describe('sanitizeV5UIMessages — provider-executed tool handling', () => {
       }),
     ]);
 
-    const result = sanitizeV5UIMessages([msg], true);
+    const result = sanitizeV5UIMessages([msg], 'prompt');
 
     expect(result).toHaveLength(1);
     expect(result[0]!.parts).toHaveLength(1);
@@ -125,7 +125,7 @@ describe('sanitizeV5UIMessages — provider-executed tool handling', () => {
       }),
     ]);
 
-    const result = sanitizeV5UIMessages([msg], true);
+    const result = sanitizeV5UIMessages([msg], 'prompt');
 
     expect(result).toHaveLength(1);
     expect(result[0]!.parts).toHaveLength(2);
@@ -147,7 +147,7 @@ describe('sanitizeV5UIMessages — provider-executed tool handling', () => {
       } as any),
     ]);
 
-    const result = sanitizeV5UIMessages([msg], true);
+    const result = sanitizeV5UIMessages([msg], 'prompt');
 
     expect(result).toHaveLength(1);
     expect(result[0]!.parts).toHaveLength(1);
@@ -174,7 +174,7 @@ describe('sanitizeV5UIMessages — provider-executed tool handling', () => {
       }),
     ]);
 
-    const result = sanitizeV5UIMessages([msg], true);
+    const result = sanitizeV5UIMessages([msg], 'prompt');
 
     expect(result).toHaveLength(1);
     expect(result[0]!.parts).toHaveLength(2);
@@ -202,10 +202,256 @@ describe('sanitizeV5UIMessages — provider-executed tool handling', () => {
     ]);
 
     // Without filterIncompleteToolCalls, both should be kept (only input-streaming is filtered)
-    const result = sanitizeV5UIMessages([msg], false);
+    const result = sanitizeV5UIMessages([msg], 'response');
 
     expect(result).toHaveLength(1);
     expect(result[0]!.parts).toHaveLength(2);
+  });
+});
+
+/**
+ * Regression tests for https://github.com/mastra-ai/mastra/issues/15668
+ *
+ * Gemini `code_execution` (and `google_search`) on Vertex AI non-deterministically
+ * omits the paired `codeExecutionResult` after emitting `executableCode`. The AI SDK
+ * surfaces this as a `tool-call { providerExecuted: true }` chunk with no paired
+ * `tool-result`. Mastra currently persists that as
+ * `tool-invocation { state: 'call', providerExecuted: true }` with no result part.
+ *
+ * When the thread is replayed on the next turn, `sanitizeV5UIMessages` keeps the
+ * orphaned provider-executed call (line ~150 of output-converter.ts). The Google
+ * provider then serializes it as a bare `functionCall` in the `contents` array —
+ * with no paired `functionResponse`. Gemini returns `text: ""` for this turn and
+ * every subsequent turn on the thread (verified by the reporter: 5/5 empty STOP).
+ *
+ * The bricking is deterministic once the orphan lands. The contract that must
+ * hold is: after UI→Model conversion, there must NEVER be a `tool-call` content
+ * part without a corresponding `tool-result` somewhere in the outgoing messages.
+ * Whether the fix synthesizes a placeholder result or strips the call is an
+ * implementation detail — but one of the two must happen.
+ */
+describe('sanitizeV5UIMessages — orphaned provider-executed tool calls (issue #15668)', () => {
+  const makeToolPart = (
+    overrides: Partial<AIV5Type.ToolUIPart> & { type: string; toolCallId: string },
+  ): AIV5Type.ToolUIPart =>
+    ({
+      state: 'input-available' as const,
+      input: {},
+      ...overrides,
+    }) as AIV5Type.ToolUIPart;
+
+  it('drops or resolves an orphaned Gemini code_execution call so the next request is not an unpaired functionCall', () => {
+    // This is the exact shape Mastra persists after Vertex drops codeExecutionResult.
+    // It is NOT a legitimate deferred provider tool — Gemini code_execution does not
+    // defer across turns (unlike Anthropic web_search). Replaying this to the model
+    // deterministically produces empty text on every subsequent turn.
+    const user: AIV5Type.UIMessage = {
+      id: 'u1',
+      role: 'user',
+      parts: [{ type: 'text', text: 'Parse the attached spreadsheet and tell me the column names.' }],
+    };
+
+    const assistantWithOrphan: AIV5Type.UIMessage = {
+      id: 'a1',
+      role: 'assistant',
+      parts: [
+        { type: 'text', text: "I'll parse it with pandas via code_execution." },
+        makeToolPart({
+          type: 'tool-code_execution',
+          toolCallId: 'gem_tool_1',
+          state: 'input-available',
+          input: { code: "import pandas as pd; print(pd.read_excel('/tmp/x.xlsx').columns.tolist())" },
+          providerExecuted: true,
+        }),
+      ],
+    };
+
+    const followUp: AIV5Type.UIMessage = {
+      id: 'u2',
+      role: 'user',
+      parts: [{ type: 'text', text: 'what were the columns?' }],
+    };
+
+    const modelMessages = aiV5UIMessagesToAIV5ModelMessages(
+      [user, assistantWithOrphan, followUp],
+      [],
+      /* mode */ 'prompt',
+    );
+
+    // Walk all assistant content parts and collect tool-call / tool-result IDs.
+    const orphanCallIds: string[] = [];
+    const resultIds = new Set<string>();
+    for (const m of modelMessages) {
+      if (typeof m.content === 'string') continue;
+      for (const part of m.content) {
+        if (part.type === 'tool-call') {
+          orphanCallIds.push((part as any).toolCallId);
+        }
+        if (part.type === 'tool-result') {
+          resultIds.add((part as any).toolCallId);
+        }
+      }
+    }
+
+    // The invariant: every tool-call sent to the provider must have a matching
+    // tool-result. An orphaned `gem_tool_1` call without a result is exactly
+    // what bricks the thread.
+    const unpaired = orphanCallIds.filter(id => !resultIds.has(id));
+    expect(unpaired).toEqual([]);
+  });
+
+  it('drops or resolves an orphaned Anthropic web_search call stuck in state:"call" (same defect class)', () => {
+    // Same underlying issue as #14148 — once a provider-executed tool is persisted
+    // as state:"call" with no paired result, every subsequent turn replays it.
+    // The safeguard must be provider-agnostic.
+    const user: AIV5Type.UIMessage = {
+      id: 'u1',
+      role: 'user',
+      parts: [{ type: 'text', text: 'find me recent news on X' }],
+    };
+
+    const assistantWithOrphan: AIV5Type.UIMessage = {
+      id: 'a1',
+      role: 'assistant',
+      parts: [
+        makeToolPart({
+          type: 'tool-web_search_20250305',
+          toolCallId: 'srvtoolu_orphan1',
+          state: 'input-available',
+          input: { query: 'X' },
+          providerExecuted: true,
+        }),
+      ],
+    };
+
+    const followUp: AIV5Type.UIMessage = {
+      id: 'u2',
+      role: 'user',
+      parts: [{ type: 'text', text: 'you good?' }],
+    };
+
+    const modelMessages = aiV5UIMessagesToAIV5ModelMessages(
+      [user, assistantWithOrphan, followUp],
+      [],
+      /* mode */ 'prompt',
+    );
+
+    const orphanCallIds: string[] = [];
+    const resultIds = new Set<string>();
+    for (const m of modelMessages) {
+      if (typeof m.content === 'string') continue;
+      for (const part of m.content) {
+        if (part.type === 'tool-call') orphanCallIds.push((part as any).toolCallId);
+        if (part.type === 'tool-result') resultIds.add((part as any).toolCallId);
+      }
+    }
+
+    const unpaired = orphanCallIds.filter(id => !resultIds.has(id));
+    expect(unpaired).toEqual([]);
+  });
+
+  it('drops a stale deferred provider call on an EARLIER assistant message when a later assistant message exists', () => {
+    // Multi-assistant history shape — this guards against the class of bug #14192:
+    // a provider-executed tool left in `input-available` on an earlier assistant
+    // turn must not be replayed to the provider just because the final turn is
+    // also an assistant. Only the most recent assistant message may legitimately
+    // carry a deferred provider tool.
+    const user: AIV5Type.UIMessage = {
+      id: 'u1',
+      role: 'user',
+      parts: [{ type: 'text', text: 'search for recent news about X' }],
+    };
+
+    const earlierAssistantWithStaleProviderCall: AIV5Type.UIMessage = {
+      id: 'a1',
+      role: 'assistant',
+      parts: [
+        makeToolPart({
+          type: 'tool-web_search_20250305',
+          toolCallId: 'srvtoolu_stale',
+          state: 'input-available',
+          input: { query: 'X' },
+          providerExecuted: true,
+        }),
+      ],
+    };
+
+    const laterAssistant: AIV5Type.UIMessage = {
+      id: 'a2',
+      role: 'assistant',
+      parts: [{ type: 'text', text: 'Here is a summary based on what I found earlier.' }],
+    };
+
+    const modelMessages = aiV5UIMessagesToAIV5ModelMessages(
+      [user, earlierAssistantWithStaleProviderCall, laterAssistant],
+      [],
+      /* mode */ 'prompt',
+    );
+
+    const orphanCallIds: string[] = [];
+    const resultIds = new Set<string>();
+    for (const m of modelMessages) {
+      if (typeof m.content === 'string') continue;
+      for (const part of m.content) {
+        if (part.type === 'tool-call') orphanCallIds.push((part as any).toolCallId);
+        if (part.type === 'tool-result') resultIds.add((part as any).toolCallId);
+      }
+    }
+
+    const unpaired = orphanCallIds.filter(id => !resultIds.has(id));
+    expect(unpaired).toEqual([]);
+    // Belt-and-suspenders: the stale id must not have leaked through at all.
+    expect(orphanCallIds).not.toContain('srvtoolu_stale');
+  });
+
+  it('keeps a deferred provider call on the last surviving assistant when a trailing assistant sanitizes away', () => {
+    const user: AIV5Type.UIMessage = {
+      id: 'u1',
+      role: 'user',
+      parts: [{ type: 'text', text: 'search for recent news about X' }],
+    };
+
+    const assistantWithDeferredProviderCall: AIV5Type.UIMessage = {
+      id: 'a1',
+      role: 'assistant',
+      parts: [
+        makeToolPart({
+          type: 'tool-web_search_20250305',
+          toolCallId: 'srvtoolu_deferred',
+          state: 'input-available',
+          input: { query: 'X' },
+          providerExecuted: true,
+        }),
+      ],
+    };
+
+    const trailingAssistantThatSanitizesAway: AIV5Type.UIMessage = {
+      id: 'a2',
+      role: 'assistant',
+      parts: [
+        makeToolPart({
+          type: 'tool-get_info',
+          toolCallId: 'client_streaming',
+          state: 'input-streaming',
+          input: { query: 'ignore me' },
+        }),
+      ],
+    };
+
+    const result = sanitizeV5UIMessages(
+      [user, assistantWithDeferredProviderCall, trailingAssistantThatSanitizesAway],
+      'prompt',
+    );
+
+    expect(result).toHaveLength(2);
+    expect(result[1]?.id).toBe('a1');
+    expect(result[1]?.parts).toEqual([
+      expect.objectContaining({
+        toolCallId: 'srvtoolu_deferred',
+        state: 'input-available',
+        providerExecuted: true,
+      }),
+    ]);
   });
 });
 
@@ -428,7 +674,7 @@ describe('sanitizeV5UIMessages — empty text part filtering', () => {
       parts: [{ type: 'text', text: '' }],
     };
 
-    const result = sanitizeV5UIMessages([userMsgWithEmptyText], true);
+    const result = sanitizeV5UIMessages([userMsgWithEmptyText], 'prompt');
 
     // User message with only empty text should be removed entirely
     expect(result).toHaveLength(0);
@@ -444,7 +690,7 @@ describe('sanitizeV5UIMessages — empty text part filtering', () => {
       ],
     };
 
-    const result = sanitizeV5UIMessages([userMsgWithMixedParts], true);
+    const result = sanitizeV5UIMessages([userMsgWithMixedParts], 'prompt');
 
     expect(result).toHaveLength(1);
     expect(result[0]!.parts).toHaveLength(1);
@@ -458,7 +704,7 @@ describe('sanitizeV5UIMessages — empty text part filtering', () => {
       parts: [{ type: 'text', text: '   ' }],
     };
 
-    const result = sanitizeV5UIMessages([userMsgWithWhitespace], true);
+    const result = sanitizeV5UIMessages([userMsgWithWhitespace], 'prompt');
 
     // User message with only whitespace text should be removed
     expect(result).toHaveLength(0);
@@ -471,7 +717,7 @@ describe('sanitizeV5UIMessages — empty text part filtering', () => {
       parts: [{ type: 'text', text: '' }],
     };
 
-    const result = sanitizeV5UIMessages([assistantMsgWithEmptyText], true);
+    const result = sanitizeV5UIMessages([assistantMsgWithEmptyText], 'prompt');
 
     // Assistant message with only empty text should be preserved as placeholder
     expect(result).toHaveLength(1);
@@ -503,7 +749,7 @@ describe('sanitizeV5UIMessages — duplicate OpenAI-compatible itemId merging', 
   it('should merge text parts with the same OpenAI itemId', () => {
     const msg = makeMessage([makeTextPart('Hello ', 'msg_abc123'), makeTextPart('world!', 'msg_abc123')]);
 
-    const result = sanitizeV5UIMessages([msg], false);
+    const result = sanitizeV5UIMessages([msg], 'response');
 
     expect(result).toHaveLength(1);
     expect(result[0]!.parts).toHaveLength(1);
@@ -518,7 +764,7 @@ describe('sanitizeV5UIMessages — duplicate OpenAI-compatible itemId merging', 
       makeTextPart('Part 3.', 'msg_abc123'),
     ]);
 
-    const result = sanitizeV5UIMessages([msg], false);
+    const result = sanitizeV5UIMessages([msg], 'response');
 
     expect(result).toHaveLength(1);
     expect(result[0]!.parts).toHaveLength(1);
@@ -531,7 +777,7 @@ describe('sanitizeV5UIMessages — duplicate OpenAI-compatible itemId merging', 
       makeTextPart('Azure!', 'msg_azure123', 'azure'),
     ]);
 
-    const result = sanitizeV5UIMessages([msg], false);
+    const result = sanitizeV5UIMessages([msg], 'response');
 
     expect(result).toHaveLength(1);
     expect(result[0]!.parts).toHaveLength(1);
@@ -545,7 +791,7 @@ describe('sanitizeV5UIMessages — duplicate OpenAI-compatible itemId merging', 
       makeTextPart('Azure', 'msg_shared', 'azure'),
     ]);
 
-    const result = sanitizeV5UIMessages([msg], false);
+    const result = sanitizeV5UIMessages([msg], 'response');
 
     expect(result).toHaveLength(1);
     expect(result[0]!.parts).toHaveLength(2);
@@ -563,7 +809,7 @@ describe('sanitizeV5UIMessages — duplicate OpenAI-compatible itemId merging', 
       makeTextPart('the answer is 42.', 'msg_websearch_001'),
     ]);
 
-    const result = sanitizeV5UIMessages([msg], false);
+    const result = sanitizeV5UIMessages([msg], 'response');
 
     expect(result).toHaveLength(1);
     expect(result[0]!.parts).toHaveLength(2);
@@ -577,7 +823,7 @@ describe('sanitizeV5UIMessages — duplicate OpenAI-compatible itemId merging', 
       makeTextPart('Second response.', 'msg_def456'),
     ]);
 
-    const result = sanitizeV5UIMessages([msg], false);
+    const result = sanitizeV5UIMessages([msg], 'response');
 
     expect(result).toHaveLength(1);
     expect(result[0]!.parts).toHaveLength(2);
@@ -588,7 +834,7 @@ describe('sanitizeV5UIMessages — duplicate OpenAI-compatible itemId merging', 
   it('should not merge text parts without itemIds', () => {
     const msg = makeMessage([makeTextPart('No metadata 1. '), makeTextPart('No metadata 2.')]);
 
-    const result = sanitizeV5UIMessages([msg], false);
+    const result = sanitizeV5UIMessages([msg], 'response');
 
     expect(result).toHaveLength(1);
     expect(result[0]!.parts).toHaveLength(2);
@@ -602,7 +848,7 @@ describe('sanitizeV5UIMessages — duplicate OpenAI-compatible itemId merging', 
       makeTextPart('Without itemId.'),
     ]);
 
-    const result = sanitizeV5UIMessages([msg], false);
+    const result = sanitizeV5UIMessages([msg], 'response');
 
     expect(result).toHaveLength(1);
     expect(result[0]!.parts).toHaveLength(4);
@@ -620,7 +866,7 @@ describe('sanitizeV5UIMessages — duplicate OpenAI-compatible itemId merging', 
       makeTextPart('This was confirmed by multiple studies.', 'msg_websearch_001'),
     ]);
 
-    const result = sanitizeV5UIMessages([msg], false);
+    const result = sanitizeV5UIMessages([msg], 'response');
 
     expect(result).toHaveLength(1);
     expect(result[0]!.parts).toHaveLength(1);

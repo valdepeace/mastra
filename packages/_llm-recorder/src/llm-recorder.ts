@@ -61,7 +61,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { diffJson } from 'diff';
 import { http, HttpResponse, bypass } from 'msw';
-import type { SetupServerApi } from 'msw/node';
+import type { SetupServer } from 'msw/node';
 import { setupServer } from 'msw/node';
 import stringSimilarity from 'string-similarity';
 import { beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
@@ -164,6 +164,11 @@ export interface LLMRecording {
     isStreaming: boolean;
   };
 }
+
+type ReplayRecording = LLMRecording & {
+  /** Additional exact-match hashes derived at replay time for backward compatibility. */
+  lookupHashes?: string[];
+};
 
 /**
  * Metadata stored at the top of each recording file.
@@ -304,7 +309,7 @@ export interface LLMRecorderOptions {
 
 export interface LLMRecorderInstance {
   /** The MSW server instance (null in live mode) */
-  server: SetupServerApi | null;
+  server: SetupServer | null;
   /** Start intercepting requests (no-op in live mode) */
   start(): void;
   /** Stop intercepting requests (no-op in live mode) */
@@ -605,16 +610,24 @@ const SIMILARITY_THRESHOLD = 0.6;
  * recording).  Exact hash matches are always exempt.
  */
 function findRecording(
-  recordings: LLMRecording[],
+  recordings: ReplayRecording[],
   hash: string,
   url: string,
   body: unknown,
   usedHashes?: Set<string>,
-): LLMRecording | undefined {
-  // 1. Exact hash match (fast path)
-  const exact = recordings.find(r => r.hash === hash);
-  if (exact) {
-    return exact;
+  exactReplayCounts?: Map<string, number>,
+): ReplayRecording | undefined {
+  // 1. Exact hash match (fast path). Multiple recordings can share a hash when
+  //    the same request produced different responses (retries, colliding test
+  //    variants) — consume them in record order, then keep serving the last one.
+  const exactMatches = recordings.filter(r => isExactRecordingMatch(r, hash));
+  if (exactMatches.length === 1) {
+    return exactMatches[0];
+  }
+  if (exactMatches.length > 1) {
+    const served = exactReplayCounts?.get(hash) ?? 0;
+    exactReplayCounts?.set(hash, served + 1);
+    return exactMatches[Math.min(served, exactMatches.length - 1)];
   }
 
   if (recordings.length === 0) {
@@ -701,6 +714,33 @@ function findRecording(
   return undefined;
 }
 
+function isExactRecordingMatch(recording: ReplayRecording, hash: string): boolean {
+  return recording.hash === hash || recording.lookupHashes?.includes(hash) === true;
+}
+
+function prepareReplayRecordings(
+  recordings: LLMRecording[],
+  transformRequest?: LLMRecorderOptions['transformRequest'],
+): ReplayRecording[] {
+  if (!transformRequest) {
+    return recordings;
+  }
+
+  return recordings.map(recording => {
+    const transformed = transformRequest({ url: recording.request.url, body: recording.request.body });
+    const transformedHash = hashRequest(transformed.url, transformed.body);
+
+    if (transformedHash === recording.hash) {
+      return recording;
+    }
+
+    return {
+      ...recording,
+      lookupHashes: [recording.hash, transformedHash],
+    };
+  });
+}
+
 /**
  * Set up LLM response recording/replay
  */
@@ -719,14 +759,14 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
 
   // Load existing recordings / metadata before any mutations (backward compatible)
   // In record/update modes a corrupted file should not block re-recording.
-  let savedRecordings: LLMRecording[] = [];
+  let savedRecordings: ReplayRecording[] = [];
   let existingMeta: RecordingMeta | undefined;
   if (recordingExists) {
     const willRecord = mode === 'record' || mode === 'update';
     try {
       const file = loadRecordingFile(recordingPath, options.name);
       existingMeta = file.meta;
-      savedRecordings = file.recordings;
+      savedRecordings = prepareReplayRecordings(file.recordings, options.transformRequest);
     } catch (err) {
       if (!willRecord) {
         throw err;
@@ -755,11 +795,10 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
       mode = 'record';
     }
   } else if (mode === 'replay' && !recordingExists) {
-    // Strict replay: fail if no recording
-    throw new Error(
-      `[llm-recorder] No recording found for "${options.name}". ` +
-        `Run with UPDATE_RECORDINGS=true or --update-recordings to create recordings.`,
-    );
+    // Strict replay: missing files can represent tests that made no LLM calls.
+    // Keep replay mode active with an empty recording set; if a request is made,
+    // the normal per-request missing-recording error will still fail the test.
+    savedRecordings = [];
   }
 
   // Live mode: no interception, just pass through
@@ -790,6 +829,11 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
   const recordings: LLMRecording[] = [];
   const isRecordMode = mode === 'record';
   const fuzzyUsedHashes = new Set<string>();
+  // Tracks how many exact matches have been served per hash so that multiple
+  // recordings sharing a hash (same request, different responses) replay in
+  // record order. Intentionally NOT reset between tests — record order spans
+  // the whole test file. See the dedup comment in save().
+  const exactReplayCounts = new Map<string, number>();
   let saved = false;
 
   // Create handlers for each LLM API host (or a filtered subset)
@@ -943,7 +987,7 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
           console.log(`[llm-recorder]   Available hashes: ${savedRecordings.map(r => r.hash).join(', ')}`);
         }
 
-        const recording = findRecording(savedRecordings, hash, url, body, fuzzyUsedHashes);
+        const recording = findRecording(savedRecordings, hash, url, body, fuzzyUsedHashes, exactReplayCounts);
 
         if (!recording) {
           console.error(`[llm-recorder] No recording found for: ${url}${model ? ` (model: ${model})` : ''}`);
@@ -957,11 +1001,11 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
         }
 
         if (debug) {
-          const matchType = recording.hash === hash ? 'exact' : 'fuzzy';
+          const matchType = isExactRecordingMatch(recording, hash) ? 'exact' : 'fuzzy';
           console.log(`[llm-recorder]   Matched (${matchType}): ${recording.request.url} [hash: ${recording.hash}]`);
         }
 
-        if (recording.hash !== hash) {
+        if (!isExactRecordingMatch(recording, hash)) {
           // findRecording returned a fuzzy match (rating >= SIMILARITY_THRESHOLD).
           // Accept it with a warning rather than failing the test.
           console.warn(
@@ -1074,11 +1118,22 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
         ...(existingMeta?.createdAt ? { updatedAt: now } : {}),
       };
 
-      // Deduplicate recordings by hash — identical requests across tests share one entry
-      const seen = new Set<string>();
+      // Deduplicate recordings by hash — identical requests across tests share one entry,
+      // but ONLY when their responses are also identical. When the same request produced
+      // different responses (e.g. a retry after a malformed response, or two test variants
+      // whose normalized requests collide but got different model outputs), every entry is
+      // kept in record order and replay consumes them sequentially, so each recorded
+      // request/response chain replays exactly as it happened.
+      const seenResponsesByHash = new Map<string, Set<string>>();
       const dedupedRecordings = recordings.filter(r => {
-        if (seen.has(r.hash)) return false;
-        seen.add(r.hash);
+        const responseKey = JSON.stringify(r.response);
+        let seen = seenResponsesByHash.get(r.hash);
+        if (!seen) {
+          seen = new Set();
+          seenResponsesByHash.set(r.hash, seen);
+        }
+        if (seen.has(responseKey)) return false;
+        seen.add(responseKey);
         return true;
       });
 
@@ -1260,8 +1315,27 @@ export function listLLMRecordings(recordingsDir?: string): string[] {
 }
 
 /**
+ * Find the nearest package root from a file path.
+ */
+function findPackageRoot(filepath: string): string | null {
+  let dir = path.dirname(path.resolve(filepath));
+
+  while (dir !== path.dirname(dir)) {
+    if (fs.existsSync(path.join(dir, 'package.json'))) return dir;
+    dir = path.dirname(dir);
+  }
+
+  return null;
+}
+
+/**
  * Get recordings directory path
  */
-export function getLLMRecordingsDir(): string {
+export function getLLMRecordingsDir(filepath?: string): string {
+  if (filepath) {
+    const packageRoot = findPackageRoot(filepath);
+    if (packageRoot) return path.join(packageRoot, '__recordings__');
+  }
+
   return DEFAULT_RECORDINGS_DIR;
 }

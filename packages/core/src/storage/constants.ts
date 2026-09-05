@@ -25,6 +25,7 @@ export const TABLE_WORKSPACE_VERSIONS = 'mastra_workspace_versions';
 export const TABLE_SKILLS = 'mastra_skills';
 export const TABLE_SKILL_VERSIONS = 'mastra_skill_versions';
 export const TABLE_SKILL_BLOBS = 'mastra_skill_blobs';
+export const TABLE_FAVORITES = 'mastra_favorites';
 
 // Dataset tables
 export const TABLE_DATASETS = 'mastra_datasets';
@@ -40,9 +41,32 @@ export const TABLE_BACKGROUND_TASKS = 'mastra_background_tasks';
 export const TABLE_SCHEDULES = 'mastra_schedules';
 export const TABLE_SCHEDULE_TRIGGERS = 'mastra_schedule_triggers';
 
+// Static workflow definitions (chat-built / studio-saved workflows)
+export const TABLE_WORKFLOW_DEFINITIONS = 'mastra_workflow_definitions';
+
 // Channel tables
 export const TABLE_CHANNEL_INSTALLATIONS = 'mastra_channel_installations';
 export const TABLE_CHANNEL_CONFIG = 'mastra_channel_config';
+
+// Tool provider connections
+export const TABLE_TOOL_PROVIDER_CONNECTIONS = 'mastra_tool_provider_connections';
+
+// Notifications
+export const TABLE_NOTIFICATIONS = 'mastra_notifications';
+
+// Harness sessions
+export const TABLE_HARNESS_SESSIONS = 'mastra_harness_sessions';
+
+// Thread state (per-thread, per-type durable state; e.g. the task list)
+export const TABLE_THREAD_STATE = 'mastra_thread_state';
+
+// Knowledge store tables
+export const TABLE_KNOWLEDGE_NODES = 'mastra_knowledge_nodes';
+export const TABLE_KNOWLEDGE_RECORDS = 'mastra_knowledge_records';
+export const TABLE_KNOWLEDGE_MENTIONS = 'mastra_knowledge_mentions';
+export const TABLE_KNOWLEDGE_CURSORS = 'mastra_knowledge_cursors';
+export const TABLE_KNOWLEDGE_ACTIVITY = 'mastra_knowledge_activity';
+export const TABLE_KNOWLEDGE_SEMANTIC_OUTBOX = 'mastra_knowledge_semantic_outbox';
 
 /** Union of all core table name constants. */
 export type TABLE_NAMES =
@@ -74,10 +98,22 @@ export type TABLE_NAMES =
   | typeof TABLE_EXPERIMENTS
   | typeof TABLE_EXPERIMENT_RESULTS
   | typeof TABLE_BACKGROUND_TASKS
+  | typeof TABLE_FAVORITES
   | typeof TABLE_SCHEDULES
   | typeof TABLE_SCHEDULE_TRIGGERS
   | typeof TABLE_CHANNEL_INSTALLATIONS
-  | typeof TABLE_CHANNEL_CONFIG;
+  | typeof TABLE_CHANNEL_CONFIG
+  | typeof TABLE_TOOL_PROVIDER_CONNECTIONS
+  | typeof TABLE_NOTIFICATIONS
+  | typeof TABLE_HARNESS_SESSIONS
+  | typeof TABLE_THREAD_STATE
+  | typeof TABLE_WORKFLOW_DEFINITIONS
+  | typeof TABLE_KNOWLEDGE_NODES
+  | typeof TABLE_KNOWLEDGE_RECORDS
+  | typeof TABLE_KNOWLEDGE_MENTIONS
+  | typeof TABLE_KNOWLEDGE_CURSORS
+  | typeof TABLE_KNOWLEDGE_ACTIVITY
+  | typeof TABLE_KNOWLEDGE_SEMANTIC_OUTBOX;
 
 export const SCORERS_SCHEMA: Record<string, StorageColumn> = {
   id: { type: 'text', nullable: false, primaryKey: true },
@@ -113,6 +149,15 @@ export const SCORERS_SCHEMA: Record<string, StorageColumn> = {
   source: { type: 'text' },
   resourceId: { type: 'text', nullable: true },
   threadId: { type: 'text', nullable: true },
+  organizationId: { type: 'text', nullable: true },
+  projectId: { type: 'text', nullable: true },
+  // Batch handle: groups all per-trace scores produced by one batch scoring call.
+  // Each score keeps its own per-execution `runId`; `batchId` is shared across the batch.
+  batchId: { type: 'text', nullable: true },
+  // Dataset provenance: which curated dataset item this score was produced against.
+  // Lets baseline scores join back to dataset items (ground truth) without re-running.
+  datasetId: { type: 'text', nullable: true },
+  datasetItemId: { type: 'text', nullable: true },
   createdAt: { type: 'timestamp' },
   updatedAt: { type: 'timestamp' },
 };
@@ -149,7 +194,9 @@ export const AGENTS_SCHEMA: Record<string, StorageColumn> = {
   status: { type: 'text', nullable: false }, // 'draft' or 'published'
   activeVersionId: { type: 'text', nullable: true }, // FK to agent_versions.id
   authorId: { type: 'text', nullable: true }, // Author identifier for multi-tenant filtering
+  visibility: { type: 'text', nullable: true }, // 'private' | 'public' | null (legacy)
   metadata: { type: 'jsonb', nullable: true }, // Additional metadata for the agent
+  favoriteCount: { type: 'integer', nullable: true }, // Denormalised count of favorites for this agent
   createdAt: { type: 'timestamp', nullable: false },
   updatedAt: { type: 'timestamp', nullable: false },
 };
@@ -168,6 +215,7 @@ export const AGENT_VERSIONS_SCHEMA: Record<string, StorageColumn> = {
   workflows: { type: 'jsonb', nullable: true },
   agents: { type: 'jsonb', nullable: true },
   integrationTools: { type: 'jsonb', nullable: true },
+  toolProviders: { type: 'jsonb', nullable: true },
   inputProcessors: { type: 'jsonb', nullable: true },
   outputProcessors: { type: 'jsonb', nullable: true },
   memory: { type: 'jsonb', nullable: true },
@@ -177,6 +225,8 @@ export const AGENT_VERSIONS_SCHEMA: Record<string, StorageColumn> = {
   workspace: { type: 'jsonb', nullable: true },
   skills: { type: 'jsonb', nullable: true },
   skillsFormat: { type: 'text', nullable: true },
+  durable: { type: 'jsonb', nullable: true },
+  browser: { type: 'jsonb', nullable: true },
   // Version metadata
   changedFields: { type: 'jsonb', nullable: true }, // Array of field names
   changeMessage: { type: 'text', nullable: true },
@@ -212,6 +262,8 @@ export const SCORER_DEFINITIONS_SCHEMA: Record<string, StorageColumn> = {
   status: { type: 'text', nullable: false }, // 'draft', 'published', or 'archived'
   activeVersionId: { type: 'text', nullable: true }, // FK to scorer_definition_versions.id
   authorId: { type: 'text', nullable: true },
+  organizationId: { type: 'text', nullable: true },
+  projectId: { type: 'text', nullable: true },
   metadata: { type: 'jsonb', nullable: true },
   createdAt: { type: 'timestamp', nullable: false },
   updatedAt: { type: 'timestamp', nullable: false },
@@ -286,6 +338,23 @@ export const MCP_SERVER_VERSIONS_SCHEMA: Record<string, StorageColumn> = {
   createdAt: { type: 'timestamp', nullable: false },
 };
 
+export const WORKFLOW_DEFINITIONS_SCHEMA: Record<string, StorageColumn> = {
+  id: { type: 'text', nullable: false, primaryKey: true },
+  description: { type: 'text', nullable: true },
+  metadata: { type: 'jsonb', nullable: true },
+  inputSchema: { type: 'jsonb', nullable: false },
+  outputSchema: { type: 'jsonb', nullable: false },
+  stateSchema: { type: 'jsonb', nullable: true },
+  requestContextSchema: { type: 'jsonb', nullable: true },
+  graph: { type: 'jsonb', nullable: false },
+  schedule: { type: 'jsonb', nullable: true },
+  status: { type: 'text', nullable: false }, // 'active' | 'archived'
+  source: { type: 'text', nullable: false }, // always 'storage' for now
+  authorId: { type: 'text', nullable: true },
+  createdAt: { type: 'timestamp', nullable: false },
+  updatedAt: { type: 'timestamp', nullable: false },
+};
+
 export const WORKSPACES_SCHEMA: Record<string, StorageColumn> = {
   id: { type: 'text', nullable: false, primaryKey: true },
   status: { type: 'text', nullable: false }, // 'draft', 'published', or 'archived'
@@ -320,6 +389,100 @@ export const SKILLS_SCHEMA: Record<string, StorageColumn> = {
   status: { type: 'text', nullable: false }, // 'draft', 'published', or 'archived'
   activeVersionId: { type: 'text', nullable: true }, // FK to skill_versions.id
   authorId: { type: 'text', nullable: true },
+  visibility: { type: 'text', nullable: true }, // 'private' | 'public' | null (legacy)
+  favoriteCount: { type: 'integer', nullable: true }, // Denormalised count of favorites for this skill
+  createdAt: { type: 'timestamp', nullable: false },
+  updatedAt: { type: 'timestamp', nullable: false },
+};
+
+export const FAVORITES_SCHEMA: Record<string, StorageColumn> = {
+  userId: { type: 'text', nullable: false },
+  entityType: { type: 'text', nullable: false }, // 'agent' | 'skill'
+  entityId: { type: 'text', nullable: false },
+  createdAt: { type: 'timestamp', nullable: false },
+};
+
+/**
+ * Per-author registry of authorized tool provider connections. Stores a stable
+ * user-supplied label across agents. Composite primary key on
+ * (authorId, providerId, connectionId). `scope` buckets identity:
+ * 'per-author' (default), 'shared' (visible to all callers), or
+ * 'caller-supplied' (authorId is a host-app end-user id forwarded via request
+ * context).
+ */
+export const TOOL_PROVIDER_CONNECTIONS_SCHEMA: Record<string, StorageColumn> = {
+  authorId: { type: 'text', nullable: false },
+  providerId: { type: 'text', nullable: false },
+  connectionId: { type: 'text', nullable: false },
+  toolkit: { type: 'text', nullable: false },
+  label: { type: 'text', nullable: true },
+  scope: { type: 'text', nullable: false },
+  createdAt: { type: 'timestamp', nullable: false },
+  updatedAt: { type: 'timestamp', nullable: false },
+};
+
+export const NOTIFICATIONS_SCHEMA: Record<string, StorageColumn> = {
+  id: { type: 'text', nullable: false },
+  threadId: { type: 'text', nullable: false },
+  source: { type: 'text', nullable: false },
+  kind: { type: 'text', nullable: false },
+  priority: { type: 'text', nullable: false },
+  status: { type: 'text', nullable: false },
+  summary: { type: 'text', nullable: false },
+  payload: { type: 'jsonb', nullable: true },
+  resourceId: { type: 'text', nullable: true },
+  agentId: { type: 'text', nullable: true },
+  sourceId: { type: 'text', nullable: true },
+  dedupeKey: { type: 'text', nullable: true },
+  coalesceKey: { type: 'text', nullable: true },
+  coalescedCount: { type: 'integer', nullable: false },
+  attributes: { type: 'jsonb', nullable: true },
+  createdAt: { type: 'timestamp', nullable: false },
+  updatedAt: { type: 'timestamp', nullable: false },
+  deliveredAt: { type: 'timestamp', nullable: true },
+  seenAt: { type: 'timestamp', nullable: true },
+  dismissedAt: { type: 'timestamp', nullable: true },
+  archivedAt: { type: 'timestamp', nullable: true },
+  discardedAt: { type: 'timestamp', nullable: true },
+  deliverAt: { type: 'timestamp', nullable: true },
+  summaryAt: { type: 'timestamp', nullable: true },
+  deliveryReason: { type: 'text', nullable: true },
+  deliveryAttempts: { type: 'integer', nullable: false },
+  lastDeliveryAttemptAt: { type: 'timestamp', nullable: true },
+  lastDeliveryError: { type: 'text', nullable: true },
+  deliveredSignalId: { type: 'text', nullable: true },
+  summarySignalId: { type: 'text', nullable: true },
+  metadata: { type: 'jsonb', nullable: true },
+};
+
+export const HARNESS_SESSIONS_SCHEMA: Record<string, StorageColumn> = {
+  id: { type: 'text', nullable: false, primaryKey: true },
+  ownerId: { type: 'text', nullable: false },
+  resourceId: { type: 'text', nullable: false },
+  threadId: { type: 'text', nullable: false },
+  parentSessionId: { type: 'text', nullable: true },
+  subagentDepth: { type: 'integer', nullable: true },
+  source: { type: 'jsonb', nullable: true },
+  origin: { type: 'text', nullable: false },
+  runtimeCompatibilityGeneration: { type: 'text', nullable: true },
+  modeId: { type: 'text', nullable: false },
+  modelId: { type: 'text', nullable: false },
+  title: { type: 'text', nullable: true },
+  metadata: { type: 'jsonb', nullable: true },
+  state: { type: 'jsonb', nullable: true },
+  pending: { type: 'jsonb', nullable: true },
+  createdAt: { type: 'timestamp', nullable: false },
+  lastActivityAt: { type: 'timestamp', nullable: false },
+  closingAt: { type: 'timestamp', nullable: true },
+  closeDeadlineAt: { type: 'timestamp', nullable: true },
+  closedAt: { type: 'timestamp', nullable: true },
+  deletedAt: { type: 'timestamp', nullable: true },
+};
+
+export const THREAD_STATE_SCHEMA: Record<string, StorageColumn> = {
+  threadId: { type: 'text', nullable: false },
+  type: { type: 'text', nullable: false },
+  value: { type: 'jsonb', nullable: false },
   createdAt: { type: 'timestamp', nullable: false },
   updatedAt: { type: 'timestamp', nullable: false },
 };
@@ -337,6 +500,7 @@ export const SKILL_VERSIONS_SCHEMA: Record<string, StorageColumn> = {
   references: { type: 'jsonb', nullable: true },
   scripts: { type: 'jsonb', nullable: true },
   assets: { type: 'jsonb', nullable: true },
+  files: { type: 'jsonb', nullable: true },
   metadata: { type: 'jsonb', nullable: true },
   tree: { type: 'jsonb', nullable: true },
   changedFields: { type: 'jsonb', nullable: true },
@@ -403,6 +567,10 @@ export const DATASETS_SCHEMA: Record<string, StorageColumn> = {
   targetType: { type: 'text', nullable: true },
   targetIds: { type: 'jsonb', nullable: true },
   scorerIds: { type: 'jsonb', nullable: true },
+  organizationId: { type: 'text', nullable: true },
+  projectId: { type: 'text', nullable: true },
+  candidateKey: { type: 'text', nullable: true },
+  candidateId: { type: 'text', nullable: true },
   version: { type: 'integer', nullable: false },
   createdAt: { type: 'timestamp', nullable: false },
   updatedAt: { type: 'timestamp', nullable: false },
@@ -412,6 +580,9 @@ export const DATASET_ITEMS_SCHEMA: Record<string, StorageColumn> = {
   id: { type: 'text', nullable: false },
   datasetId: { type: 'text', nullable: false, references: { table: 'mastra_datasets', column: 'id' } },
   datasetVersion: { type: 'integer', nullable: false },
+  externalId: { type: 'text', nullable: true },
+  organizationId: { type: 'text', nullable: true },
+  projectId: { type: 'text', nullable: true },
   validTo: { type: 'integer', nullable: true },
   isDeleted: { type: 'boolean', nullable: false },
   input: { type: 'jsonb', nullable: false },
@@ -420,6 +591,9 @@ export const DATASET_ITEMS_SCHEMA: Record<string, StorageColumn> = {
   metadata: { type: 'jsonb', nullable: true },
   source: { type: 'jsonb', nullable: true },
   expectedTrajectory: { type: 'jsonb', nullable: true },
+  toolMocks: { type: 'jsonb', nullable: true },
+  unmockedToolPolicy: { type: 'text', nullable: true },
+  scorerIds: { type: 'jsonb', nullable: true },
   createdAt: { type: 'timestamp', nullable: false },
   updatedAt: { type: 'timestamp', nullable: false },
 };
@@ -437,10 +611,19 @@ export const EXPERIMENTS_SCHEMA: Record<string, StorageColumn> = {
   name: { type: 'text', nullable: true },
   description: { type: 'text', nullable: true },
   metadata: { type: 'jsonb', nullable: true },
+  provenance: { type: 'jsonb', nullable: true },
+  runnerAttestation: { type: 'jsonb', nullable: true },
+  experimentSetId: { type: 'text', nullable: true },
+  comparisonId: { type: 'text', nullable: true },
+  variantId: { type: 'text', nullable: true },
+  trialIndex: { type: 'integer', nullable: true },
   datasetId: { type: 'text', nullable: true, references: { table: 'mastra_datasets', column: 'id' } },
   datasetVersion: { type: 'integer', nullable: true },
-  targetType: { type: 'text', nullable: false },
-  targetId: { type: 'text', nullable: false },
+  // Nullable: caller-driven ingestion experiments have no registered target.
+  targetType: { type: 'text', nullable: true },
+  targetId: { type: 'text', nullable: true },
+  // Run-level scorer IDs pinned at create time for caller-driven experiments.
+  scorerIds: { type: 'jsonb', nullable: true },
   status: { type: 'text', nullable: false },
   totalItems: { type: 'integer', nullable: false },
   succeededCount: { type: 'integer', nullable: false },
@@ -449,6 +632,8 @@ export const EXPERIMENTS_SCHEMA: Record<string, StorageColumn> = {
   startedAt: { type: 'timestamp', nullable: true },
   completedAt: { type: 'timestamp', nullable: true },
   agentVersion: { type: 'text', nullable: true },
+  organizationId: { type: 'text', nullable: true },
+  projectId: { type: 'text', nullable: true },
   createdAt: { type: 'timestamp', nullable: false },
   updatedAt: { type: 'timestamp', nullable: false },
 };
@@ -461,14 +646,93 @@ export const EXPERIMENT_RESULTS_SCHEMA: Record<string, StorageColumn> = {
   input: { type: 'jsonb', nullable: false },
   output: { type: 'jsonb', nullable: true },
   groundTruth: { type: 'jsonb', nullable: true },
+  metadata: { type: 'jsonb', nullable: true },
   error: { type: 'jsonb', nullable: true },
   startedAt: { type: 'timestamp', nullable: false },
   completedAt: { type: 'timestamp', nullable: false },
   retryCount: { type: 'integer', nullable: false },
+  // Nullable for backwards compatibility with pre-existing rows; readers treat NULL as 0.
+  attempt: { type: 'integer', nullable: true },
   traceId: { type: 'text', nullable: true },
   status: { type: 'text', nullable: true },
   tags: { type: 'jsonb', nullable: true },
+  comment: { type: 'text', nullable: true },
+  toolMockReport: { type: 'jsonb', nullable: true },
+  organizationId: { type: 'text', nullable: true },
+  projectId: { type: 'text', nullable: true },
   createdAt: { type: 'timestamp', nullable: false },
+};
+
+export const KNOWLEDGE_NODES_SCHEMA: Record<string, StorageColumn> = {
+  id: { type: 'text', nullable: false, primaryKey: true },
+  type: { type: 'text', nullable: false },
+  name: { type: 'text', nullable: false },
+  canonicalName: { type: 'text', nullable: false },
+  kind: { type: 'text', nullable: true },
+  content: { type: 'text', nullable: true },
+  description: { type: 'text', nullable: true },
+  scope: { type: 'jsonb', nullable: false },
+  scopeKey: { type: 'text', nullable: false },
+  version: { type: 'integer', nullable: false },
+  mergedInto: { type: 'text', nullable: true },
+  createdAt: { type: 'timestamp', nullable: false },
+  updatedAt: { type: 'timestamp', nullable: false },
+};
+
+export const KNOWLEDGE_RECORDS_SCHEMA: Record<string, StorageColumn> = {
+  id: { type: 'text', nullable: false, primaryKey: true },
+  node: { type: 'text', nullable: false },
+  text: { type: 'text', nullable: false },
+  scope: { type: 'jsonb', nullable: false },
+  scopeKey: { type: 'text', nullable: false },
+  sourceThreadId: { type: 'text', nullable: false },
+  capturedAt: { type: 'timestamp', nullable: false },
+  when: { type: 'timestamp', nullable: true },
+  maxScope: { type: 'text', nullable: true },
+  metadata: { type: 'jsonb', nullable: true },
+  deletedAt: { type: 'timestamp', nullable: true },
+  deletedBy: { type: 'text', nullable: true },
+};
+
+export const KNOWLEDGE_MENTIONS_SCHEMA: Record<string, StorageColumn> = {
+  sourceType: { type: 'text', nullable: false },
+  sourceId: { type: 'text', nullable: false },
+  recordId: { type: 'text', nullable: false },
+};
+
+export const KNOWLEDGE_CURSORS_SCHEMA: Record<string, StorageColumn> = {
+  sourceThreadId: { type: 'text', nullable: false },
+  agent: { type: 'text', nullable: false },
+  lastKnowledgeId: { type: 'text', nullable: false },
+  updatedAt: { type: 'timestamp', nullable: false },
+};
+
+export const KNOWLEDGE_ACTIVITY_SCHEMA: Record<string, StorageColumn> = {
+  id: { type: 'text', nullable: false, primaryKey: true },
+  action: { type: 'text', nullable: false },
+  recordType: { type: 'text', nullable: false },
+  recordId: { type: 'text', nullable: false },
+  scope: { type: 'jsonb', nullable: false },
+  scopeKey: { type: 'text', nullable: false },
+  sourceThreadId: { type: 'text', nullable: true },
+  createdAt: { type: 'timestamp', nullable: false },
+};
+
+export const KNOWLEDGE_SEMANTIC_OUTBOX_SCHEMA: Record<string, StorageColumn> = {
+  id: { type: 'text', nullable: false, primaryKey: true },
+  idempotencyKey: { type: 'text', nullable: false },
+  documentId: { type: 'text', nullable: false },
+  documentType: { type: 'text', nullable: false },
+  operation: { type: 'text', nullable: false },
+  scope: { type: 'jsonb', nullable: false },
+  scopeKey: { type: 'text', nullable: false },
+  status: { type: 'text', nullable: false },
+  attempts: { type: 'integer', nullable: false },
+  availableAt: { type: 'timestamp', nullable: false },
+  claimedAt: { type: 'timestamp', nullable: true },
+  claimedBy: { type: 'text', nullable: true },
+  createdAt: { type: 'timestamp', nullable: false },
+  completedAt: { type: 'timestamp', nullable: true },
 };
 
 /**
@@ -555,6 +819,7 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
   [TABLE_DATASET_VERSIONS]: DATASET_VERSIONS_SCHEMA,
   [TABLE_EXPERIMENTS]: EXPERIMENTS_SCHEMA,
   [TABLE_EXPERIMENT_RESULTS]: EXPERIMENT_RESULTS_SCHEMA,
+  [TABLE_FAVORITES]: FAVORITES_SCHEMA,
   [TABLE_BACKGROUND_TASKS]: {
     id: { type: 'text', nullable: false, primaryKey: true },
     tool_call_id: { type: 'text', nullable: false },
@@ -620,6 +885,17 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
     data: { type: 'jsonb', nullable: false },
     updatedAt: { type: 'timestamp', nullable: false },
   },
+  [TABLE_TOOL_PROVIDER_CONNECTIONS]: TOOL_PROVIDER_CONNECTIONS_SCHEMA,
+  [TABLE_NOTIFICATIONS]: NOTIFICATIONS_SCHEMA,
+  [TABLE_HARNESS_SESSIONS]: HARNESS_SESSIONS_SCHEMA,
+  [TABLE_THREAD_STATE]: THREAD_STATE_SCHEMA,
+  [TABLE_WORKFLOW_DEFINITIONS]: WORKFLOW_DEFINITIONS_SCHEMA,
+  [TABLE_KNOWLEDGE_NODES]: KNOWLEDGE_NODES_SCHEMA,
+  [TABLE_KNOWLEDGE_RECORDS]: KNOWLEDGE_RECORDS_SCHEMA,
+  [TABLE_KNOWLEDGE_MENTIONS]: KNOWLEDGE_MENTIONS_SCHEMA,
+  [TABLE_KNOWLEDGE_CURSORS]: KNOWLEDGE_CURSORS_SCHEMA,
+  [TABLE_KNOWLEDGE_ACTIVITY]: KNOWLEDGE_ACTIVITY_SCHEMA,
+  [TABLE_KNOWLEDGE_SEMANTIC_OUTBOX]: KNOWLEDGE_SEMANTIC_OUTBOX_SCHEMA,
 };
 
 /**
@@ -628,6 +904,21 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
  */
 export const TABLE_CONFIGS: Partial<Record<TABLE_NAMES, StorageTableConfig>> = {
   [TABLE_DATASET_ITEMS]: { columns: DATASET_ITEMS_SCHEMA, compositePrimaryKey: ['id', 'datasetVersion'] },
+  [TABLE_FAVORITES]: { columns: FAVORITES_SCHEMA, compositePrimaryKey: ['userId', 'entityType', 'entityId'] },
+  [TABLE_TOOL_PROVIDER_CONNECTIONS]: {
+    columns: TOOL_PROVIDER_CONNECTIONS_SCHEMA,
+    compositePrimaryKey: ['authorId', 'providerId', 'connectionId'],
+  },
+  [TABLE_NOTIFICATIONS]: { columns: NOTIFICATIONS_SCHEMA, compositePrimaryKey: ['threadId', 'id'] },
+  [TABLE_THREAD_STATE]: { columns: THREAD_STATE_SCHEMA, compositePrimaryKey: ['threadId', 'type'] },
+  [TABLE_KNOWLEDGE_MENTIONS]: {
+    columns: KNOWLEDGE_MENTIONS_SCHEMA,
+    compositePrimaryKey: ['sourceType', 'sourceId', 'recordId'],
+  },
+  [TABLE_KNOWLEDGE_CURSORS]: {
+    columns: KNOWLEDGE_CURSORS_SCHEMA,
+    compositePrimaryKey: ['sourceThreadId', 'agent'],
+  },
 };
 
 /**

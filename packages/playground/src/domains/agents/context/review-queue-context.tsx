@@ -182,6 +182,7 @@ export function ReviewQueueProvider({ children }: { children: ReactNode }) {
               feedbackSource: 'studio',
               feedbackType: 'rating',
               value: rating === 'positive' ? 1 : -1,
+              reviewStatus: 'reviewed',
               experimentId: item.experimentId ?? undefined,
               sourceId: item.id,
             },
@@ -198,7 +199,16 @@ export function ReviewQueueProvider({ children }: { children: ReactNode }) {
   const commentItem = useCallback(
     (id: string, comment: string) => {
       const item = items.find(i => i.id === id);
-      // Persist comment via feedback API if we have a traceId
+      if (item?.experimentId && item?.datasetId) {
+        // Persist comment on the experiment result so it survives reloads
+        updateExperimentResult.mutate({
+          datasetId: item.datasetId,
+          experimentId: item.experimentId,
+          resultId: item.id,
+          comment,
+        });
+      }
+      // Also record the comment via feedback API if we have a traceId
       if (item?.traceId) {
         client
           .createFeedback({
@@ -209,6 +219,7 @@ export function ReviewQueueProvider({ children }: { children: ReactNode }) {
               feedbackType: 'comment',
               value: comment,
               comment,
+              reviewStatus: 'reviewed',
               experimentId: item.experimentId ?? undefined,
               sourceId: item.id, // experiment result ID
             },
@@ -219,7 +230,7 @@ export function ReviewQueueProvider({ children }: { children: ReactNode }) {
       }
       setItems(prev => prev.map(i => (i.id === id ? { ...i, comment } : i)));
     },
-    [items, client],
+    [items, client, updateExperimentResult],
   );
 
   const assignCluster = useCallback((itemId: string, clusterId: string) => {

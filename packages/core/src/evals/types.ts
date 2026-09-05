@@ -26,6 +26,8 @@ export const scoringEntityTypeSchema = z.enum([
   'WORKFLOW',
   'TRAJECTORY',
   'STEP',
+  // Externally executed experiment items (targetType: 'external')
+  'EXTERNAL',
   ...Object.values(SpanType),
 ] as [string, string, ...string[]]);
 
@@ -88,6 +90,8 @@ export const scoringHookInputSchema = z.object({
   spanId: z.string().optional(),
   resourceId: z.string().optional(),
   threadId: z.string().optional(),
+  // Tenancy: organizationId arrives via ObservabilityContext; projectId is scores-specific.
+  projectId: z.string().optional(),
   // Note: observabilityContext is not serializable, so we don't include it in the schema
 });
 
@@ -192,6 +196,17 @@ export const scoreRowDataSchema = z.object({
   spanId: z.string().optional(),
   resourceId: z.string().optional(),
   threadId: z.string().optional(),
+  // Multi-tenant scope. `resourceId` is overloaded (memory end-user), so tenancy
+  // uses dedicated fields: organizationId (account) + projectId (project scope).
+  organizationId: z.string().nullish(),
+  projectId: z.string().nullish(),
+  // Batch handle shared across all per-trace scores produced by one batch scoring
+  // call. `runId` stays per-execution; `batchId` groups the batch.
+  batchId: z.string().nullish(),
+  // Dataset provenance: links a baseline score back to the curated dataset item it
+  // scored, so scores can join to ground truth without re-running the agent.
+  datasetId: z.string().nullish(),
+  datasetItemId: z.string().nullish(),
 
   // Additional ScoreRowData fields
   preprocessStepResult: optionalRecordSchema,
@@ -209,11 +224,22 @@ export type ScoreRowData = z.infer<typeof scoreRowDataSchema>;
 // Save Score Payload (for creating new scores)
 // ============================================================================
 
-export const saveScorePayloadSchema = scoreRowDataSchema.omit({
-  id: true,
-  createdAt: true,
-  updatedAt: true,
-});
+export const saveScorePayloadSchema = scoreRowDataSchema
+  .omit({
+    id: true,
+    createdAt: true,
+    updatedAt: true,
+  })
+  .extend({
+    /**
+     * Optional caller-supplied stable id. When provided, storage adapters
+     * upsert by this id (latest write wins) instead of inserting a new row
+     * with a random id. Used by caller-driven experiments so retried
+     * submissions converge on one score row per (experiment, item, attempt,
+     * scorer).
+     */
+    id: z.string().optional(),
+  });
 
 export type SaveScorePayload = z.infer<typeof saveScorePayloadSchema>;
 
@@ -293,6 +319,16 @@ export type McpToolCallStep = TrajectoryStepBase & {
   toolResult?: Record<string, unknown>;
   /** The MCP server that handled this tool call */
   mcpServer?: string;
+  /** Whether the tool call succeeded */
+  success?: boolean;
+};
+
+export type ProviderToolCallStep = TrajectoryStepBase & {
+  stepType: 'provider_tool_call';
+  /** Arguments passed to the server-side tool */
+  toolArgs?: Record<string, unknown>;
+  /** Result returned by the server-side tool */
+  toolResult?: Record<string, unknown>;
   /** Whether the tool call succeeded */
   success?: boolean;
 };
@@ -387,6 +423,7 @@ export type ProcessorRunStep = TrajectoryStepBase & {
 export type TrajectoryStep =
   | ToolCallStep
   | McpToolCallStep
+  | ProviderToolCallStep
   | ModelGenerationStep
   | AgentRunStep
   | WorkflowStepStep
@@ -612,8 +649,16 @@ export function extractTrajectory(output: ScorerRunOutputForAgent): Trajectory {
   const steps: ToolCallStep[] = [];
 
   for (const message of output) {
-    const toolInvocations = message?.content?.toolInvocations;
-    if (!toolInvocations) continue;
+    // Prefer the legacy toolInvocations array when present; fall back to
+    // V2 content.parts for messages that only store tool calls there.
+    const legacy = message?.content?.toolInvocations;
+    const fromParts = legacy
+      ? undefined
+      : message?.content?.parts
+          ?.filter((p): p is Extract<typeof p, { type: 'tool-invocation' }> => p.type === 'tool-invocation')
+          .map(p => p.toolInvocation);
+    const toolInvocations = legacy ?? fromParts;
+    if (!toolInvocations?.length) continue;
 
     for (const invocation of toolInvocations) {
       if (invocation && invocation.toolName && (invocation.state === 'result' || invocation.state === 'call')) {
@@ -736,7 +781,13 @@ const SKIPPED_SPAN_TYPES = new Set([
   SpanType.SCORER_RUN,
   SpanType.SCORER_STEP,
   SpanType.GENERIC,
+  // Retained for traces recorded before skill spans moved to SKILL_ACTION.
+  // SKILL_ACTION is deliberately NOT skipped: it now also covers the skill
+  // tools (activate/search/read), which are model-initiated trajectory steps
+  // and were never skipped when they were WORKSPACE_ACTION spans.
+  SpanType.SKILL_RESOLUTION,
   SpanType.MODEL_STEP,
+  SpanType.MODEL_INFERENCE,
   SpanType.MODEL_CHUNK,
   SpanType.WORKFLOW_CONDITIONAL_EVAL,
 ]);
@@ -799,6 +850,20 @@ function spanToTrajectorySteps(node: SpanTreeNode): TrajectoryStep[] {
           toolArgs,
           toolResult,
           mcpServer: typeof attrs.mcpServer === 'string' ? attrs.mcpServer : undefined,
+          success: typeof attrs.success === 'boolean' ? attrs.success : undefined,
+        },
+      ];
+    }
+
+    case SpanType.PROVIDER_TOOL_CALL: {
+      const toolArgs = toRecordOrUndefined(span.input);
+      const toolResult = toRecordOrUndefined(span.output);
+      return [
+        {
+          ...base,
+          stepType: 'provider_tool_call' as const,
+          toolArgs,
+          toolResult,
           success: typeof attrs.success === 'boolean' ? attrs.success : undefined,
         },
       ];

@@ -257,6 +257,7 @@ describe('record-builders', () => {
         traceId: 'trace-1',
         spanId: 'span-1',
         scorerId: 'judge-1',
+        scorerName: null,
         scorerVersion: 'v1',
         scoreSource: 'eval',
         source: 'eval',
@@ -368,6 +369,7 @@ describe('record-builders', () => {
 
       expect(buildFeedbackRecord(event)).toEqual({
         feedbackId: 'feedback-builder-1',
+        reviewStatus: 'needs-review',
         timestamp,
         traceId: 'trace-1',
         spanId: 'span-1',
@@ -753,6 +755,7 @@ describe('record-builders', () => {
         traceId: 'trace-1',
         spanId: 'span-1',
         scorerId: 'relevance',
+        scorerName: 'Relevance Scorer',
         scorerVersion: null,
         scoreSource: null,
         source: null,
@@ -784,7 +787,7 @@ describe('record-builders', () => {
         experimentId: 'context-exp',
         scope: null,
         scoreTraceId: null,
-        metadata: { kept: true, scorerName: 'Relevance Scorer' },
+        metadata: { kept: true },
       });
     });
   });
@@ -834,6 +837,7 @@ describe('record-builders', () => {
 
       expect(buildFeedbackRecord(event)).toEqual({
         feedbackId: 'feedback-builder-derived',
+        reviewStatus: 'needs-review',
         timestamp,
         traceId: 'trace-1',
         spanId: 'span-1',

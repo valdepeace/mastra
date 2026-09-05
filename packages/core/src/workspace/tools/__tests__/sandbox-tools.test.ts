@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 
+import { WORKSPACE_TOOLS } from '../../constants';
+import type { CommandResult } from '../../sandbox';
 import { Workspace } from '../../workspace';
 import { executeCommandTool, executeCommandWithBackgroundTool } from '../execute-command';
 import { getProcessOutputTool } from '../get-process-output';
@@ -24,7 +26,7 @@ function createMockHandle(opts: {
   stdout?: string;
   stderr?: string;
   exitCode?: number;
-  waitResult?: { exitCode: number; success: boolean; stdout: string; stderr: string };
+  waitResult?: CommandResult;
 }) {
   const handle = {
     pid: opts.pid,
@@ -211,6 +213,23 @@ describe('execute_command tool', () => {
         expect(result).toContain('line 500');
       });
 
+      it('accepts tail as a numeric string, like timeout', async () => {
+        const sandbox = createMockSandbox({
+          executeCommand: vi.fn().mockResolvedValue({
+            success: true,
+            exitCode: 0,
+            stdout: longOutput,
+            stderr: '',
+            executionTimeMs: 5,
+          }),
+        });
+        const ctx = createContext(sandbox);
+        const result = await executeCommandTool.execute({ command: 'seq 500', tail: '10' as any }, ctx);
+        expect(result).toContain('[showing last 10 of 500 lines]');
+        expect(result).toContain('line 491');
+        expect(result).toContain('line 500');
+      });
+
       it('tail applies to both stdout and stderr on failure', async () => {
         const longStderr = Array.from({ length: 50 }, (_, i) => `err ${i + 1}`).join('\n');
         const sandbox = createMockSandbox({
@@ -266,6 +285,48 @@ describe('execute_command tool', () => {
       const result = await executeCommandWithBackgroundTool.execute({ command: 'echo hi' }, ctx);
       expect(result).toBe('foreground result\n');
       expect(sandbox.processes.spawn).not.toHaveBeenCalled();
+    });
+
+    it('passes truncation metadata to background onExit callbacks', async () => {
+      const onExit = vi.fn();
+      const handle = createMockHandle({
+        pid: '42',
+        waitResult: {
+          exitCode: 0,
+          success: true,
+          stdout: 'tail',
+          stderr: '',
+          stdoutTruncated: true,
+          stderrTruncated: false,
+          stdoutDroppedBytes: 1024,
+          stderrDroppedBytes: 0,
+        },
+      });
+      const sandbox = createMockSandbox({
+        processes: {
+          spawn: vi.fn().mockResolvedValue(handle),
+        },
+      });
+      const workspace = new Workspace({
+        sandbox,
+        tools: {
+          [WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND]: {
+            backgroundProcesses: { onExit },
+          },
+        },
+      });
+
+      await executeCommandWithBackgroundTool.execute({ command: 'node server.js', background: true }, { workspace });
+      await vi.waitFor(() => expect(onExit).toHaveBeenCalled());
+
+      expect(onExit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          pid: '42',
+          stdout: 'tail',
+          stdoutTruncated: true,
+          stdoutDroppedBytes: 1024,
+        }),
+      );
     });
   });
 });
@@ -334,6 +395,25 @@ describe('get_process_output tool', () => {
     const ctx = createContext(sandbox);
     const result = await getProcessOutputTool.execute({ pid: 'session-abc' }, ctx);
     expect(result).toContain('string pid output');
+  });
+
+  it('accepts tail as a numeric string', async () => {
+    const handle = createMockHandle({
+      pid: '13',
+      stdout: Array.from({ length: 50 }, (_, i) => `line ${i + 1}`).join('\n'),
+      stderr: '',
+      exitCode: undefined,
+    });
+    const sandbox = createMockSandbox({
+      processes: {
+        get: vi.fn().mockResolvedValue(handle),
+      },
+    });
+    const ctx = createContext(sandbox);
+    const result = await getProcessOutputTool.execute({ pid: '13', tail: '5' as any }, ctx);
+    expect(result).toContain('[showing last 5 of 50 lines]');
+    expect(result).toContain('line 46');
+    expect(result).toContain('line 50');
   });
 
   it('returns output and exit code for already-exited process (no wait)', async () => {

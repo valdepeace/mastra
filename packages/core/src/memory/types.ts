@@ -11,6 +11,8 @@ import type { PublicSchema } from '../schema';
 import type { MastraCompositeStore } from '../storage';
 import type { DynamicArgument } from '../types';
 import type { MastraEmbeddingModel, MastraEmbeddingOptions, MastraVector } from '../vector';
+import type { VectorFilter } from '../vector/filter/base';
+import type { MemoryRunStateAccessor } from './run-state';
 import type { MemoryProcessor } from '.';
 
 export type { Message as AiMessageType } from '@internal/ai-sdk-v4';
@@ -20,7 +22,7 @@ export type { MastraLanguageModel };
 export type MastraMessageV1 = {
   id: string;
   content: string | UserContent | AssistantContent | ToolContent;
-  role: 'system' | 'user' | 'assistant' | 'tool';
+  role: 'system' | 'user' | 'assistant' | 'tool' | 'signal';
   createdAt: Date;
   threadId?: string;
   resourceId?: string;
@@ -56,6 +58,8 @@ export type ThreadOMMetadata = {
   suggestedResponse?: string;
   /** Observer-generated thread title */
   threadTitle?: string;
+  /** Extracted Observational Memory values keyed by extractor slug */
+  extracted?: Record<string, unknown>;
   /** Timestamp of the last observed message in this thread (ISO string for JSON serialization) */
   lastObservedAt?: string;
   /** Cursor pointing at the last observed message (for replay pruning fallback) */
@@ -122,6 +126,8 @@ export type MemoryRequestContext = {
   thread?: Partial<StorageThreadType> & { id: string };
   resourceId?: string;
   memoryConfig?: MemoryConfigInternal;
+  /** Internal accessor for non-serializable state shared within one agent run. */
+  runState?: MemoryRunStateAccessor;
 };
 
 /**
@@ -181,15 +187,42 @@ type BaseWorkingMemory = {
    * @default 'resource'
    */
   scope?: 'thread' | 'resource';
+  /**
+   * Experimental: deliver working memory to the model as a state signal instead of folding
+   * it into the system message. Storage is unchanged. When `true`, `Memory` auto-attaches
+   * a state-signal processor that emits snapshots or deltas with dedup via `cacheKey`, and
+   * registers the working-memory tool as `setWorkingMemory` instead of `updateWorkingMemory`.
+   *
+   * Not supported with template working memory `version: 'vnext'`.
+   *
+   * @default false
+   * @see docs/src/content/en/docs/agents/signals.mdx
+   */
+  useStateSignals?: boolean;
+  /**
+   * Whether the main agent manages working memory directly through tool/instruction injection.
+   * Set to false when another path, such as Observational Memory extractors,
+   * owns working memory updates.
+   *
+   * @default true
+   */
+  agentManaged?: boolean;
   /** @deprecated The `use` option has been removed. Working memory always uses tool-call mode. */
   use?: never;
 };
 
-type TemplateWorkingMemory = BaseWorkingMemory & {
-  template: string;
-  schema?: never;
-  version?: 'stable' | 'vnext';
-};
+type TemplateWorkingMemory =
+  | (BaseWorkingMemory & {
+      template: string;
+      schema?: never;
+      version?: 'stable';
+    })
+  | (Omit<BaseWorkingMemory, 'useStateSignals'> & {
+      template: string;
+      schema?: never;
+      version: 'vnext';
+      useStateSignals?: false;
+    });
 
 type SchemaWorkingMemory = BaseWorkingMemory & {
   schema: PublicSchema;
@@ -353,6 +386,21 @@ export type SemanticRecall = {
   indexConfig?: VectorIndexConfig;
 
   /**
+   * Metadata filter for semantic search queries.
+   * Allows filtering results by metadata fields using MongoDB-style query syntax.
+   * Works in combination with scope-based filtering (resource_id/thread_id).
+   *
+   * @example
+   * ```typescript
+   * filter: {
+   *   projectId: { $eq: 'project-a' },
+   *   category: { $in: ['work', 'personal'] }
+   * }
+   * ```
+   */
+  filter?: VectorFilter;
+
+  /**
    * Minimum similarity score threshold (0-1).
    * Messages below this threshold will be filtered out from semantic search results.
    *
@@ -381,6 +429,8 @@ export type SemanticRecall = {
  */
 export type ObservationalMemoryModelSettings = AgentExecutionOptions['modelSettings'];
 
+export type ObservationalMemoryActivationTTL = number | string | 'auto' | false;
+
 /**
  * Configuration for the observation step in Observational Memory.
  */
@@ -396,6 +446,16 @@ export interface ObservationalMemoryObservationConfig {
    * @default 'google/gemini-2.5-flash'
    */
   model?: AgentConfig['model'];
+
+  /**
+   * Manage working memory through Observational Memory extraction.
+   * When enabled alongside `workingMemory.enabled`, Memory supplies defaults that
+   * disable main-agent working memory management and add the WorkingMemoryExtractor.
+   * Set `workingMemory.agentManaged: true` to keep main-agent tools/instructions enabled.
+   *
+   * @default false
+   */
+  manageWorkingMemory?: boolean;
 
   /**
    * Token count of unobserved messages that triggers observation.
@@ -491,17 +551,38 @@ export interface ObservationalMemoryObservationConfig {
   bufferActivation?: number;
 
   /**
-   * Token threshold above which synchronous (blocking) observation is forced.
-   * When set, the system will never block for observation between `messageTokens`
-   * and `blockAfter` — only async buffering and activation are used in that range.
-   * Once unobserved tokens exceed `blockAfter`, a synchronous observation runs as a
-   * last resort to prevent context window overflow.
+   * Time before buffered observations are force-activated after inactivity.
+   * Accepts milliseconds as a number, a duration string like `"5m"` or `"1hr"`,
+   * `"auto"` to choose a provider-aware TTL from the actor model's prompt-cache behavior,
+   * or `false` to disable top-level `activateAfterIdle` for observations.
+   * If unset, top-level `activateAfterIdle` is used for observations.
+   */
+  activateAfterIdle?: ObservationalMemoryActivationTTL;
+
+  /**
+   * Force-activate buffered observations when the actor provider/model changes.
+   * If unset, top-level `activateOnProviderChange` is used for observations.
+   */
+  activateOnProviderChange?: boolean;
+
+  /**
+   * Token threshold above which buffered activation is allowed to overshoot the
+   * retention target. Above `blockAfter`, activation uses the smallest set of buffered
+   * chunks that reaches the retention target, even when that overshoots the target by
+   * more than the usual safeguard allows. It never activates more chunks than are needed
+   * to reach the retention target, and it changes the result only when the retention
+   * floor is above roughly 20,000 tokens — with the default settings it has no
+   * observable effect.
+   *
+   * Crossing `blockAfter` does not trigger a blocking observation. A synchronous
+   * (blocking) observation runs when the `messageTokens` threshold is reached and
+   * buffered activation did not happen.
    *
    * Accepts either:
-   * - A **multiplier** (1 < value < 2): multiplied by `messageTokens`.
-   *   e.g. `blockAfter: 1.5` with `messageTokens: 20_000` → blocks at 30,000 tokens.
-   * - An **absolute token count** (≥ 2): must be greater than `messageTokens`.
-   *   e.g. `blockAfter: 80_000` → blocks at 80,000 tokens.
+   * - A **multiplier** (1 ≤ value < 100): multiplied by `messageTokens`.
+   *   e.g. `blockAfter: 1.5` with `messageTokens: 20_000` → resolves to 30,000 tokens.
+   * - An **absolute token count** (≥ 100): must be greater than `messageTokens`.
+   *   e.g. `blockAfter: 80_000` → resolves to 80,000 tokens.
    *
    * Only relevant when `bufferTokens` is set. When `bufferTokens` is not set,
    * synchronous observation is used directly at `messageTokens` and this setting has no effect.
@@ -557,6 +638,16 @@ export interface ObservationalMemoryObservationConfig {
    * @default false
    */
   threadTitle?: boolean;
+
+  /**
+   * Whether image/file attachment parts are forwarded to the Observer LLM.
+   * - `true` forwards attachments
+   * - `false` drops attachments and leaves placeholder text
+   * - `'auto'` checks model capabilities to decide
+   *
+   * @default true
+   */
+  observeAttachments?: 'auto' | boolean;
 }
 
 /**
@@ -623,6 +714,21 @@ export interface ObservationalMemoryReflectionConfig {
    * @default 1.2 (120% of `observationTokens`) when `bufferActivation` is set.
    */
   blockAfter?: number;
+
+  /**
+   * Time before buffered reflections are force-activated after inactivity.
+   * Accepts milliseconds as a number, a duration string like `"5m"` or `"1hr"`,
+   * `"auto"` to choose a provider-aware TTL from the actor model's prompt-cache behavior,
+   * or `false` to disable idle activation for reflections.
+   * Reflections do not inherit top-level `activateAfterIdle`; set this explicitly to enable.
+   */
+  activateAfterIdle?: ObservationalMemoryActivationTTL;
+
+  /**
+   * Force-activate buffered reflections when the actor provider/model changes.
+   * Reflections do not inherit top-level `activateOnProviderChange`; set this explicitly to enable.
+   */
+  activateOnProviderChange?: boolean;
 
   /**
    * Ratio (0-1) controlling when async reflection buffering starts.
@@ -727,21 +833,29 @@ export interface ObservationalMemoryOptions {
   scope?: 'resource' | 'thread';
 
   /**
-   * Time before buffered observations or buffered reflections are force-activated after inactivity.
-   * Accepts milliseconds as a number or a duration string like `"5m"` or `"1hr"`.
+   * Time before buffered observations are force-activated after inactivity.
+   * Accepts milliseconds as a number, a duration string like `"5m"` or `"1hr"`,
+   * or `"auto"` to choose a provider-aware TTL from the actor model's prompt-cache behavior.
    * When the gap between the current time and the last assistant message part's `createdAt`
-   * exceeds this value, buffered observational memory activates regardless of whether the
+   * exceeds this value, buffered observations activate regardless of whether the
    * token threshold has been reached. Useful to align with prompt cache TTLs.
+   *
+   * Reflections do not inherit this setting. Use `reflection.activateAfterIdle` to
+   * opt reflections into idle activation.
    *
    * @example 300_000
    * @example "5m"
    * @example "1hr"
+   * @example "auto"
    */
-  activateAfterIdle?: number | string;
+  activateAfterIdle?: ObservationalMemoryActivationTTL;
 
   /**
-   * Force-activate buffered observations and reflections when the actor provider/model changes.
+   * Force-activate buffered observations when the actor provider/model changes.
    * Useful when switching between models that do not share prompt caches.
+   *
+   * Reflections do not inherit this setting. Use `reflection.activateOnProviderChange`
+   * to opt reflections into provider-change activation.
    */
   activateOnProviderChange?: boolean;
 
@@ -767,7 +881,7 @@ export interface ObservationalMemoryOptions {
   temporalMarkers?: boolean;
 
   /**
-   * **Experimental.** Enable retrieval-mode observation groups as durable pointers
+   * Enable retrieval-mode observation groups as durable pointers
    * to raw message history. When enabled, observation groups keep `_range`
    * metadata visible in context and a `recall` tool is registered so the actor
    * can inspect raw messages behind a stored observation summary.
@@ -776,14 +890,15 @@ export interface ObservationalMemoryOptions {
    * - `{ vector: true }` — also enables semantic search using Memory-level vector/embedder
    * - `{ scope: 'thread' }` — restricts the recall tool to the current thread only
    * - `{ vector: true, scope: 'thread' }` — current-thread browsing + semantic search
+   * - `{ instructions: '...' }` — appends application-specific recall guidance after
+   *   Mastra's built-in retrieval instructions (never replaces them)
    *
    * `scope` defaults to `'resource'` (cross-thread browsing, thread listing, and search).
    * Set to `'thread'` to restrict to the current thread only.
    *
-   * @experimental
    * @default false
    */
-  retrieval?: boolean | { vector?: boolean; scope?: 'thread' | 'resource' };
+  retrieval?: boolean | { vector?: boolean; scope?: 'thread' | 'resource'; instructions?: string };
 }
 
 /**
@@ -949,8 +1064,8 @@ type BaseMemoryConfig = {
    * Set to false to allow the agent to see suspended tool calls in context.
    * This is useful for suspend/resume patterns where the agent should be aware of pending interactions.
    *
-   * Note: Some providers (e.g. OpenAI) may return errors when incomplete tool calls are included.
-   * Anthropic handles incomplete tool calls without issues.
+   * Note: providers reject a tool call that has no matching tool result, so a suspended call kept
+   * in context is paired with a `{ status: 'pending' }` placeholder result before the prompt is sent.
    *
    * @default true
    * @example
@@ -1207,10 +1322,10 @@ export type SerializedObservationalMemoryConfig = {
   /** Memory scope: 'resource' or 'thread' */
   scope?: 'resource' | 'thread';
 
-  /** Inactivity TTL before forcing buffered observation/reflection activation */
-  activateAfterIdle?: number | string;
+  /** Inactivity TTL before forcing buffered observation activation */
+  activateAfterIdle?: ObservationalMemoryActivationTTL;
 
-  /** Force-activate buffered observation/reflection activation when the actor model changes */
+  /** Force-activate buffered observation activation when the actor model changes */
   activateOnProviderChange?: boolean;
 
   /** Share the token budget between messages and observations */
@@ -1220,10 +1335,9 @@ export type SerializedObservationalMemoryConfig = {
   temporalMarkers?: boolean;
 
   /**
-   * **Experimental.** Enable retrieval-mode observation groups as durable pointers to raw message history.
-   * @experimental
+   * Enable retrieval-mode observation groups as durable pointers to raw message history.
    */
-  retrieval?: boolean | { vector?: boolean; scope?: 'thread' | 'resource' };
+  retrieval?: boolean | { vector?: boolean; scope?: 'thread' | 'resource'; instructions?: string };
 
   /** Observation step configuration */
   observation?: SerializedObservationalMemoryObservationConfig;
@@ -1236,6 +1350,9 @@ export type SerializedObservationalMemoryConfig = {
 export type SerializedObservationalMemoryObservationConfig = {
   /** Observer model ID */
   model?: string;
+  /** Manage working memory through Observational Memory extraction. */
+  manageWorkingMemory?: boolean;
+
   /** Token count threshold that triggers observation */
   messageTokens?: number;
   /** Model settings (temperature, maxOutputTokens, etc.) */
@@ -1248,12 +1365,18 @@ export type SerializedObservationalMemoryObservationConfig = {
   bufferTokens?: number | false;
   /** Ratio of buffered observations to activate */
   bufferActivation?: number;
+  /** Inactivity TTL before forcing buffered observation activation */
+  activateAfterIdle?: ObservationalMemoryActivationTTL;
+  /** Force-activate buffered observation activation when the actor model changes */
+  activateOnProviderChange?: boolean;
   /** Token threshold for synchronous blocking */
   blockAfter?: number;
   /** Optional token budget for observer context (0 = full truncation, false = disabled) */
   previousObserverTokens?: number | false;
   /** Whether the Observer should suggest thread titles */
   threadTitle?: boolean;
+  /** Whether image/file attachment parts are forwarded to the Observer LLM */
+  observeAttachments?: 'auto' | boolean;
 };
 
 /** Serializable subset of ObservationalMemoryReflectionConfig */
@@ -1268,6 +1391,10 @@ export type SerializedObservationalMemoryReflectionConfig = {
   providerOptions?: Record<string, Record<string, unknown> | undefined>;
   /** Token threshold for synchronous blocking */
   blockAfter?: number;
+  /** Inactivity TTL before forcing buffered reflection activation */
+  activateAfterIdle?: ObservationalMemoryActivationTTL;
+  /** Force-activate buffered reflection activation when the actor model changes */
+  activateOnProviderChange?: boolean;
   /** Ratio for async reflection buffering */
   bufferActivation?: number;
 };

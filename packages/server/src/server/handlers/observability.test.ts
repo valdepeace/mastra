@@ -13,6 +13,7 @@ import { HTTPException } from '../http-exception';
 import * as errorHandler from './error';
 import {
   LIST_TRACES_ROUTE,
+  LIST_TRACES_LIGHT_ROUTE,
   LIST_BRANCHES_ROUTE,
   GET_BRANCH_ROUTE,
   GET_TRACE_ROUTE,
@@ -21,7 +22,7 @@ import {
   SCORE_TRACES_ROUTE,
   LIST_SCORES_BY_SPAN_ROUTE,
 } from './observability';
-import { NEW_ROUTES } from './observability-new-endpoints';
+import { LIST_METRICS, NEW_ROUTES } from './observability-new-endpoints';
 import { createTestServerContext } from './test-utils';
 
 // Mock scoreTraces
@@ -38,12 +39,15 @@ vi.mock('./error', () => ({
 
 // Mock observability store
 const createMockObservabilityStore = () => ({
+  getFeatures: vi.fn(),
   getTrace: vi.fn(),
   getTraceLight: vi.fn(),
   getSpan: vi.fn(),
   getBranch: vi.fn(),
   listTraces: vi.fn(),
+  listTracesLight: vi.fn(),
   listBranches: vi.fn(),
+  listMetrics: vi.fn(),
   listLogs: vi.fn(),
   listScores: vi.fn(),
   createScore: vi.fn(),
@@ -54,6 +58,7 @@ const createMockObservabilityStore = () => ({
   getScorePercentiles: vi.fn(),
   listFeedback: vi.fn(),
   createFeedback: vi.fn(),
+  updateFeedbackReviewStatus: vi.fn(),
   getFeedbackAggregate: vi.fn(),
   getFeedbackBreakdown: vi.fn(),
   getFeedbackTimeSeries: vi.fn(),
@@ -166,9 +171,37 @@ describe('Observability Handlers', () => {
         traceId: 'test-trace-123',
       });
 
-      expect(result).toEqual(mockTrace);
+      expect(result).toEqual({
+        traceId: 'test-trace-123',
+        spans: [{ ...createSampleSpan(), status: 'success' }],
+      });
       expect(mockObservabilityStore.getTrace).toHaveBeenCalledWith({ traceId: 'test-trace-123' });
       expect(handleErrorSpy).not.toHaveBeenCalled();
+    });
+
+    it('should derive span status from error and endedAt', async () => {
+      const mockTrace: TraceRecord = {
+        traceId: 'test-trace-123',
+        spans: [
+          createSampleSpan({ spanId: 'span-success' }),
+          createSampleSpan({ spanId: 'span-error', error: { message: 'boom' } }),
+          createSampleSpan({ spanId: 'span-running', endedAt: null }),
+        ],
+      };
+
+      (mockObservabilityStore.getTrace as ReturnType<typeof vi.fn>).mockResolvedValue(mockTrace);
+
+      const result = (await GET_TRACE_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        traceId: 'test-trace-123',
+      })) as { spans: Array<{ spanId: string; status: string }> };
+
+      const statuses = Object.fromEntries(result.spans.map(span => [span.spanId, span.status]));
+      expect(statuses).toEqual({
+        'span-success': 'success',
+        'span-error': 'error',
+        'span-running': 'running',
+      });
     });
 
     it('should throw 404 when trace not found', async () => {
@@ -227,6 +260,56 @@ describe('Observability Handlers', () => {
       ).rejects.toThrow();
 
       expect(handleErrorSpy).toHaveBeenCalledWith(storageError, 'Error getting trace');
+    });
+  });
+
+  describe('Delta capability gating', () => {
+    it('should reject metrics delta mode when the store does not advertise delta support', async () => {
+      await expect(
+        LIST_METRICS.handler({
+          ...createTestServerContext({ mastra: mockMastra }),
+          mode: 'delta',
+        }),
+      ).rejects.toThrow(HTTPException);
+
+      try {
+        await LIST_METRICS.handler({
+          ...createTestServerContext({ mastra: mockMastra }),
+          mode: 'delta',
+        });
+      } catch (error) {
+        expect(error).toBeInstanceOf(HTTPException);
+        expect((error as HTTPException).status).toBe(501);
+        expect((error as HTTPException).message).toBe(
+          'Delta polling is not supported by the configured observability store for metrics',
+        );
+      }
+
+      expect(mockObservabilityStore.listMetrics).not.toHaveBeenCalled();
+    });
+
+    it('should allow metrics delta mode when the store advertises support', async () => {
+      const deltaResponse = {
+        metrics: [],
+        delta: { limit: 10, hasMore: false },
+        deltaCursor: null,
+      };
+
+      (mockObservabilityStore.getFeatures as ReturnType<typeof vi.fn>).mockReturnValue(['delta-polling']);
+      (mockObservabilityStore.listMetrics as ReturnType<typeof vi.fn>).mockResolvedValue(deltaResponse);
+
+      const result = await LIST_METRICS.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        mode: 'delta',
+      });
+
+      expect(result).toEqual(deltaResponse);
+      expect(mockObservabilityStore.listMetrics).toHaveBeenCalledWith({
+        mode: 'delta',
+        filters: {},
+        after: undefined,
+        limit: undefined,
+      });
     });
   });
 
@@ -627,6 +710,178 @@ describe('Observability Handlers', () => {
 
       expect(handleErrorSpy).toHaveBeenCalledWith(storageError, 'Error listing traces');
     });
+
+    it('should allow trace delta mode when the store advertises support', async () => {
+      const deltaResponse = {
+        spans: [],
+        delta: { limit: 10, hasMore: false },
+        deltaCursor: 'cursor-1',
+      };
+
+      (mockObservabilityStore.getFeatures as ReturnType<typeof vi.fn>).mockReturnValue(['delta-polling']);
+      (mockObservabilityStore.listTraces as ReturnType<typeof vi.fn>).mockResolvedValue(deltaResponse);
+
+      const result = await LIST_TRACES_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        mode: 'delta',
+        after: 'cursor-0',
+        limit: 10,
+      });
+
+      expect(result).toEqual(deltaResponse);
+      expect(mockObservabilityStore.listTraces).toHaveBeenCalledWith({
+        mode: 'delta',
+        filters: {},
+        after: 'cursor-0',
+        limit: 10,
+      });
+    });
+  });
+
+  describe('LIST_TRACES_LIGHT_ROUTE', () => {
+    it('should return paginated lightweight results', async () => {
+      const mockResult = {
+        pagination: { total: 1, page: 0, perPage: 10, hasMore: false },
+        spans: [
+          {
+            traceId: 'test-trace-123',
+            spanId: 'test-span-456',
+            parentSpanId: null,
+            name: 'test-span',
+            spanType: SpanType.GENERIC,
+            isEvent: false,
+            startedAt: new Date('2024-01-01T00:00:00Z'),
+            endedAt: new Date('2024-01-01T00:01:00Z'),
+            error: null,
+            entityType: null,
+            entityId: null,
+            entityName: null,
+            createdAt: new Date('2024-01-01T00:00:00Z'),
+            updatedAt: null,
+          },
+        ],
+      };
+
+      (mockObservabilityStore.listTracesLight as ReturnType<typeof vi.fn>).mockResolvedValue(mockResult);
+
+      const result = await LIST_TRACES_LIGHT_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        entityType: 'AGENT',
+        page: 1,
+        perPage: 10,
+        field: 'startedAt',
+        direction: 'DESC',
+      });
+
+      expect(result).toEqual(mockResult);
+      expect(mockObservabilityStore.listTracesLight).toHaveBeenCalledWith({
+        filters: { entityType: 'AGENT' },
+        pagination: { page: 1, perPage: 10 },
+        orderBy: { field: 'startedAt', direction: 'DESC' },
+      });
+      expect(mockObservabilityStore.listTraces).not.toHaveBeenCalled();
+    });
+
+    it('falls back to listTraces when the store predates listTracesLight', async () => {
+      const fullResult = {
+        pagination: { total: 0, page: 0, perPage: 10, hasMore: false },
+        spans: [],
+      };
+
+      // Simulate an older `@mastra/core` whose `ObservabilityStorage` base
+      // class doesn't expose `listTracesLight` at all.
+      const original = mockObservabilityStore.listTracesLight;
+      // @ts-expect-error - intentionally remove method to simulate old core
+      delete mockObservabilityStore.listTracesLight;
+      (mockObservabilityStore.listTraces as ReturnType<typeof vi.fn>).mockResolvedValue(fullResult);
+
+      try {
+        const result = await LIST_TRACES_LIGHT_ROUTE.handler({
+          ...createTestServerContext({ mastra: mockMastra }),
+        });
+
+        expect(result).toEqual(fullResult);
+        expect(mockObservabilityStore.listTraces).toHaveBeenCalledWith({
+          filters: {},
+          pagination: {},
+          orderBy: {},
+        });
+      } finally {
+        mockObservabilityStore.listTracesLight = original;
+      }
+    });
+
+    it('should allow delta mode when the store advertises support', async () => {
+      const deltaResponse = {
+        spans: [],
+        delta: { limit: 10, hasMore: false },
+        deltaCursor: 'cursor-1',
+      };
+
+      (mockObservabilityStore.getFeatures as ReturnType<typeof vi.fn>).mockReturnValue(['delta-polling']);
+      (mockObservabilityStore.listTracesLight as ReturnType<typeof vi.fn>).mockResolvedValue(deltaResponse);
+
+      const result = await LIST_TRACES_LIGHT_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        mode: 'delta',
+        after: 'cursor-0',
+        limit: 10,
+      });
+
+      expect(result).toEqual(deltaResponse);
+      expect(mockObservabilityStore.listTracesLight).toHaveBeenCalledWith({
+        mode: 'delta',
+        filters: {},
+        after: 'cursor-0',
+        limit: 10,
+      });
+      expect(mockObservabilityStore.listTraces).not.toHaveBeenCalled();
+    });
+
+    it('should reject delta mode when the store does not advertise delta support', async () => {
+      (mockObservabilityStore.getFeatures as ReturnType<typeof vi.fn>).mockReturnValue([]);
+
+      await expect(
+        LIST_TRACES_LIGHT_ROUTE.handler({
+          ...createTestServerContext({ mastra: mockMastra }),
+          mode: 'delta',
+          after: 'cursor-0',
+          limit: 10,
+        }),
+      ).rejects.toThrow();
+
+      expect(mockObservabilityStore.listTracesLight).not.toHaveBeenCalled();
+    });
+
+    it('falls back to delta on listTraces when the store predates listTracesLight', async () => {
+      const deltaResponse = { spans: [], delta: { limit: 10, hasMore: false }, deltaCursor: 'cursor-1' };
+
+      (mockObservabilityStore.getFeatures as ReturnType<typeof vi.fn>).mockReturnValue(['delta-polling']);
+      (mockObservabilityStore.listTraces as ReturnType<typeof vi.fn>).mockResolvedValue(deltaResponse);
+
+      const original = mockObservabilityStore.listTracesLight;
+      // @ts-expect-error - intentionally remove method to simulate old core
+      delete mockObservabilityStore.listTracesLight;
+
+      try {
+        const result = await LIST_TRACES_LIGHT_ROUTE.handler({
+          ...createTestServerContext({ mastra: mockMastra }),
+          mode: 'delta',
+          after: 'cursor-0',
+          limit: 10,
+        });
+
+        expect(result).toEqual(deltaResponse);
+        expect(mockObservabilityStore.listTraces).toHaveBeenCalledWith({
+          mode: 'delta',
+          filters: {},
+          after: 'cursor-0',
+          limit: 10,
+        });
+      } finally {
+        mockObservabilityStore.listTracesLight = original;
+      }
+    });
   });
 
   describe('LIST_BRANCHES_ROUTE', () => {
@@ -698,6 +953,32 @@ describe('Observability Handlers', () => {
       ).rejects.toThrow();
 
       expect(handleErrorSpy).toHaveBeenCalledWith(storageError, 'Error listing branches');
+    });
+
+    it('should allow branch delta mode when the store advertises support', async () => {
+      const deltaResponse = {
+        branches: [],
+        delta: { limit: 5, hasMore: false },
+        deltaCursor: 'cursor-2',
+      };
+
+      (mockObservabilityStore.getFeatures as ReturnType<typeof vi.fn>).mockReturnValue(['delta-polling']);
+      (mockObservabilityStore.listBranches as ReturnType<typeof vi.fn>).mockResolvedValue(deltaResponse);
+
+      const result = await LIST_BRANCHES_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        mode: 'delta',
+        after: 'cursor-1',
+        limit: 5,
+      });
+
+      expect(result).toEqual(deltaResponse);
+      expect(mockObservabilityStore.listBranches).toHaveBeenCalledWith({
+        mode: 'delta',
+        filters: {},
+        after: 'cursor-1',
+        limit: 5,
+      });
     });
   });
 
@@ -1456,6 +1737,33 @@ describe('Observability Handlers', () => {
     });
   });
 
+  describe('UPDATE_FEEDBACK_REVIEW_STATUS_ROUTE', () => {
+    it('should update and return the feedback review status', async () => {
+      const feedback = {
+        feedbackId: 'feedback-123',
+        timestamp: new Date('2026-09-01T12:00:00.000Z'),
+        traceId: 'trace-123',
+        feedbackSource: 'user',
+        feedbackType: 'comment',
+        value: 'Needs follow-up',
+        reviewStatus: 'reviewed' as const,
+      };
+      (mockObservabilityStore.updateFeedbackReviewStatus as ReturnType<typeof vi.fn>).mockResolvedValue(feedback);
+
+      const result = await NEW_ROUTES.UPDATE_FEEDBACK_REVIEW_STATUS.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        feedbackId: 'feedback-123',
+        reviewStatus: 'reviewed',
+      });
+
+      expect(result).toEqual(feedback);
+      expect(mockObservabilityStore.updateFeedbackReviewStatus).toHaveBeenCalledWith({
+        feedbackId: 'feedback-123',
+        reviewStatus: 'reviewed',
+      });
+    });
+  });
+
   describe('CREATE_FEEDBACK_ROUTE', () => {
     it('should create feedback successfully', async () => {
       (mockObservabilityStore.createFeedback as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
@@ -1505,6 +1813,38 @@ describe('Observability Handlers', () => {
 
       expect(mockObservabilityStore.createFeedback).toHaveBeenCalledWith({
         feedback: expect.objectContaining({ ...feedbackData, timestamp: expect.any(Date) }),
+      });
+    });
+
+    it('should default reviewStatus to needs-review', async () => {
+      (mockObservabilityStore.createFeedback as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+      await NEW_ROUTES.CREATE_FEEDBACK.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        feedback: { traceId: 'trace-123', source: 'user', feedbackType: 'comment', value: 'hi' },
+      });
+
+      expect(mockObservabilityStore.createFeedback).toHaveBeenCalledWith({
+        feedback: expect.objectContaining({ reviewStatus: 'needs-review' }),
+      });
+    });
+
+    it('should preserve a caller-supplied reviewStatus', async () => {
+      (mockObservabilityStore.createFeedback as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+      await NEW_ROUTES.CREATE_FEEDBACK.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        feedback: {
+          traceId: 'trace-123',
+          source: 'studio',
+          feedbackType: 'rating',
+          value: 1,
+          reviewStatus: 'reviewed',
+        },
+      });
+
+      expect(mockObservabilityStore.createFeedback).toHaveBeenCalledWith({
+        feedback: expect.objectContaining({ reviewStatus: 'reviewed' }),
       });
     });
 

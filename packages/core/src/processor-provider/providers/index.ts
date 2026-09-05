@@ -13,11 +13,14 @@ import { SystemPromptScrubber } from '../../processors/processors/system-prompt-
 import type { SystemPromptScrubberOptions } from '../../processors/processors/system-prompt-scrubber';
 import { TokenLimiterProcessor } from '../../processors/processors/token-limiter';
 import { ToolCallFilter } from '../../processors/processors/tool-call-filter';
+import type { ToolCallFilterOptions } from '../../processors/processors/tool-call-filter';
 import { UnicodeNormalizer } from '../../processors/processors/unicode-normalizer';
 import type { ProcessorProvider, ProcessorPhase } from '../types';
 
 // Reusable schema fragments
-const structuredOutputOptionsSchema = z.object({ jsonPromptInjection: z.boolean().optional() }).optional();
+const structuredOutputOptionsSchema = z
+  .object({ jsonPromptInjection: z.union([z.boolean(), z.enum(['system', 'inline', 'auto'])]).optional() })
+  .optional();
 const providerOptionsSchema = z.record(z.string(), z.any()).optional();
 
 // ---------------------------------------------------------------------------
@@ -74,10 +77,12 @@ export const toolCallFilterProvider: ProcessorProvider = {
   },
   configSchema: z.object({
     exclude: z.array(z.string()).optional(),
+    filterAfterToolSteps: z.number().optional(),
+    preserveModelOutput: z.boolean().optional(),
   }),
   availablePhases: ['processInput'] as ProcessorPhase[],
   createProcessor(config) {
-    return new ToolCallFilter(config as { exclude?: string[] });
+    return new ToolCallFilter(config as ToolCallFilterOptions);
   },
 };
 
@@ -197,7 +202,6 @@ export const languageDetectorProvider: ProcessorProvider = {
     instructions: z.string().optional(),
     minTextLength: z.number().optional(),
     includeDetectionDetails: z.boolean().optional(),
-    translationQuality: z.enum(['speed', 'quality', 'balanced']).optional(),
     providerOptions: providerOptionsSchema,
   }),
   availablePhases: ['processInput'] as ProcessorPhase[],

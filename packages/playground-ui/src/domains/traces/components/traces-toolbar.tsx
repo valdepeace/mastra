@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import { PropertyFilterActions } from '@/ds/components/PropertyFilter/property-filter-actions';
 import { PropertyFilterApplied } from '@/ds/components/PropertyFilter/property-filter-applied';
 import type { PropertyFilterField, PropertyFilterToken } from '@/ds/components/PropertyFilter/types';
@@ -18,6 +19,9 @@ type TracesToolbarProps = {
   filterTokens: PropertyFilterToken[];
   onFilterTokensChange: (tokens: PropertyFilterToken[]) => void;
   autoFocusFilterFieldId?: string;
+  /** Field ids rendered as read-only pills (cannot be edited or removed). */
+  lockedFieldIds?: readonly string[];
+  lockedTooltipContent?: ReactNode;
 };
 
 export function TracesToolbar({
@@ -30,23 +34,35 @@ export function TracesToolbar({
   filterTokens,
   onFilterTokensChange,
   autoFocusFilterFieldId,
+  lockedFieldIds,
+  lockedTooltipContent,
 }: TracesToolbarProps) {
   const hasActiveFilters = filterTokens.length > 0;
-  const hasNonDefaultFilter = filterTokens.some(token => isNonDefaultFilter(token, filterFields));
+
+  const lockedSet = new Set(lockedFieldIds ?? []);
+  const editableTokens = filterTokens.filter(t => !lockedSet.has(t.fieldId));
+  const hasNonDefaultFilter = editableTokens.some(token => isNonDefaultFilter(token, filterFields));
+  const hasEditableFilters = editableTokens.length > 0;
+
+  // Without filters the toolbar renders nothing; returning null avoids an empty
+  // grid row (and its gap) in `PageLayout.TopArea`.
+  if (!hasActiveFilters) return null;
 
   return (
     // 1fr | auto — pills wrap in the first column; Clear stays pinned to the
     // top of the second column regardless of how many pill rows render.
-    <div className={cn('grid grid-cols-[1fr_auto] gap-3 items-start ')}>
+    <div className={cn('grid grid-cols-[1fr_auto] items-start gap-3 ')}>
       <PropertyFilterApplied
         fields={filterFields}
         tokens={filterTokens}
         onTokensChange={onFilterTokensChange}
         disabled={isLoading}
         autoFocusFieldId={autoFocusFilterFieldId}
+        lockedFieldIds={lockedFieldIds}
+        lockedTooltipContent={lockedTooltipContent}
       />
 
-      {hasActiveFilters && (
+      {hasActiveFilters && hasEditableFilters && (
         <PropertyFilterActions
           disabled={isLoading}
           onClear={hasNonDefaultFilter ? onClear : undefined}

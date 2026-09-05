@@ -5,7 +5,7 @@
  * BrowserManager capabilities (newWindow, switchTo, closeTab).
  */
 
-import { ThreadManager } from '@mastra/core/browser';
+import { ThreadManager, resolveLaunchViewport } from '@mastra/core/browser';
 import type { BrowserState, ThreadSession, ThreadManagerConfig } from '@mastra/core/browser';
 import { BrowserManager } from 'agent-browser';
 import type { BrowserLaunchOptions } from 'agent-browser';
@@ -15,7 +15,7 @@ import type { BrowserConfig } from './types';
 /**
  * Extended session info for AgentBrowser.
  */
-interface AgentBrowserSession extends ThreadSession {
+export interface AgentBrowserSession extends ThreadSession {
   /** For 'thread' scope: dedicated browser manager instance */
   manager?: BrowserManager;
 }
@@ -33,6 +33,12 @@ export interface AgentBrowserThreadManagerConfig extends ThreadManagerConfig {
 }
 
 /**
+ * Factory for custom thread managers (e.g. Firecrawl-hosted CDP per session).
+ * Defaults to {@link AgentBrowserThreadManager} when omitted.
+ */
+export type CreateAgentBrowserThreadManager = (config: AgentBrowserThreadManagerConfig) => AgentBrowserThreadManager;
+
+/**
  * Thread manager implementation for AgentBrowser.
  *
  * Supports two scope modes:
@@ -40,9 +46,9 @@ export interface AgentBrowserThreadManagerConfig extends ThreadManagerConfig {
  * - 'thread': Each thread gets a dedicated browser manager instance
  */
 export class AgentBrowserThreadManager extends ThreadManager<BrowserManager> {
-  private readonly browserConfig: BrowserConfig;
+  protected readonly browserConfig: BrowserConfig;
   private readonly resolveCdpUrl?: (cdpUrl: string | (() => string | Promise<string>)) => Promise<string>;
-  private readonly onBrowserCreated?: (manager: BrowserManager, threadId: string) => void;
+  protected readonly onBrowserCreated?: (manager: BrowserManager, threadId: string) => void;
 
   constructor(config: AgentBrowserThreadManagerConfig) {
     super(config);
@@ -76,9 +82,9 @@ export class AgentBrowserThreadManager extends ThreadManager<BrowserManager> {
       // Thread scope - create a new browser manager for this thread
       const manager = new BrowserManager();
 
-      const launchOptions: BrowserLaunchOptions = {
+      const launchOptions: BrowserLaunchOptions & { cdpHeaders?: Record<string, string> } = {
         headless: this.browserConfig.headless,
-        viewport: this.browserConfig.viewport,
+        ...resolveLaunchViewport(this.browserConfig.viewport),
         profile: this.browserConfig.profile,
         executablePath: this.browserConfig.executablePath,
         storageState: this.browserConfig.storageState,
@@ -86,6 +92,9 @@ export class AgentBrowserThreadManager extends ThreadManager<BrowserManager> {
 
       if (this.browserConfig.cdpUrl && this.resolveCdpUrl) {
         launchOptions.cdpUrl = await this.resolveCdpUrl(this.browserConfig.cdpUrl);
+      }
+      if (this.browserConfig.cdpHeaders) {
+        launchOptions.cdpHeaders = this.browserConfig.cdpHeaders;
       }
 
       try {
@@ -133,7 +142,7 @@ export class AgentBrowserThreadManager extends ThreadManager<BrowserManager> {
   /**
    * Restore browser state (multiple tabs) to a browser manager.
    */
-  private async restoreBrowserState(manager: BrowserManager, state: BrowserState): Promise<void> {
+  protected async restoreBrowserState(manager: BrowserManager, state: BrowserState): Promise<void> {
     try {
       // Navigate first tab to first URL
       const firstTab = state.tabs[0];

@@ -1,10 +1,7 @@
-import {
-  PermissionDenied,
-  SessionExpired,
-  Spinner,
-  is401UnauthorizedError,
-  is403ForbiddenError,
-} from '@mastra/playground-ui';
+import { PermissionDenied } from '@mastra/playground-ui/components/PermissionDenied';
+import { SessionExpired } from '@mastra/playground-ui/components/SessionExpired';
+import { Spinner } from '@mastra/playground-ui/components/Spinner';
+import { is401UnauthorizedError, is403ForbiddenError } from '@mastra/playground-ui/utils/errors';
 import { useCallback, useMemo, useState } from 'react';
 import { useParams } from 'react-router';
 import { AgentPlaygroundView } from '@/domains/agents/components/agent-playground/agent-playground-view';
@@ -15,7 +12,10 @@ import { useAgentVersions, useAgentVersion } from '@/domains/agents/hooks/use-ag
 import { useStoredAgent } from '@/domains/agents/hooks/use-stored-agents';
 import { mapAgentResponseToDataSource } from '@/domains/agents/utils/compute-agent-initial-values';
 import type { AgentDataSource } from '@/domains/agents/utils/compute-agent-initial-values';
+import { getEditorOwnership } from '@/domains/agents/utils/editor-ownership';
+import { useEditorSource } from '@/domains/configuration/hooks/use-editor-source';
 import { useMemory } from '@/domains/memory/hooks/use-memory';
+import { useMastraPlatform } from '@/lib/mastra-platform/hooks/use-mastra-platform';
 
 function AgentPlayground() {
   const { agentId } = useParams();
@@ -23,11 +23,13 @@ function AgentPlayground() {
 
   const { data: codeAgent, isLoading: isLoadingCodeAgent, error } = useAgent(agentId!);
   const { data: memory } = useMemory(agentId!);
+  const editorSource = useEditorSource();
+  const { isMastraPlatform, mastraPlatformApiEndpoint, mastraPlatformProjectId } = useMastraPlatform();
 
   // Fetch versions first — this endpoint returns an empty array for code-only agents
-  const { data: versionsData } = useAgentVersions({
-    agentId: agentId ?? '',
-    params: { sortDirection: 'DESC' },
+  const { data: versionsData, isLoading: isLoadingVersions } = useAgentVersions({
+    agentId,
+    params: { orderBy: { direction: 'DESC' } },
   });
 
   // Only fetch stored agent details when versions exist (avoids 404 for code-only agents)
@@ -38,7 +40,12 @@ function AgentPlayground() {
   });
 
   const isCodeAgentOverride = codeAgent?.source === 'code';
-  const isLoading = isLoadingCodeAgent || (hasVersions && isLoadingStoredAgent);
+  const isCodeSourceAgent = isCodeAgentOverride && editorSource === 'code';
+  const isCodeAgentEditable = !getEditorOwnership(isCodeAgentOverride, codeAgent?.editor).isFullyLocked;
+  const showCodeModeActions = isCodeSourceAgent && isCodeAgentEditable;
+  const canOpenPr = showCodeModeActions && isMastraPlatform && !!mastraPlatformApiEndpoint && !!mastraPlatformProjectId;
+  const openPrTitle = canOpenPr ? 'Open a pull request for these JSON changes' : undefined;
+  const isLoading = isLoadingCodeAgent || isLoadingVersions || (hasVersions && isLoadingStoredAgent);
   const hasMemory = Boolean(memory?.result);
 
   // Fetch version data when a specific version is selected
@@ -63,12 +70,23 @@ function AgentPlayground() {
     return {} as AgentDataSource;
   }, [isViewingVersion, versionData, storedAgent, codeAgent]);
 
-  const { form, handlePublish, handleSaveDraft, isSubmitting, isSavingDraft, isDirty } = useAgentCmsForm({
+  const {
+    form,
+    handlePublish,
+    handleSaveDraft,
+    handleDownloadJson,
+    handleOpenPr,
+    isSubmitting,
+    isSavingDraft,
+    isDirty,
+  } = useAgentCmsForm({
     mode: 'edit',
     agentId: agentId ?? '',
     dataSource,
     isCodeAgentOverride,
     hasStoredOverride: isCodeAgentOverride && !!storedAgent,
+    editorConfig: codeAgent?.editor,
+    saveSuccessMessage: isCodeSourceAgent ? 'Saved to filesystem' : undefined,
     onSuccess: () => {},
   });
 
@@ -79,6 +97,11 @@ function AgentPlayground() {
       await handlePublish();
     }
   }, [handlePublish, isViewingPreviousVersion, selectedVersionId]);
+
+  const handleOpenPrClick = useCallback(async () => {
+    if (!mastraPlatformApiEndpoint || !mastraPlatformProjectId) return;
+    await handleOpenPr({ platformApiEndpoint: mastraPlatformApiEndpoint, projectId: mastraPlatformProjectId });
+  }, [handleOpenPr, mastraPlatformApiEndpoint, mastraPlatformProjectId]);
 
   const handleVersionSelect = useCallback(
     (versionId: string) => {
@@ -117,7 +140,7 @@ function AgentPlayground() {
   }
 
   if (!codeAgent) {
-    return <div className="text-center py-4">Agent not found</div>;
+    return <div className="py-4 text-center">Agent not found</div>;
   }
 
   return (
@@ -130,7 +153,9 @@ function AgentPlayground() {
       handlePublish={handlePublish}
       handleSaveDraft={handleSaveDraft}
       isCodeAgentOverride={isCodeAgentOverride}
-      readOnly={isViewingPreviousVersion}
+      isCodeSourceAgent={isCodeSourceAgent}
+      readOnly={isViewingPreviousVersion || !isCodeAgentEditable}
+      editorConfig={codeAgent?.editor}
     >
       <AgentPlaygroundView
         agentId={agentId!}
@@ -146,9 +171,15 @@ function AgentPlayground() {
         isSavingDraft={isSavingDraft}
         isPublishing={isSubmitting}
         hasDraft={hasDraft}
-        readOnly={isViewingPreviousVersion}
+        readOnly={isViewingPreviousVersion || !isCodeAgentEditable}
+        isCodeSourceAgent={isCodeSourceAgent}
+        showCodeModeActions={showCodeModeActions}
+        canOpenPr={canOpenPr}
+        openPrTitle={openPrTitle}
         onSaveDraft={handleSaveDraft}
         onPublish={handlePublishVersion}
+        onDownloadJson={handleDownloadJson}
+        onOpenPr={handleOpenPrClick}
         isViewingPreviousVersion={isViewingPreviousVersion}
       />
     </AgentEditFormProvider>

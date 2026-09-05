@@ -1,7 +1,36 @@
 Build from root: pnpm build:playground-ui
 Test from root: pnpm --filter ./packages/playground-ui test
-Run e2e-frontend-validation for frontend changes before merging
+Typecheck: pnpm --filter ./packages/playground-ui typecheck (standalone `tsc`)
 
-This package needs both component validation and realistic UI validation
+`build` is `vite build` only; vite-plugin-dts emits declarations and gates type
+errors via the `afterDiagnostic` hook in vite.config.ts. Use the `typecheck`
+script for an explicit `tsc` gate (CI runs turbo `typecheck`). The package's own
+build is ~8s; a slow `build:playground-ui` is the cold turbo cache rebuilding
+upstream deps (`^build`), not this package.
 
-Preserve design-system consistency and existing component APIs where possible
+PRIMARY testing strategy: Vitest + MSW + typed @mastra/client-js fixtures.
+This is the #1 way to validate changes here — ABOVE Playwright E2E.
+Use the `playground-msw-tests` skill for business hooks, data components,
+gating, and React Query flows.
+
+After tests pass, mutation testing is mandatory on exactly the production
+`.ts`/`.tsx` files the task changed (none changed = skip):
+`pnpm --filter ./packages/playground-ui test:mutate "src/foo.ts,src/bar.tsx"`.
+No dirs/globs, no unrelated files, no direct `stryker run`, no
+tests/fixtures/generated/config/docs. Strengthen the TDD/BDD tests to kill
+survivors (never weaken assertions); report truly equivalent/unreachable ones.
+
+Rules:
+
+- Drive the real @mastra/client-js + React Query stack; only mock the network.
+- Never `vi.mock` our own data hooks, services, or auth gating.
+- Fixtures live in nearby `__tests__/fixtures/` folders and MUST be typed with
+  response types re-exported from @mastra/client-js.
+
+Use Playwright E2E (`e2e-tests-studio` skill) only when MSW cannot model the
+journey. Run e2e-frontend-validation before merging frontend changes when
+applicable.
+
+Include mobile, tablet, and desktop screenshots when handing off UI changes.
+Preserve design-system consistency and existing component APIs where possible.
+No new `asChild`; prefer Base UI's native `render` prop.

@@ -9,8 +9,8 @@
   "keywords": [],
   "author": "",
   "license": "Apache-2.0",
-  "pnpm": {
-    "neverBuiltDependencies": []
+  "dependencies": {
+    "unicorn-magic": "0.2.0"
   },
-  "packageManager": "pnpm@10.29.3"
+  "packageManager": "pnpm@11.3.0"
 }

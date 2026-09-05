@@ -1,6 +1,6 @@
 ---
 title: "Reference: Agent.stream() | Streaming"
-description: "Documentation for the `Agent.stream()` method in Mastra agents, which enables real-time streaming of responses with enhanced capabilities."
+description: "The .stream() method enables real-time streaming of responses from an agent with enhanced capabilities and format flexibility."
 packages:
   - "@mastra/ai-sdk"
 ---
@@ -9,7 +9,7 @@ import { MODEL_SETTINGS_OBJECT } from "@site/src/components/ModelSettingsPropert
 
 # Agent.stream()
 
-The `.stream()` method enables real-time streaming of responses from an agent with enhanced capabilities and format flexibility. This method accepts messages and optional streaming options, providing a next-generation streaming experience with support for both Mastra's native format and AI SDK v5+ compatibility.
+The `.stream()` method enables real-time streaming of responses from an agent with enhanced capabilities and format flexibility. This method accepts messages and optional streaming options, providing a current streaming experience with support for both Mastra's native format and AI SDK v5+ compatibility.
 
 ## Usage example
 
@@ -17,7 +17,7 @@ The `.stream()` method enables real-time streaming of responses from an agent wi
 const stream = await agent.stream('message for agent')
 ```
 
-:::info
+:::note
 
 **Model Compatibility**: This method is designed for V2 models. V1 models should use the [`.streamLegacy()`](./streamLegacy) method. The framework automatically detects your model version and will throw an error if there's a mismatch.
 
@@ -253,6 +253,18 @@ const stream = await agent.stream('message for agent')
                   },
                 ],
               },
+              {
+                parameters: [
+                  {
+                    name: 'suppressFeedback',
+                    type: 'boolean',
+                    isOptional: true,
+                    defaultValue: 'false',
+                    description:
+                      'When true, marks the completion check feedback so consumers can hide it from displayed output. Feedback is only added to the conversation when the check fails, to guide the next iteration.',
+                  },
+                ],
+              },
             ],
           },
           {
@@ -269,7 +281,7 @@ const stream = await agent.stream('message for agent')
                     type: '(context: DelegationStartContext) => DelegationStartResult | void | Promise<DelegationStartResult | void>',
                     isOptional: true,
                     description:
-                      'Called before delegating to a subagent. Use this to modify the delegation parameters or reject the delegation entirely.',
+                      "Called before delegating to a subagent. Use this to modify the delegation parameters, reject the delegation entirely, or mutate `context.requestContext` to add entries to the subagent run's request context.",
                   },
                 ],
               },
@@ -323,16 +335,17 @@ const stream = await agent.stream('message for agent')
           },
           {
             name: 'onAbort',
-            type: '(event: any) => Promise<void> | void',
+            type: '(event: { steps: any[]; text?: string }) => Promise<void> | void',
             isOptional: true,
-            description: 'Callback function called when the stream is aborted.',
+            description:
+              'Callback function called when the stream is aborted. `steps` contains the steps that completed before the abort, and `text` contains the assistant text streamed so far for the step that was in flight.',
           },
           {
             name: 'abortSignal',
             type: 'AbortSignal',
             isOptional: true,
             description:
-              "Signal object that allows you to abort the agent's execution. When the signal is aborted, all ongoing operations will be terminated.",
+              "Signal object that allows you to abort the agent's execution, including in-flight subagent runs. Canceled runs continue through output processors. When writable memory is configured, built-in memory processors persist submitted messages, completed tool results, and assistant output available when terminal processing runs. Output that doesn't reach terminal processing isn't persisted. Custom output processors can transform or interrupt this behavior before memory processors run.",
           },
           {
             name: 'activeTools',
@@ -414,10 +427,10 @@ const stream = await agent.stream('message for agent')
                 parameters: [
                   {
                     name: 'jsonPromptInjection',
-                    type: 'boolean',
+                    type: "boolean | 'system' | 'inline' | 'auto'",
                     isOptional: true,
                     description:
-                      'Injects system prompt into the main agent instructing it to return structured output, useful for when a model does not natively support structured outputs.',
+                      "Controls how the JSON schema reaches the model. Set to 'auto' to use native structured output when supported and inline prompt injection otherwise.",
                   },
                 ],
               },
@@ -510,6 +523,17 @@ const stream = await agent.stream('message for agent')
                     isOptional: true,
                     description:
                       'Configuration for memory behavior including lastMessages, readOnly, semanticRecall, workingMemory, and filterIncompleteToolCalls.',
+                  },
+                ],
+              },
+              {
+                parameters: [
+                  {
+                    name: 'onTitleGenerated',
+                    type: '(title: string) => void | Promise<void>',
+                    isOptional: true,
+                    description:
+                      'Callback fired asynchronously when a thread title is generated and persisted to storage. Title generation runs in the background and may complete after the stream ends. Only fires when `generateTitle` is enabled in memory options and the thread has no existing title.',
                   },
                 ],
               },
@@ -636,6 +660,13 @@ const stream = await agent.stream('message for agent')
             isOptional: true,
             description:
               "Tools that are executed on the 'client' side of the request. These tools do not have execute functions in the definition.",
+          },
+          {
+            name: 'hooks',
+            type: 'ToolHooks',
+            isOptional: true,
+            description:
+              'Per-execution hooks that run before and after tool calls. Overrides matching agent-level hooks for this execution. `beforeToolCall` can return `{ proceed: false, output }` to skip the tool call.',
           },
           {
             name: 'savePerStep',
@@ -813,7 +844,7 @@ const stream = await agent.stream('message for agent')
             type: 'VersionOverrides',
             isOptional: true,
             description:
-              'Per-invocation version overrides for sub-agent delegation. Merged on top of Mastra instance-level versions and propagated automatically through sub-agent calls via requestContext. Requires the editor package. See [Sub-agent versioning](/docs/editor/overview#sub-agent-versioning).',
+              'Per-invocation version overrides for sub-agent delegation. Merged on top of Mastra instance-level versions and propagated automatically through sub-agent calls via requestContext. Requires the editor package. See [Editor versioning](/docs/studio/editor#versioning).',
             properties: [
               {
                 type: 'VersionOverrides',
@@ -846,6 +877,27 @@ const stream = await agent.stream('message for agent')
                         ],
                       },
                     ],
+                  },
+                ],
+              },
+            ],
+          },
+          {
+            name: 'untilIdle',
+            type: 'boolean | { maxIdleMs?: number }',
+            isOptional: true,
+            description:
+              'When set, keeps the stream open across background-task continuations. The agent will automatically re-invoke the LLM when background tasks complete, streaming continuation turns through the same `fullStream`. Pass `true` for default settings (5 min idle timeout), or an object with `maxIdleMs` to configure. Requires memory. Replaces the standalone `streamUntilIdle()` method.',
+            properties: [
+              {
+                parameters: [
+                  {
+                    name: 'maxIdleMs',
+                    type: 'number',
+                    isOptional: true,
+                    defaultValue: '300000',
+                    description:
+                      'Closes the outer stream after this many ms of idleness between turns. The timer only runs while the wrapper is between turns. Default: 5 minutes.',
                   },
                 ],
               },
@@ -912,6 +964,26 @@ for await (const chunk of stream.fullStream) {
 const fullText = await stream.text
 ```
 
+### Limiting execution time
+
+Use `modelSettings.timeout` to bound how long a run may take. `totalMs` limits the entire run, including every loop iteration, tool call and retry. `stepMs` limits a single model call, covering both establishing the stream and consuming it.
+
+```ts title="index.ts"
+const stream = await agent.stream('Tell me a story', {
+  modelSettings: {
+    timeout: {
+      totalMs: 30000, // fail the run if it takes longer than 30s
+      stepMs: 10000, // fail an individual model call after 10s
+    },
+  },
+})
+```
+
+Exceeding either budget fails with a `MastraTimeoutError`, which carries a `timeoutType` of `'total'` or `'step'`. Each budget behaves differently when the agent is configured with fallback [`models`](/reference/agents/agent):
+
+- A `totalMs` timeout ends the run immediately and doesn't try the next model, because it's a hard deadline for the run as a whole.
+- A `stepMs` timeout isn't retried against the same model, but does advance to the next model, which makes it a way to fail over from a slow provider.
+
 ### AI SDK v5+ Format
 
 To use the stream with AI SDK v5 (and later), you can convert it using our utility function `toAISdkStream`.
@@ -951,8 +1023,9 @@ const stream = await agent.stream('Tell me a story', {
   onError: ({ error }) => {
     console.error('Streaming error:', error)
   },
-  onAbort: event => {
-    console.log('Stream aborted:', event)
+  onAbort: ({ steps, text }) => {
+    console.log('Stream aborted after', steps.length, 'steps')
+    console.log('Partial text:', text)
   },
 })
 
@@ -984,7 +1057,7 @@ await agent.stream('message for agent', {
       sentiment: z.enum(['positive', 'negative', 'neutral']),
       confidence: z.number(),
     }),
-    model: 'openai/gpt-5.4',
+    model: '__GATEWAY_OPENAI_MODEL__',
     errorStrategy: 'warn',
   },
   // Output processors for streaming response validation
@@ -1049,4 +1122,4 @@ Responses WebSocket connections run one response at a time. Mastra rejects overl
 
 - [Generating responses](/docs/agents/overview#use-your-agent)
 - [Streaming responses](/docs/agents/overview#use-your-agent)
-- [Agent Approval](/docs/agents/agent-approval)
+- [Agent Approval](/docs/agents/human-in-the-loop)

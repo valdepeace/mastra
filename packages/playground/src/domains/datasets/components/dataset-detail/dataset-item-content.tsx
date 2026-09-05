@@ -1,8 +1,9 @@
 'use client';
 
 import type { DatasetItem } from '@mastra/client-js';
-import { Sections, SideDialog } from '@mastra/playground-ui';
-import { FileInputIcon, FileOutputIcon, TagIcon, RouteIcon } from 'lucide-react';
+import { Sections } from '@mastra/playground-ui/components/Sections';
+import { SideDialog } from '@mastra/playground-ui/components/SideDialog';
+import { FileInputIcon, FileOutputIcon, ListChecksIcon, TagIcon, RouteIcon } from 'lucide-react';
 import type { useLinkComponent } from '@/lib/framework';
 
 /**
@@ -26,6 +27,11 @@ export function DatasetItemContent({ item }: DatasetItemContentProps) {
       {trajectoryDisplay && (
         <SideDialog.CodeSection title="Expected Trajectory" icon={<RouteIcon />} codeStr={trajectoryDisplay} />
       )}
+      <SideDialog.CodeSection
+        title="Scorers"
+        icon={<ListChecksIcon />}
+        codeStr={item.scorerIds === undefined ? 'Inherited from dataset' : JSON.stringify(item.scorerIds, null, 2)}
+      />
       <SideDialog.CodeSection title="Metadata" icon={<TagIcon />} codeStr={metadataDisplay} />
     </Sections>
   );

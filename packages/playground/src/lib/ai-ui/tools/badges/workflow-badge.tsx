@@ -1,25 +1,35 @@
 import type { GetWorkflowResponse } from '@mastra/client-js';
-import { Button, CodeEditor, WorkflowIcon } from '@mastra/playground-ui';
+import { ToolCallMono } from '@mastra/playground-ui/components/ai/tool-call';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { CodeEditor } from '@mastra/playground-ui/components/CodeEditor';
+import { WorkflowIcon } from '@mastra/playground-ui/icons/WorkflowIcon';
 
-import type { MastraUIMessage } from '@mastra/react';
 import { useContext, useEffect } from 'react';
 import { BackgroundTaskMetadataDialogTrigger } from './background-task-metadata-dialog';
 import { BadgeWrapper } from './badge-wrapper';
 import { LoadingBadge } from './loading-badge';
 import { NetworkChoiceMetadataDialogTrigger } from './network-choice-metadata-dialog';
+import { SectionLabel } from './section-label';
 import type { ToolApprovalButtonsProps } from './tool-approval-buttons';
 import { ToolApprovalButtons } from './tool-approval-buttons';
-import { WorkflowGraph, WorkflowRunContext, WorkflowRunProvider } from '@/domains/workflows';
+import {
+  WorkflowGraph,
+  WorkflowRunContext,
+  WorkflowRunProvider,
+  WorkflowSelectedStepProvider,
+  WorkflowStepDetailProvider,
+} from '@/domains/workflows';
 import type { WorkflowRunStreamResult } from '@/domains/workflows/context/workflow-run-context';
 import { useWorkflow } from '@/hooks';
 import { useWorkflowRuns } from '@/hooks/use-workflow-runs';
+import type { MessageMetadata } from '@/lib/ai-ui/messages/message-metadata';
 import { useLinkComponent } from '@/lib/framework';
 
 export interface WorkflowBadgeProps extends Omit<ToolApprovalButtonsProps, 'toolCalled'> {
   workflowId: string;
   result?: any;
   isStreaming?: boolean;
-  metadata?: MastraUIMessage['metadata'];
+  metadata?: MessageMetadata;
   suspendPayload?: any;
   toolCalled?: boolean;
 }
@@ -46,8 +56,10 @@ export const WorkflowBadge = ({
 
   const snapshot = typeof run?.snapshot === 'object' ? run?.snapshot : undefined;
 
-  const selectionReason = metadata?.mode === 'network' ? metadata.selectionReason : undefined;
-  const agentNetworkInput = metadata?.mode === 'network' ? metadata.agentInput : undefined;
+  const routingDecision = metadata?.mode === 'network' ? metadata.routingDecision : undefined;
+  const selectionReason =
+    metadata?.mode === 'network' ? (routingDecision?.selectionReason ?? metadata.selectionReason) : undefined;
+  const agentNetworkInput = metadata?.mode === 'network' ? (routingDecision ?? metadata.agentInput) : undefined;
 
   const bgEntry =
     (metadata?.mode === 'stream' || metadata?.mode === 'generate') && metadata?.backgroundTasks
@@ -56,7 +68,9 @@ export const WorkflowBadge = ({
 
   let suspendPayloadSlot =
     typeof suspendPayload === 'string' ? (
-      <pre className="whitespace-pre bg-surface4 p-4 rounded-md overflow-x-auto">{suspendPayload}</pre>
+      <ToolCallMono copyText={suspendPayload} className="text-icon3">
+        {suspendPayload}
+      </ToolCallMono>
     ) : (
       <CodeEditor data={suspendPayload} data-testid="tool-suspend-payload" />
     );
@@ -90,7 +104,7 @@ export const WorkflowBadge = ({
 
       {suspendPayloadSlot !== undefined && suspendPayload && (
         <div>
-          <p className="font-medium pb-2">Workflow suspend payload</p>
+          <SectionLabel>Workflow suspend payload</SectionLabel>
           {suspendPayloadSlot}
         </div>
       )}
@@ -129,8 +143,12 @@ const WorkflowBadgeExtended = ({ workflowId, workflow, runId }: WorkflowBadgeExt
         )}
       </div>
 
-      <div className="rounded-md overflow-hidden h-[60vh] w-full">
-        <WorkflowGraph workflowId={workflowId} workflow={workflow!} />
+      <div className="h-[60vh] w-full overflow-hidden rounded-md">
+        <WorkflowSelectedStepProvider>
+          <WorkflowStepDetailProvider>
+            <WorkflowGraph workflowId={workflowId} workflow={workflow!} />
+          </WorkflowStepDetailProvider>
+        </WorkflowSelectedStepProvider>
       </div>
     </>
   );

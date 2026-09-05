@@ -1,4 +1,4 @@
-import type { Dispatch, SetStateAction } from 'react';
+import type { Dispatch, ReactNode, SetStateAction } from 'react';
 import { useMemo } from 'react';
 import type { UISpan } from '../types';
 import { spanTypePrefixes, getSpanTypeUi } from './shared';
@@ -16,6 +16,8 @@ type TraceTimelineProps = {
   setExpandedSpanIds?: Dispatch<SetStateAction<string[]>>;
   featuredSpanIds?: string[];
   chartWidth?: 'wide' | 'default';
+  /** Rendered on the left of the span type legend row. */
+  leadingSlot?: ReactNode;
 };
 
 export function TraceTimeline({
@@ -28,6 +30,7 @@ export function TraceTimeline({
   setExpandedSpanIds,
   featuredSpanIds,
   chartWidth = 'default',
+  leadingSlot,
 }: TraceTimelineProps) {
   const overallLatency = hierarchicalSpans?.[0]?.latency || 0;
   const overallStartTime = hierarchicalSpans?.[0]?.startTime || '';
@@ -56,22 +59,26 @@ export function TraceTimeline({
       {isLoading ? (
         <div
           className={cn(
-            'flex items-center text-ui-sm gap-3 bg-surface3/50 rounded-md p-3 justify-center text-neutral3',
-            '[&_svg]:w-[1.25em] [&_svg]:h-[1.25em] [&_svg]:opacity-50',
+            'flex items-center justify-center gap-3 rounded-md bg-surface3/50 p-3 text-ui-sm text-neutral3',
+            '[&_svg]:size-[1.25em] [&_svg]:opacity-50',
           )}
         >
           <Spinner /> Loading Trace Timeline ...
         </div>
       ) : (
         <>
-          {usedSpanTypes.length > 0 && (
-            <div className="flex flex-wrap gap-3 px-2 py-1.5 justify-end">
+          {(usedSpanTypes.length > 0 || leadingSlot) && (
+            <div className="flex flex-wrap items-center justify-end gap-3 px-2 py-1.5">
+              {/* The slot takes the leftover width and is the only thing allowed to
+                  shrink, so the legend never compresses or wraps. `min-w-0` lets it
+                  shrink past its content width instead of pushing the legend down. */}
+              {leadingSlot && <div className="min-w-0 flex-1">{leadingSlot}</div>}
               {usedSpanTypes.map(type => {
                 const spanUI = getSpanTypeUi(type);
                 return (
-                  <div key={type} className="flex items-center gap-1 text-ui-sm text-neutral3">
+                  <div key={type} className="text-ui-sm text-neutral3 flex shrink-0 items-center gap-1">
                     <span
-                      className="inline-block w-1.5 h-1.5 rounded-full shrink-0"
+                      className="inline-block size-1.5 shrink-0 rounded-full"
                       style={{ backgroundColor: spanUI?.color }}
                     />
                     {spanUI?.label || type}
@@ -80,7 +87,7 @@ export function TraceTimeline({
               })}
             </div>
           )}
-          <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-start content-start gap-y-px overflow-hidden py-1">
+          <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] content-start items-start gap-y-px overflow-hidden py-1">
             {hierarchicalSpans?.map(span => (
               <TraceTimelineSpan
                 key={span.id}

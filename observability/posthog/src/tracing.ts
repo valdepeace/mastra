@@ -1,4 +1,11 @@
-import type { AnyExportedSpan, ModelGenerationAttributes, SpanErrorInfo, UsageStats } from '@mastra/core/observability';
+import type {
+  AnyExportedSpan,
+  ExportedFeedback,
+  FeedbackEvent,
+  ModelGenerationAttributes,
+  SpanErrorInfo,
+  UsageStats,
+} from '@mastra/core/observability';
 import { SpanType } from '@mastra/core/observability';
 import type { TraceData, TrackingExporterConfig } from '@mastra/observability';
 import { TrackingExporter } from '@mastra/observability';
@@ -14,14 +21,16 @@ export interface PostHogUsageMetrics {
   $ai_output_tokens?: number;
   $ai_cache_read_input_tokens?: number;
   $ai_cache_creation_input_tokens?: number;
+  $ai_cache_creation_5m_input_tokens?: number;
+  $ai_cache_creation_1h_input_tokens?: number;
 }
 
 /**
  * Formats UsageStats to PostHog's expected property format.
  *
- * PostHog expects $ai_input_tokens to be NON-cached tokens only,
- * with cache tokens tracked separately for accurate cost calculation.
- * See: https://posthog.com/docs/llm-analytics/calculating-costs
+ * Pass through gross input token counts with cache fields as subsets.
+ * PostHog subtracts cache tokens when computing costs for non-Anthropic
+ * providers and detects Anthropic-style exclusive reporting on its own.
  *
  * @param usage - The UsageStats from span attributes
  * @returns PostHog-formatted usage properties
@@ -32,25 +41,26 @@ export function formatUsageMetrics(usage?: UsageStats): PostHogUsageMetrics {
   const props: PostHogUsageMetrics = {};
 
   if (usage.inputTokens !== undefined) {
-    // Start with total input tokens (which includes cached tokens from usage.ts)
     props.$ai_input_tokens = usage.inputTokens;
-
-    // Subtract cache tokens to get the actual non-cached input count
-    if (usage.inputDetails?.cacheRead !== undefined) {
-      props.$ai_cache_read_input_tokens = usage.inputDetails.cacheRead;
-      props.$ai_input_tokens -= props.$ai_cache_read_input_tokens;
-    }
-
-    if (usage.inputDetails?.cacheWrite !== undefined) {
-      props.$ai_cache_creation_input_tokens = usage.inputDetails.cacheWrite;
-      props.$ai_input_tokens -= props.$ai_cache_creation_input_tokens;
-    }
-
-    // Defensive clamp: ensure input tokens is never negative
-    if (props.$ai_input_tokens < 0) props.$ai_input_tokens = 0;
   }
 
-  if (usage.outputTokens !== undefined) props.$ai_output_tokens = usage.outputTokens;
+  if (usage.inputDetails?.cacheRead !== undefined) {
+    props.$ai_cache_read_input_tokens = usage.inputDetails.cacheRead;
+  }
+
+  if (usage.inputDetails?.cacheWrite !== undefined) {
+    props.$ai_cache_creation_input_tokens = usage.inputDetails.cacheWrite;
+  }
+  if (usage.inputDetails?.cacheWrite5m !== undefined) {
+    props.$ai_cache_creation_5m_input_tokens = usage.inputDetails.cacheWrite5m;
+  }
+  if (usage.inputDetails?.cacheWrite1h !== undefined) {
+    props.$ai_cache_creation_1h_input_tokens = usage.inputDetails.cacheWrite1h;
+  }
+
+  if (usage.outputTokens !== undefined) {
+    props.$ai_output_tokens = usage.outputTokens;
+  }
 
   return props;
 }
@@ -179,12 +189,14 @@ export class PosthogExporter extends TrackingExporter<
     const distinctId = this.getDistinctId(span, traceData);
     const properties = this.buildEventProperties(span, 0);
 
-    this.#client?.capture({
-      distinctId,
-      event: eventName,
-      properties,
-      timestamp: span.endTime ? new Date(span.endTime) : new Date(),
-    });
+    this.#client?.capture(
+      this.withGroups({
+        distinctId,
+        event: eventName,
+        properties,
+        timestamp: span.endTime ? new Date(span.endTime) : new Date(),
+      }),
+    );
 
     return true;
   }
@@ -218,7 +230,7 @@ export class PosthogExporter extends TrackingExporter<
     const mergedSpan = !span.input && cachedSpan?.input ? { ...span, input: cachedSpan.input } : span;
 
     const eventMessage = this.buildEventMessage({ span: mergedSpan, traceData });
-    this.#client?.capture(eventMessage);
+    this.#client?.capture(this.withGroups(eventMessage));
   }
 
   protected override async _abortSpan(args: {
@@ -232,7 +244,80 @@ export class PosthogExporter extends TrackingExporter<
     span.errorInfo = reason;
 
     const eventMessage = this.buildEventMessage({ span, traceData });
-    this.#client?.capture(eventMessage);
+    this.#client?.capture(this.withGroups(eventMessage));
+  }
+
+  /**
+   * Forward feedback recorded via `addFeedback()` to PostHog as a native
+   * `$ai_feedback` event, shown as "User feedback" on the linked trace in
+   * PostHog's AI observability UI.
+   */
+  async onFeedbackEvent(event: FeedbackEvent): Promise<void> {
+    if (!this.#client) return;
+
+    const { feedback } = event;
+    if (!feedback.traceId) {
+      this.logger.debug('PostHog exporter: dropping feedback with no traceId; PostHog requires $ai_trace_id', {
+        feedbackId: feedback.feedbackId,
+      });
+      return;
+    }
+
+    const properties: Record<string, any> = {
+      // Custom metadata goes first so it cannot overwrite the natively mapped fields below
+      ...this.extractCustomMetadata(feedback.metadata),
+      $ai_trace_id: feedback.traceId,
+      // PostHog's trace UI only displays feedback events that carry $ai_feedback_text
+      $ai_feedback_text: feedback.comment ?? String(feedback.value),
+      feedback_id: feedback.feedbackId,
+      feedback_type: feedback.feedbackType,
+      feedback_value: feedback.value,
+    };
+
+    const feedbackSource = feedback.feedbackSource ?? feedback.source;
+    if (feedbackSource) properties.feedback_source = feedbackSource;
+    if (feedback.spanId) properties.span_id = feedback.spanId;
+    if (feedback.sourceId) properties.source_id = feedback.sourceId;
+    if (feedback.metadata?.sessionId) properties.$ai_session_id = feedback.metadata.sessionId;
+
+    try {
+      this.#client.capture(
+        this.withGroups({
+          distinctId: this.getFeedbackDistinctId(feedback),
+          event: '$ai_feedback',
+          properties,
+          timestamp: new Date(feedback.timestamp),
+        }),
+      );
+    } catch (err) {
+      this.logger.error('PostHog exporter: failed to submit feedback', {
+        error: err,
+        traceId: feedback.traceId,
+        feedbackId: feedback.feedbackId,
+      });
+    }
+  }
+
+  private getFeedbackDistinctId(feedback: ExportedFeedback): string {
+    const userId = feedback.feedbackUserId ?? feedback.userId ?? feedback.metadata?.userId;
+    if (userId) {
+      return String(userId);
+    }
+    return this.config.defaultDistinctId ?? 'anonymous';
+  }
+
+  /**
+   * PostHog group analytics are keyed off the top-level `groups` field on the
+   * capture call. The Node SDK derives the event's `$groups` from that field and
+   * overwrites any property-level `$groups`, so group metadata carried in
+   * properties is dropped unless it is mirrored here.
+   */
+  private withGroups(message: EventMessage): EventMessage {
+    const groups = message.properties?.$groups;
+    if (groups && typeof groups === 'object' && !Array.isArray(groups)) {
+      return { ...message, groups };
+    }
+    return message;
   }
 
   private buildEventMessage(args: { span: AnyExportedSpan; traceData: PosthogTraceData }): EventMessage {
@@ -436,8 +521,8 @@ export class PosthogExporter extends TrackingExporter<
     return props;
   }
 
-  private extractCustomMetadata(span: AnyExportedSpan): Record<string, any> {
-    const { userId, sessionId, ...customMetadata } = span.metadata ?? {};
+  private extractCustomMetadata(metadata?: Record<string, unknown>): Record<string, any> {
+    const { userId, sessionId, ...customMetadata } = metadata ?? {};
     return customMetadata;
   }
 
@@ -459,8 +544,20 @@ export class PosthogExporter extends TrackingExporter<
       if (attrs.parameters.maxOutputTokens !== undefined) props.$ai_max_tokens = attrs.parameters.maxOutputTokens;
     }
     if (attrs.streaming !== undefined) props.$ai_stream = attrs.streaming;
+    if (attrs.tools?.length) {
+      // OpenAI-style shape — the format PostHog's own AI SDKs send and its
+      // trace view renders. Provider-defined tools pass through as-is.
+      props.$ai_tools = attrs.tools.map(tool =>
+        tool.type === 'function'
+          ? {
+              type: 'function',
+              function: { name: tool.name, description: tool.description, parameters: tool.parameters },
+            }
+          : tool,
+      );
+    }
 
-    return { ...props, ...this.extractErrorProperties(span.errorInfo), ...this.extractCustomMetadata(span) };
+    return { ...props, ...this.extractErrorProperties(span.errorInfo), ...this.extractCustomMetadata(span.metadata) };
   }
 
   private buildSpanProperties(span: AnyExportedSpan): Record<string, any> {
@@ -479,7 +576,7 @@ export class PosthogExporter extends TrackingExporter<
       Object.assign(props, span.attributes);
     }
 
-    return { ...props, ...this.extractErrorProperties(span.errorInfo), ...this.extractCustomMetadata(span) };
+    return { ...props, ...this.extractErrorProperties(span.errorInfo), ...this.extractCustomMetadata(span.metadata) };
   }
 
   private formatMessages(data: SpanData, defaultRole: 'user' | 'assistant' = 'user'): PostHogMessage[] {

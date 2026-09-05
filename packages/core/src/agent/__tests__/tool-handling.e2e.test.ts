@@ -1,13 +1,16 @@
-import { createGatewayMock } from '@internal/test-utils';
+import { getLLMTestMode } from '@internal/llm-recorder';
+import { createGatewayMock, setupDummyApiKeys } from '@internal/test-utils';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Agent } from '../agent';
 import { getOpenAIModel, getSingleDummyResponseModel } from './mock-model';
+
+setupDummyApiKeys(getLLMTestMode(), ['openai']);
 
 const mock = createGatewayMock();
 beforeAll(() => mock.start());
 afterAll(() => mock.saveAndStop());
 
-function toolhandlingE2ETests(version: 'v1' | 'v2' | 'v3') {
+function toolhandlingE2ETests(version: 'v1' | 'v2' | 'v3' | 'v4') {
   const dummyModel = getSingleDummyResponseModel(version);
   const openaiModel = getOpenAIModel(version);
 
@@ -73,3 +76,4 @@ function toolhandlingE2ETests(version: 'v1' | 'v2' | 'v3') {
 toolhandlingE2ETests('v1');
 toolhandlingE2ETests('v2');
 toolhandlingE2ETests('v3');
+toolhandlingE2ETests('v4');

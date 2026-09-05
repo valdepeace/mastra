@@ -2,12 +2,18 @@ import { convertToCoreMessages as convertToCoreMessagesV4 } from '@internal/ai-s
 import type { CoreMessage as CoreMessageV4, UIMessage as UIMessageV4 } from '@internal/ai-sdk-v4';
 import * as AIV5 from '@internal/ai-sdk-v5';
 
+import { deepEqual } from '../../../utils/deep-equal';
 import { AIV4Adapter, AIV5Adapter, AIV6Adapter } from '../adapters';
 import type { AdapterContext } from '../adapters';
 import { TypeDetector } from '../detection/TypeDetector';
+import { categorizeFileData } from '../prompt/image-utils';
 import type { MastraDBMessage, MessageSource } from '../state/types';
 import type { AIV5Type, AIV6Type } from '../types';
-import { ensureAnthropicCompatibleMessages } from '../utils/provider-compat';
+import {
+  ensureAnthropicCompatibleMessages,
+  pairOrphanedToolCalls,
+  sanitizeOrphanedToolPairs,
+} from '../utils/provider-compat';
 import { getResponseProviderItemKey } from '../utils/response-item-metadata';
 
 /**
@@ -122,55 +128,101 @@ export function sanitizeAIV4UIMessages(messages: UIMessageV4[]): UIMessageV4[] {
  */
 export function sanitizeV5UIMessages(
   messages: AIV5Type.UIMessage[],
-  filterIncompleteToolCalls = false,
+  mode: ToolCallConversionMode = 'response',
 ): AIV5Type.UIMessage[] {
-  const msgs = messages
-    .map(m => {
-      if (m.parts.length === 0) return false;
+  // Precompute the index of the last user message. A deferred provider-executed
+  // tool call (e.g. Anthropic non-deterministically defers web_search across
+  // steps N→N+1 within the same run) may legitimately carry `input-available`
+  // state ONLY on the most recent surviving assistant message, AND only if no
+  // user turn has followed it. On any earlier assistant turn (or after a later
+  // user message) an unresolved provider-executed call is an orphan — provider
+  // dropped the result chunk (#15668), run aborted mid-stream (#14148), or a
+  // stale call from an earlier step (#14192) — and must be dropped to keep the
+  // tool-call/tool-result invariant.
+  let lastUserIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.role === 'user') {
+      lastUserIdx = i;
+      break;
+    }
+  }
 
-      // Filter out streaming states and optionally input-available (which aren't supported by convertToModelMessages)
-      const safeParts = m.parts.filter(p => {
-        // Filter out data-* parts (custom streaming data from writer.custom())
-        // These are Mastra extensions not supported by LLM providers.
-        // If not filtered, convertToModelMessages produces empty content arrays
-        // which causes some models to fail with "must include at least one parts field"
-        if (typeof p.type === 'string' && p.type.startsWith('data-')) {
-          return false;
-        }
+  const getSafeParts = (m: AIV5Type.UIMessage, assistantTurnStillOpen: boolean) =>
+    m.parts.filter(p => {
+      // Filter out data-* parts (custom streaming data from writer.custom())
+      // These are Mastra extensions not supported by LLM providers.
+      // If not filtered, convertToModelMessages produces empty content arrays
+      // which causes some models to fail with "must include at least one parts field"
+      if (typeof p.type === 'string' && p.type.startsWith('data-')) {
+        return false;
+      }
 
-        // Filter out empty text parts to handle legacy data from before this filtering was implemented.
-        // For assistant messages, preserve empty text parts if they are the only parts (placeholder messages).
-        // For user messages, always filter them out — Anthropic rejects empty user text content blocks.
-        if (p.type === 'text' && (!('text' in p) || p.text === '' || p.text?.trim() === '')) {
-          // Always filter empty text parts from user messages
-          if (m.role === 'user') return false;
+      // Filter out empty text parts to handle legacy data from before this filtering was implemented.
+      // For assistant messages, preserve empty text parts if they are the only parts (placeholder messages).
+      // For user messages, always filter them out — Anthropic rejects empty user text content blocks.
+      if (p.type === 'text' && (!('text' in p) || p.text === '' || p.text?.trim() === '')) {
+        // Always filter empty text parts from user messages
+        if (m.role === 'user') return false;
 
-          // For non-user messages, only filter if there are other non-empty parts
-          const hasNonEmptyParts = m.parts.some(
-            part => !(part.type === 'text' && (!('text' in part) || part.text === '' || part.text?.trim() === '')),
-          );
-          if (hasNonEmptyParts) return false;
-        }
+        // For non-user messages, only filter if there are other non-empty parts
+        const hasNonEmptyParts = m.parts.some(
+          part => !(part.type === 'text' && (!('text' in part) || part.text === '' || part.text?.trim() === '')),
+        );
+        if (hasNonEmptyParts) return false;
+      }
 
-        if (!AIV5.isToolUIPart(p)) return true;
+      if (!AIV5.isToolUIPart(p)) return true;
 
-        // When sending messages TO the LLM: keep completed tool calls and provider-executed tools.
-        // Filter out incomplete client-side tool calls (input-available without providerExecuted)
-        // and input-streaming states.
-        if (filterIncompleteToolCalls) {
-          // Completed tools (client or provider) — keep them
-          if (p.state === 'output-available' || p.state === 'output-error') return true;
+      // When sending messages TO the LLM: keep completed tool calls and provider-executed tools.
+      // Filter out incomplete client-side tool calls (input-available without providerExecuted)
+      // and input-streaming states.
+      if (mode !== 'response') {
+        // Completed tools (client or provider) — keep them
+        if (p.state === 'output-available' || p.state === 'output-error') return true;
+        if (p.state === 'input-available') {
           // Provider-executed tools may be deferred by the provider (e.g. Anthropic non-deterministically
           // defers web_search when mixed with client tool calls). Keep these so the provider API sees
-          // the server_tool_use block on the next request.
-          if (p.state === 'input-available' && p.providerExecuted) return true;
-          return false;
+          // the server_tool_use block on the next request — but ONLY on the most recent surviving
+          // assistant message. On any earlier assistant turn an unresolved provider-executed call is
+          // an orphan (provider dropped the result chunk, or the run aborted mid-stream) and must be
+          // dropped to keep the tool-call/tool-result invariant required by provider APIs. See #15668, #14148.
+          // This holds whichever way the caller configured suspended tool calls — the provider decides
+          // when it resumes its own call, not the caller.
+          if (p.providerExecuted) return assistantTurnStillOpen;
+          // Client-side suspended calls are kept only when the caller asked to see them. They are
+          // paired with a pending result downstream so the prompt stays valid.
+          return mode === 'prompt-with-suspended';
         }
+        return false;
+      }
 
-        // When processing response messages FROM the LLM: keep input-available states
-        // (tool calls waiting for client-side execution) but filter out input-streaming
-        return p.state !== 'input-streaming';
-      });
+      // When processing response messages FROM the LLM: keep input-available states
+      // (tool calls waiting for client-side execution) but filter out input-streaming
+      return p.state !== 'input-streaming';
+    });
+
+  let lastSurvivingAssistantIdx = -1;
+  if (lastUserIdx !== messages.length - 1) {
+    for (let i = messages.length - 1; i > lastUserIdx; i--) {
+      const message = messages[i]!;
+      if (message.role !== 'assistant' || message.parts.length === 0) continue;
+      if (getSafeParts(message, true).length > 0) {
+        lastSurvivingAssistantIdx = i;
+        break;
+      }
+    }
+  }
+
+  const msgs = messages
+    .map((m, idx) => {
+      if (m.parts.length === 0) return false;
+
+      // Deferred-provider-tool behavior is ONLY valid on the most recent surviving
+      // assistant message AND only when no user turn has followed it.
+      const assistantTurnStillOpen = m.role === 'assistant' && idx === lastSurvivingAssistantIdx;
+
+      // Filter out streaming states and optionally input-available (which aren't supported by convertToModelMessages)
+      const safeParts = getSafeParts(m, assistantTurnStillOpen);
 
       if (!safeParts.length) return false;
 
@@ -185,10 +237,19 @@ export function sanitizeV5UIMessages(
           if (AIV5.isToolUIPart(part) && part.state === 'output-available') {
             return {
               ...part,
-              output:
-                typeof part.output === 'object' && part.output && 'value' in part.output
-                  ? part.output.value
-                  : part.output,
+              output: (() => {
+                const o = part.output;
+                if (o == null || typeof o !== 'object') return o;
+                const obj = o as Record<string, unknown>;
+                // Preserve { type: 'content', value: [...] } — this is the AI SDK's
+                // native multimodal tool result shape. Unwrapping it here causes
+                // convertToModelMessages to receive a raw array which gets stringified.
+                // See: https://github.com/mastra-ai/mastra/issues/17876
+                if (obj.type === 'content' && Array.isArray(obj.value)) return o;
+                // For other wrapped shapes (legacy), unwrap as before
+                if ('value' in obj) return obj.value;
+                return o;
+              })(),
             };
           }
           return part;
@@ -241,9 +302,161 @@ export function addStartStepPartsForAIV5(messages: AIV5Type.UIMessage[]): AIV5Ty
 
 /**
  * Converts AIV4 UI messages to AIV4 Core messages.
+ *
+ * Provider file IDs (e.g. OpenAI Files API "file-...") stored in
+ * `experimental_attachments` would make AI SDK v4's internal `attachmentsToParts`
+ * throw `Invalid URL: file-...` inside `convertToCoreMessages`. Strip them before
+ * conversion and re-append them as file parts on the resulting user core message
+ * so the IDs survive untouched.
  */
 export function aiV4UIMessagesToAIV4CoreMessages(messages: UIMessageV4[]): CoreMessageV4[] {
-  return convertToCoreMessagesV4(sanitizeAIV4UIMessages(messages));
+  const sanitized = sanitizeAIV4UIMessages(messages);
+
+  type AttachmentV4 = NonNullable<UIMessageV4['experimental_attachments']>[number];
+  // Keyed by the user message's position among user messages: each user UI message
+  // converts to exactly one user core message, in order.
+  const fileIdAttachmentsByUserIndex = new Map<number, AttachmentV4[]>();
+  let userIndex = 0;
+
+  const prepared = sanitized.map(m => {
+    if (m.role !== 'user') return m;
+    const currentUserIndex = userIndex++;
+
+    if (!m.experimental_attachments?.length) return m;
+
+    const fileIdAttachments = m.experimental_attachments.filter(
+      a => categorizeFileData(a.url, a.contentType).type === 'providerFileId',
+    );
+    if (!fileIdAttachments.length) return m;
+
+    fileIdAttachmentsByUserIndex.set(currentUserIndex, fileIdAttachments);
+    const remaining = m.experimental_attachments.filter(a => !fileIdAttachments.includes(a));
+    return {
+      ...m,
+      experimental_attachments: remaining.length ? remaining : undefined,
+    };
+  });
+
+  const coreMessages = convertToCoreMessagesV4(prepared);
+  if (!fileIdAttachmentsByUserIndex.size) return coreMessages;
+
+  let coreUserIndex = 0;
+  return coreMessages.map(coreMessage => {
+    if (coreMessage.role !== 'user') return coreMessage;
+    const fileIdAttachments = fileIdAttachmentsByUserIndex.get(coreUserIndex++);
+    if (!fileIdAttachments) return coreMessage;
+
+    const fileParts = fileIdAttachments.map(a => ({
+      type: 'file' as const,
+      data: a.url,
+      mimeType: a.contentType || 'application/octet-stream',
+    }));
+    const existingContent =
+      typeof coreMessage.content === 'string'
+        ? [{ type: 'text' as const, text: coreMessage.content }]
+        : coreMessage.content;
+
+    return {
+      ...coreMessage,
+      content: [...existingContent, ...fileParts],
+    };
+  });
+}
+
+/**
+ * Converts MCP-style tool results (`{ content: [...] }`) to model-native
+ * multimodal tool result output without persisting a duplicate modelOutput copy.
+ */
+function convertMcpContentToolResultOutput(output: unknown): unknown {
+  if (!output || typeof output !== 'object') return undefined;
+
+  const content = (output as Record<string, unknown>).content;
+  if (!Array.isArray(content)) return undefined;
+
+  const hasValidMultimodal = content.some(part => {
+    if (!part || typeof part !== 'object') return false;
+    const typedPart = part as Record<string, unknown>;
+    return (typedPart.type === 'image' || typedPart.type === 'audio') && typeof typedPart.data === 'string';
+  });
+  if (!hasValidMultimodal) return undefined;
+
+  const value = content
+    .map(part => {
+      if (!part || typeof part !== 'object') return null;
+      const typedPart = part as Record<string, unknown>;
+      switch (typedPart.type) {
+        case 'text':
+          return { type: 'text', text: String(typedPart.text ?? '') };
+        case 'image':
+          return typeof typedPart.data === 'string'
+            ? { type: 'image-data', data: typedPart.data, mediaType: String(typedPart.mimeType ?? 'image/png') }
+            : { type: 'text', text: JSON.stringify(typedPart) };
+        case 'audio':
+          return typeof typedPart.data === 'string'
+            ? { type: 'file-data', data: typedPart.data, mediaType: String(typedPart.mimeType ?? 'audio/wav') }
+            : { type: 'text', text: JSON.stringify(typedPart) };
+        default:
+          return { type: 'text', text: JSON.stringify(typedPart) };
+      }
+    })
+    .filter(Boolean);
+
+  return value.length > 0 ? { type: 'content', value } : undefined;
+}
+
+function collectRawToolResultOutputs(dbMessages: MastraDBMessage[]): Map<string, unknown> {
+  const outputs = new Map<string, unknown>();
+  for (const message of dbMessages) {
+    if (message.content?.format !== 2 || !message.content.parts) continue;
+
+    for (const part of message.content.parts) {
+      if (part.type !== 'tool-invocation' || part.toolInvocation?.state !== 'result') continue;
+      const mastraMetadata = part.providerMetadata?.mastra;
+      if (mastraMetadata && typeof mastraMetadata === 'object' && 'modelOutput' in mastraMetadata) continue;
+      outputs.set(part.toolInvocation.toolCallId, part.toolInvocation.result);
+    }
+  }
+  return outputs;
+}
+
+function isDefaultToolResultOutput(output: unknown, rawOutput: unknown): boolean {
+  if (!output || typeof output !== 'object') return false;
+  const typedOutput = output as Record<string, unknown>;
+  if (typedOutput.type !== 'json') return false;
+  return typedOutput.value === rawOutput || deepEqual(typedOutput.value, rawOutput);
+}
+
+function applyMcpContentToolResultOutputs(
+  modelMessages: AIV5Type.ModelMessage[],
+  dbMessages: MastraDBMessage[],
+): AIV5Type.ModelMessage[] {
+  const rawOutputs = collectRawToolResultOutputs(dbMessages);
+  if (rawOutputs.size === 0) return modelMessages;
+
+  return modelMessages.map(message => {
+    if (message.role !== 'tool' || !Array.isArray(message.content)) return message;
+
+    let modified = false;
+    const content = message.content.map(part => {
+      if (part.type !== 'tool-result' || !rawOutputs.has(part.toolCallId)) return part;
+      if (part.output?.type !== 'json') return part;
+      const rawOutput = rawOutputs.get(part.toolCallId);
+      let converted: ReturnType<typeof convertMcpContentToolResultOutput>;
+      try {
+        converted = convertMcpContentToolResultOutput(rawOutput);
+        if (!converted) return part;
+        if (!isDefaultToolResultOutput(part.output, rawOutput)) return part;
+      } catch {
+        // MCP content may contain values that cannot be serialized or structurally compared.
+        // Preserve the original JSON output when the optional conversion cannot complete.
+        return part;
+      }
+      modified = true;
+      return { ...part, output: converted } as typeof part;
+    });
+
+    return modified ? ({ ...message, content } as AIV5Type.ModelMessage) : message;
+  });
 }
 
 /**
@@ -296,45 +509,78 @@ function restoreAssistantFileProviderMetadata(
 }
 
 /**
+ * How suspended (result-less) tool calls are handled when converting to model messages.
+ *
+ * - `response`: messages coming FROM the LLM. Suspended calls are kept so they stay in
+ *   message history, and no pairing is enforced — nothing here is sent to a provider.
+ * - `prompt`: messages going TO the LLM. Suspended calls are dropped.
+ * - `prompt-with-suspended`: messages going TO the LLM with suspended calls kept visible to
+ *   the agent. Each is paired with a pending result so the prompt stays valid.
+ *
+ * The last two both submit to a provider, so both enforce tool-call/tool-result pairing.
+ * That requirement belongs to the provider protocol, not to the caller's preference.
+ */
+export type ToolCallConversionMode = 'response' | 'prompt' | 'prompt-with-suspended';
+
+/**
  * Converts AIV5 UI messages to AIV5 Model messages.
  * Handles sanitization, step-start insertion, provider options restoration, and Anthropic compatibility.
  *
  * @param messages - AIV5 UI messages to convert
  * @param dbMessages - MastraDB messages used to look up tool call args for Anthropic compatibility
- * @param filterIncompleteToolCalls - Whether to filter out incomplete tool calls
+ * @param mode - How to handle suspended tool calls
  */
 export function aiV5UIMessagesToAIV5ModelMessages(
   messages: AIV5Type.UIMessage[],
   dbMessages: MastraDBMessage[],
-  filterIncompleteToolCalls = false,
+  mode: ToolCallConversionMode = 'response',
 ): AIV5Type.ModelMessage[] {
-  const sanitized = sanitizeV5UIMessages(messages, filterIncompleteToolCalls);
+  const sanitized = sanitizeV5UIMessages(messages, mode);
   const preprocessed = addStartStepPartsForAIV5(sanitized);
 
-  const result = restoreAssistantFileProviderMetadata(AIV5.convertToModelMessages(preprocessed), preprocessed);
+  // Convert per UI message: an assistant turn with a tool call splits into
+  // [assistant, tool] model messages, so a batch convert + index-based attach
+  // would misplace message-level providerOptions onto the tool message.
+  const converted: AIV5Type.ModelMessage[] = [];
+  for (const uiMsg of preprocessed) {
+    const produced = AIV5.convertToModelMessages([uiMsg]);
+    if (produced.length === 0) continue;
 
-  // Restore message-level providerOptions from metadata.providerMetadata
-  // This preserves providerOptions through the DB → UI → Model conversion
-  const withProviderOptions = result.map((modelMsg, index) => {
-    const uiMsg = preprocessed[index];
+    const providerMetadata =
+      uiMsg.metadata && typeof uiMsg.metadata === 'object' && 'providerMetadata' in uiMsg.metadata
+        ? (uiMsg.metadata as { providerMetadata?: AIV5Type.ProviderMetadata }).providerMetadata
+        : undefined;
 
-    if (
-      uiMsg?.metadata &&
-      typeof uiMsg.metadata === 'object' &&
-      'providerMetadata' in uiMsg.metadata &&
-      uiMsg.metadata.providerMetadata
-    ) {
-      return {
-        ...modelMsg,
-        providerOptions: uiMsg.metadata.providerMetadata as AIV5Type.ProviderMetadata,
-      } satisfies AIV5Type.ModelMessage;
+    if (providerMetadata) {
+      let target = -1;
+      for (let index = produced.length - 1; index >= 0; index--) {
+        if (produced[index]?.role === uiMsg.role) {
+          target = index;
+          break;
+        }
+      }
+      if (target !== -1) {
+        produced[target] = { ...produced[target], providerOptions: providerMetadata } as AIV5Type.ModelMessage;
+      }
     }
 
-    return modelMsg;
-  });
+    converted.push(...produced);
+  }
+
+  const withFileMetadata = restoreAssistantFileProviderMetadata(converted, preprocessed);
+  const withMcpContentOutputs = applyMcpContentToolResultOutputs(withFileMetadata, dbMessages);
 
   // Add input field to tool-result parts for Anthropic API compatibility (fixes issue #11376)
-  return ensureAnthropicCompatibleMessages(withProviderOptions, dbMessages);
+  const anthropicCompat = ensureAnthropicCompatibleMessages(withMcpContentOutputs, dbMessages);
+
+  switch (mode) {
+    case 'prompt':
+      return sanitizeOrphanedToolPairs(anthropicCompat);
+    case 'prompt-with-suspended':
+      return pairOrphanedToolCalls(anthropicCompat);
+    default:
+      return anthropicCompat;
+  }
 }
 
 /**

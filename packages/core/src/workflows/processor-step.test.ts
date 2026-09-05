@@ -1,12 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { Agent } from '../agent';
-import type { MastraDBMessage, MessageList } from '../agent/message-list';
+import { MessageList } from '../agent/message-list';
+import type { MastraDBMessage } from '../agent/message-list';
 import { TripWire } from '../agent/trip-wire';
 import type { Processor } from '../processors';
 import { ProcessorStepInputSchema, ProcessorStepOutputSchema, ProcessorStepSchema } from '../processors/step-schema';
 import { Tool } from '../tools';
-import { createStep, createWorkflow, isProcessor } from './workflow';
+import { createWorkflow } from './create';
+import { createStep, isProcessor } from './workflow';
 
 // Helper to create a mock MessageList
 function createMockMessageList(messages: MastraDBMessage[] = []): MessageList {
@@ -17,14 +19,39 @@ function createMockMessageList(messages: MastraDBMessage[] = []): MessageList {
       response: { db: () => messages.filter(m => m.role === 'assistant') },
     },
     add: vi.fn(),
+    addSignal: vi.fn(signal => signal),
+    markResponseMessageBoundary: vi.fn(),
     addSystem: vi.fn(),
     removeByIds: vi.fn(),
     startRecording: vi.fn(),
     stopRecording: vi.fn(() => []),
     makeMessageSourceChecker: vi.fn(() => ({ getSource: () => 'input' })),
     getAllSystemMessages: vi.fn(() => []),
+    getSystemMessages: vi.fn(() => []),
+    replaceAllSystemMessages: vi.fn(),
   } as unknown as MessageList;
   return mockMessageList;
+}
+
+// Helper to create a mock tracing context whose createChildSpan returns a
+// capturable PROCESSOR_RUN mock span
+function createMockTracingContext() {
+  const mockSpan = {
+    end: vi.fn(),
+    error: vi.fn(),
+    update: vi.fn(),
+    createChildSpan: vi.fn(),
+    findParent: vi.fn(() => undefined),
+  };
+  mockSpan.createChildSpan.mockReturnValue(mockSpan);
+  const currentSpan = {
+    isValid: true,
+    isInternal: false,
+    parent: undefined,
+    createChildSpan: vi.fn(() => mockSpan),
+    findParent: vi.fn(() => undefined),
+  };
+  return { mockSpan, tracingContext: { currentSpan } };
 }
 
 describe('isProcessor', () => {
@@ -64,6 +91,14 @@ describe('isProcessor', () => {
     const processor: Processor = {
       id: 'test-processor',
       processOutputStep: async ({ messages }) => messages,
+    };
+    expect(isProcessor(processor)).toBe(true);
+  });
+
+  it('should return true for object with computeStateSignal method', () => {
+    const processor: Processor = {
+      id: 'test-processor',
+      computeStateSignal: () => ({ cacheKey: 'state', contents: 'state' }),
     };
     expect(isProcessor(processor)).toBe(true);
   });
@@ -257,6 +292,186 @@ describe('createStep with Processor', () => {
           messages: [{ id: '1', content: 'test', step: 5 }],
         }),
       );
+    });
+
+    it('should provide sendSignal when phase is inputStep', async () => {
+      const processInputStepMock = vi.fn(async ({ messageList, sendSignal }) => {
+        await sendSignal?.({
+          type: 'system-reminder',
+          contents: 'Use package instructions',
+          attributes: { type: 'dynamic-agents-md', path: '/repo/packages/core/AGENTS.md' },
+        });
+        return messageList;
+      });
+
+      const processor: Processor = {
+        id: 'signal-input-step-processor',
+        processInputStep: processInputStepMock,
+      };
+
+      const step = createStep(processor);
+      const messageList = createMockMessageList();
+      const rotateResponseMessageId = vi.fn(() => 'response-2');
+      const writer = vi.fn();
+      const inputData = {
+        phase: 'inputStep' as const,
+        messages: [{ id: '1', content: 'test' }],
+        messageList,
+        stepNumber: 1,
+        systemMessages: [],
+        rotateResponseMessageId,
+      };
+
+      await step.execute({ inputData, outputWriter: writer } as any);
+
+      expect(processInputStepMock).toHaveBeenCalledWith(expect.objectContaining({ sendSignal: expect.any(Function) }));
+      expect(messageList.markResponseMessageBoundary).toHaveBeenCalledTimes(1);
+      expect(messageList.addSignal).toHaveBeenCalledWith(expect.objectContaining({ tagName: 'system-reminder' }));
+      expect(rotateResponseMessageId).toHaveBeenCalledTimes(1);
+      expect(writer).toHaveBeenCalledWith(expect.objectContaining({ type: 'data-signal', transient: true }), {
+        messageId: 'response-2',
+      });
+    });
+
+    it('should provide sendSignal when phase is inputStep and messageList is synthesized', async () => {
+      const processInputStepMock = vi.fn(async ({ messageList, sendSignal }) => {
+        await sendSignal?.({
+          type: 'system-reminder',
+          contents: 'Use synthesized message list instructions',
+          attributes: { type: 'dynamic-agents-md', path: '/repo/AGENTS.md' },
+        });
+        return messageList;
+      });
+
+      const processor: Processor = {
+        id: 'synthesized-signal-input-step-processor',
+        processInputStep: processInputStepMock,
+      };
+
+      const step = createStep(processor);
+      const rotateResponseMessageId = vi.fn(() => 'response-2');
+      const inputData = {
+        phase: 'inputStep' as const,
+        messages: [{ id: '1', role: 'user', content: 'test', createdAt: new Date() }],
+        stepNumber: 1,
+        systemMessages: [],
+        rotateResponseMessageId,
+      };
+
+      const result = await step.execute({ inputData } as any);
+      const messages = result?.messageList?.get.all.db() ?? [];
+
+      expect(processInputStepMock).toHaveBeenCalledWith(expect.objectContaining({ sendSignal: expect.any(Function) }));
+      expect(messages.some(message => message.role === 'signal')).toBe(true);
+      expect(rotateResponseMessageId).toHaveBeenCalledTimes(1);
+    });
+
+    it('should preserve tagged system messages when processInput returns { messages, systemMessages }', async () => {
+      const processor: Processor = {
+        id: 'system-appender',
+        processInput: async ({ messages, systemMessages }) => ({
+          messages: messages as MastraDBMessage[],
+          systemMessages: [...systemMessages, { role: 'system' as const, content: 'channel context' }],
+        }),
+      };
+
+      const step = createStep(processor);
+      const messageList = new MessageList({ threadId: 't1', resourceId: 'r1' });
+      messageList.addSystem('Original instruction');
+      messageList.addSystem('<observations>memory</observations>', 'observational-memory');
+
+      const inputData = {
+        phase: 'input' as const,
+        messages: [],
+        messageList,
+        systemMessages: messageList.getSystemMessages(),
+      };
+
+      await step.execute({ inputData } as any);
+
+      expect(messageList.getSystemMessages('observational-memory').map(m => m.content)).toEqual([
+        '<observations>memory</observations>',
+      ]);
+      expect(messageList.getSystemMessages().map(m => m.content)).toEqual(['Original instruction', 'channel context']);
+    });
+
+    it('should preserve tagged system messages when processInputStep returns systemMessages', async () => {
+      const processor: Processor = {
+        id: 'system-appender-step',
+        processInputStep: async ({ messages, systemMessages }) => ({
+          messages: messages as MastraDBMessage[],
+          systemMessages: [...systemMessages, { role: 'system' as const, content: 'channel context' }],
+        }),
+      };
+
+      const step = createStep(processor);
+      const messageList = new MessageList({ threadId: 't1', resourceId: 'r1' });
+      messageList.addSystem('Original instruction');
+      messageList.addSystem('<observations>memory</observations>', 'observational-memory');
+
+      const inputData = {
+        phase: 'inputStep' as const,
+        messages: [],
+        messageList,
+        stepNumber: 0,
+        systemMessages: messageList.getSystemMessages(),
+      };
+
+      await step.execute({ inputData } as any);
+
+      expect(messageList.getSystemMessages('observational-memory').map(m => m.content)).toEqual([
+        '<observations>memory</observations>',
+      ]);
+      expect(messageList.getSystemMessages().map(m => m.content)).toEqual(['Original instruction', 'channel context']);
+    });
+
+    it('should keep tagged system messages off args.systemMessages in a chained processor workflow but preserve them on messageList', async () => {
+      const replacerStep = createStep({
+        id: 'replacer',
+        processInputStep: async ({ messages, systemMessages }) => ({
+          messages: messages as MastraDBMessage[],
+          systemMessages: [...systemMessages, { role: 'system' as const, content: 'channel context' }],
+        }),
+      });
+
+      let secondStepSeenSystemMessages: any[] = [];
+      const inspectorStep = createStep({
+        id: 'inspector',
+        processInputStep: async ({ systemMessages, messageList }) => {
+          secondStepSeenSystemMessages = systemMessages;
+          return { messageList };
+        },
+      });
+
+      const messageList = new MessageList({ threadId: 't1', resourceId: 'r1' });
+      messageList.addSystem('Original instruction');
+      messageList.addSystem('<observations>memory</observations>', 'observational-memory');
+
+      const step1Output = await replacerStep.execute({
+        inputData: {
+          phase: 'inputStep' as const,
+          messages: [],
+          messageList,
+          stepNumber: 0,
+          systemMessages: messageList.getSystemMessages(),
+        },
+      } as any);
+
+      await inspectorStep.execute({
+        inputData: {
+          phase: 'inputStep' as const,
+          messages: (step1Output as any).messages ?? [],
+          messageList,
+          stepNumber: 1,
+          systemMessages: (step1Output as any).systemMessages,
+        },
+      } as any);
+
+      expect(secondStepSeenSystemMessages.map(m => m.content)).toEqual(['Original instruction', 'channel context']);
+      expect(messageList.getSystemMessages('observational-memory').map(m => m.content)).toEqual([
+        '<observations>memory</observations>',
+      ]);
+      expect(messageList.getAllSystemMessages().map(m => m.content)).toContain('<observations>memory</observations>');
     });
 
     it('should call processOutputStream when phase is outputStream (messageList optional)', async () => {
@@ -656,6 +871,101 @@ describe('createStep with Processor', () => {
         expect((error as TripWire).options?.retry).toBe(true);
         expect((error as TripWire).options?.metadata).toEqual({ tone: 'aggressive', score: 0.9 });
       }
+    });
+
+    it('should record TripWire on the processor span as an error with tripwireAbort attributes', async () => {
+      const processor: Processor = {
+        id: 'span-tripwire-processor',
+        processInput: async ({ abort }) => {
+          abort('PII detected', { retry: true, metadata: { type: 'pii' } });
+          return [];
+        },
+      };
+
+      const step = createStep(processor);
+      const messageList = createMockMessageList();
+      const { mockSpan, tracingContext } = createMockTracingContext();
+      const inputData = {
+        phase: 'input' as const,
+        messages: [{ id: '1', content: 'bad content' }],
+        messageList,
+      };
+
+      await expect(step.execute({ inputData, tracingContext } as any)).rejects.toThrow(TripWire);
+
+      expect(mockSpan.error).toHaveBeenCalledTimes(1);
+      expect(mockSpan.error).toHaveBeenCalledWith(
+        expect.objectContaining({
+          endSpan: true,
+          attributes: {
+            tripwireAbort: {
+              reason: 'PII detected',
+              retry: true,
+              metadata: { type: 'pii' },
+            },
+          },
+        }),
+      );
+      expect(mockSpan.end).not.toHaveBeenCalled();
+    });
+
+    it('should record tripwireAbort with undefined retry when abort called without options', async () => {
+      const processor: Processor = {
+        id: 'span-plain-abort-processor',
+        processInput: async ({ abort }) => {
+          abort('Content violates policy');
+          return [];
+        },
+      };
+
+      const step = createStep(processor);
+      const messageList = createMockMessageList();
+      const { mockSpan, tracingContext } = createMockTracingContext();
+      const inputData = {
+        phase: 'input' as const,
+        messages: [{ id: '1', content: 'bad content' }],
+        messageList,
+      };
+
+      await expect(step.execute({ inputData, tracingContext } as any)).rejects.toThrow(TripWire);
+
+      expect(mockSpan.error).toHaveBeenCalledWith(
+        expect.objectContaining({
+          endSpan: true,
+          attributes: {
+            tripwireAbort: {
+              reason: 'Content violates policy',
+              retry: undefined,
+              metadata: undefined,
+            },
+          },
+        }),
+      );
+    });
+
+    it('should record non-TripWire errors on the processor span without tripwireAbort', async () => {
+      const processor: Processor = {
+        id: 'span-error-processor',
+        processInput: async () => {
+          throw new Error('processor blew up');
+        },
+      };
+
+      const step = createStep(processor);
+      const messageList = createMockMessageList();
+      const { mockSpan, tracingContext } = createMockTracingContext();
+      const inputData = {
+        phase: 'input' as const,
+        messages: [{ id: '1', content: 'content' }],
+        messageList,
+      };
+
+      await expect(step.execute({ inputData, tracingContext } as any)).rejects.toThrow('processor blew up');
+
+      expect(mockSpan.error).toHaveBeenCalledTimes(1);
+      const errorArgs = (mockSpan.error as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+      expect(errorArgs?.attributes?.tripwireAbort).toBeUndefined();
+      expect(mockSpan.end).not.toHaveBeenCalled();
     });
 
     it('should re-throw non-TripWire errors', async () => {

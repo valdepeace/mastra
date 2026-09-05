@@ -1,32 +1,23 @@
 import type { DatasetItem } from '@mastra/client-js';
-import {
-  Breadcrumb,
-  Button,
-  ButtonsGroup,
-  CodeDiff,
-  Column,
-  Columns,
-  Crumb,
-  Header,
-  HeaderAction,
-  Icon,
-  MainContentContent,
-  MainContentLayout,
-  MainHeader,
-  PermissionDenied,
-  SessionExpired,
-  TextAndIcon,
-  is401UnauthorizedError,
-  is403ForbiddenError,
-} from '@mastra/playground-ui';
-import { Database, ArrowLeft, GitCompareIcon, History, ArrowLeftIcon, DiffIcon, ColumnsIcon } from 'lucide-react';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { ButtonsGroup } from '@mastra/playground-ui/components/ButtonsGroup';
+import { CodeDiff } from '@mastra/playground-ui/components/CodeDiff';
+import { Column, Columns } from '@mastra/playground-ui/components/Columns';
+import { MainContentContent, MainContentLayout } from '@mastra/playground-ui/components/MainContent';
+import { MainHeader } from '@mastra/playground-ui/components/MainHeader';
+import { PermissionDenied } from '@mastra/playground-ui/components/PermissionDenied';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@mastra/playground-ui/components/Select';
+import { SessionExpired } from '@mastra/playground-ui/components/SessionExpired';
+import { TextAndIcon } from '@mastra/playground-ui/components/Text';
+import { is401UnauthorizedError, is403ForbiddenError } from '@mastra/playground-ui/utils/errors';
+import { ArrowLeft, GitCompareIcon, History, DiffIcon, ColumnsIcon } from 'lucide-react';
 import { Fragment, useState } from 'react';
-import { useParams, useSearchParams, Link } from 'react-router';
+import { useParams, useNavigate, Link } from 'react-router';
 import { DatasetItemHeader, DatasetItemContent } from '@/domains/datasets';
 import { useDatasetItem, useDatasetItems } from '@/domains/datasets/hooks/use-dataset-items';
 import { useDataset } from '@/domains/datasets/hooks/use-datasets';
-import { SelectField } from '@/lib/form/components/select-field';
 import { useLinkComponent } from '@/lib/framework';
+import { RouteHeaderActions } from '@/lib/route-header';
 import { cn } from '@/lib/utils';
 
 function itemToText(item: DatasetItem): string {
@@ -42,11 +33,15 @@ function itemToText(item: DatasetItem): string {
 }
 
 function DatasetItemsComparePage() {
-  const { datasetId } = useParams<{ datasetId: string }>();
-  const [searchParams, setSearchParams] = useSearchParams();
-  const itemIds = searchParams.get('items')?.split(',').filter(Boolean) ?? [];
+  const { datasetId, itemId, secondItemId } = useParams<{
+    datasetId: string;
+    itemId: string;
+    secondItemId: string;
+  }>();
+  const navigate = useNavigate();
+  const itemIds = [itemId, secondItemId].filter((id): id is string => Boolean(id));
   const { data: dataset, error } = useDataset(datasetId ?? '');
-  const { Link: FrameworkLink } = useLinkComponent();
+  const { Link: FrameworkLink, paths } = useLinkComponent();
   const [isDiffView, setIsDiffView] = useState<boolean>(false);
 
   const { data: itemA } = useDatasetItem(datasetId ?? '', itemIds[0] ?? '');
@@ -75,21 +70,8 @@ function DatasetItemsComparePage() {
   if (!datasetId || itemIds.length < 2) {
     return (
       <MainContentLayout>
-        <Header>
-          <Breadcrumb>
-            <Crumb as={Link} to="/datasets">
-              <Icon>
-                <Database />
-              </Icon>
-              Datasets
-            </Crumb>
-            <Crumb isCurrent as="span">
-              Compare Items
-            </Crumb>
-          </Breadcrumb>
-        </Header>
         <MainContentContent>
-          <div className="text-neutral4 text-center py-8">
+          <div className="text-neutral4 py-8 text-center">
             <p>Select at least two items to compare.</p>
           </div>
         </MainContentContent>
@@ -99,30 +81,12 @@ function DatasetItemsComparePage() {
 
   return (
     <MainContentLayout>
-      <Header>
-        <Breadcrumb>
-          <Crumb as={Link} to="/datasets">
-            <Icon>
-              <Database />
-            </Icon>
-            Datasets
-          </Crumb>
-          <Crumb as={Link} to={`/datasets/${datasetId}`}>
-            {dataset?.name || datasetId?.slice(0, 8)}
-          </Crumb>
-          <Crumb isCurrent as="span">
-            Compare Items
-          </Crumb>
-        </Breadcrumb>
-        <HeaderAction>
-          <Button as={Link} to={`/datasets/${datasetId}`} variant="outline">
-            <Icon>
-              <ArrowLeft />
-            </Icon>
-            Back to Dataset
-          </Button>
-        </HeaderAction>
-      </Header>
+      <RouteHeaderActions owner="dataset-items-compare">
+        <Button as={Link} to={`/datasets/${datasetId}`} variant="outline">
+          <ArrowLeft />
+          Back to Dataset
+        </Button>
+      </RouteHeaderActions>
 
       <div className="h-full overflow-hidden px-[3vw] pb-4">
         <div
@@ -147,10 +111,6 @@ function DatasetItemsComparePage() {
             </MainHeader.Column>
             <MainHeader.Column>
               <ButtonsGroup>
-                <Button as={Link} to={`/datasets/${datasetId}`}>
-                  <ArrowLeftIcon />
-                  Back to Dataset
-                </Button>
                 <Button variant="primary" onClick={() => setIsDiffView(v => !v)}>
                   {isDiffView ? (
                     <>
@@ -179,7 +139,7 @@ function DatasetItemsComparePage() {
                   onItemChange={(newItemId: string) => {
                     const newIds = [...itemIds];
                     newIds[idx] = newItemId;
-                    setSearchParams({ items: newIds.join(',') });
+                    void navigate(paths.datasetItemCompareLink(datasetId, newIds[0]!, newIds[1]!));
                   }}
                 />
                 {idx == 0 && <div className={cn('bg-surface5 w-[3px] shrink-0 mx-[1.5vw]')}></div>}
@@ -223,15 +183,18 @@ function CompareItemColumn({
   return (
     <Column>
       <Column.Toolbar className="flex gap-4">
-        <SelectField
-          label="Item"
-          name={`compare-item-${idx}`}
-          value={itemId}
-          onValueChange={onItemChange}
-          options={options}
-          placeholder="Select item"
-          labelIsHidden={true}
-        />
+        <Select name={`compare-item-${idx}`} value={itemId} onValueChange={onItemChange}>
+          <SelectTrigger aria-label="Item">
+            <SelectValue placeholder="Select item" />
+          </SelectTrigger>
+          <SelectContent>
+            {options.map(option => (
+              <SelectItem key={option.value} value={option.value} disabled={option.disabled}>
+                {option.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
         <Button as={Link} to={`/datasets/${datasetId}/items/${itemId}`}>
           <History />
           Versions

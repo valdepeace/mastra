@@ -1,6 +1,6 @@
 ---
 title: "Reference: Upstash vector store | Vectors"
-description: Documentation for the UpstashVector class in Mastra, which provides vector search using Upstash Vector.
+description: "Configure UpstashVector for serverless similarity and hybrid search, metadata filtering, index management, and vector operations with Upstash Vector."
 packages:
   - "@mastra/core"
   - "@mastra/fastembed"
@@ -385,7 +385,7 @@ export const upstashAgent = new Agent({
   name: 'Upstash Agent',
   instructions:
     'You are an AI agent with the ability to automatically recall memories from previous interactions.',
-  model: 'openai/gpt-5.4',
+  model: '__GATEWAY_OPENAI_MODEL__',
   memory: new Memory({
     storage: new UpstashStore({
       id: 'upstash-agent-storage',

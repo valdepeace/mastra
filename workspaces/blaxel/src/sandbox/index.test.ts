@@ -88,6 +88,15 @@ vi.mock('@blaxel/core', () => ({
   },
 }));
 
+function restoreBlRegion(value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env.BL_REGION;
+    return;
+  }
+
+  process.env.BL_REGION = value;
+}
+
 describe('BlaxelSandbox', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
@@ -134,6 +143,26 @@ describe('BlaxelSandbox', () => {
 
       expect((sandbox as any).image).toBe('custom:latest');
       expect((sandbox as any).memory).toBe(8192);
+    });
+
+    it('uses configured region', () => {
+      const sandbox = new BlaxelSandbox({ region: 'eu-lon-1' });
+
+      expect((sandbox as any).region).toBe('eu-lon-1');
+    });
+
+    it('defaults region to BL_REGION, then auto', () => {
+      const originalBlRegion = process.env.BL_REGION;
+
+      try {
+        process.env.BL_REGION = 'us-pdx-1';
+        expect((new BlaxelSandbox() as any).region).toBe('us-pdx-1');
+
+        delete process.env.BL_REGION;
+        expect((new BlaxelSandbox() as any).region).toBe('auto');
+      } finally {
+        restoreBlRegion(originalBlRegion);
+      }
     });
   });
 
@@ -201,6 +230,59 @@ describe('BlaxelSandbox', () => {
           }),
         }),
       );
+    });
+
+    it('passes configured region to sandbox creation', async () => {
+      const { SandboxInstance } = await import('@blaxel/core');
+      const sandbox = new BlaxelSandbox({ id: 'region-id', region: 'eu-lon-1' });
+
+      await sandbox._start();
+
+      expect(SandboxInstance.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          region: 'eu-lon-1',
+        }),
+      );
+    });
+
+    it('passes BL_REGION to sandbox creation when region is not configured', async () => {
+      const { SandboxInstance } = await import('@blaxel/core');
+      const originalBlRegion = process.env.BL_REGION;
+
+      try {
+        process.env.BL_REGION = 'us-was-1';
+        const sandbox = new BlaxelSandbox({ id: 'env-region-id' });
+
+        await sandbox._start();
+
+        expect(SandboxInstance.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            region: 'us-was-1',
+          }),
+        );
+      } finally {
+        restoreBlRegion(originalBlRegion);
+      }
+    });
+
+    it('passes auto to sandbox creation when no region is set', async () => {
+      const { SandboxInstance } = await import('@blaxel/core');
+      const originalBlRegion = process.env.BL_REGION;
+
+      try {
+        delete process.env.BL_REGION;
+        const sandbox = new BlaxelSandbox({ id: 'auto-region-id' });
+
+        await sandbox._start();
+
+        expect(SandboxInstance.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            region: 'auto',
+          }),
+        );
+      } finally {
+        restoreBlRegion(originalBlRegion);
+      }
     });
 
     it('reconnects to existing sandbox by name', async () => {
@@ -285,6 +367,18 @@ describe('BlaxelSandbox', () => {
         expect.objectContaining({
           env: expect.objectContaining({ A: '1', B: '3', C: '4' }),
         }),
+      );
+    });
+
+    it('setEnv after construction reaches subsequent commands', async () => {
+      const sandbox = new BlaxelSandbox();
+      await sandbox._start();
+
+      sandbox.setEnv(env => ({ ...env, GH_TOKEN: 'tok_1' }));
+      await sandbox.executeCommand('echo', ['test']);
+
+      expect(mockSandbox.process.exec).toHaveBeenLastCalledWith(
+        expect.objectContaining({ env: expect.objectContaining({ GH_TOKEN: 'tok_1' }) }),
       );
     });
   });
@@ -451,6 +545,36 @@ describe('BlaxelSandbox', () => {
           workingDir: '/tmp',
         }),
       );
+    });
+
+    it('defaults workingDir to the configured workingDirectory', async () => {
+      const sandbox = new BlaxelSandbox({ workingDirectory: '/srv/app' });
+      await sandbox._start();
+
+      await sandbox.executeCommand('pwd');
+
+      expect(mockSandbox.process.exec).toHaveBeenCalledWith(expect.objectContaining({ workingDir: '/srv/app' }));
+      expect(sandbox.workingDirectory).toBe('/srv/app');
+    });
+
+    it('per-command cwd wins over the configured workingDirectory', async () => {
+      const sandbox = new BlaxelSandbox({ workingDirectory: '/srv/app' });
+      await sandbox._start();
+
+      await sandbox.executeCommand('pwd', [], { cwd: '/tmp' });
+
+      expect(mockSandbox.process.exec).toHaveBeenCalledWith(expect.objectContaining({ workingDir: '/tmp' }));
+    });
+
+    it('passes undefined workingDir when neither cwd nor workingDirectory is set', async () => {
+      const sandbox = new BlaxelSandbox();
+      await sandbox._start();
+
+      await sandbox.executeCommand('pwd');
+
+      const callArg = (mockSandbox.process.exec as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0];
+      expect(callArg.workingDir).toBeUndefined();
+      expect(sandbox.workingDirectory).toBeUndefined();
     });
 
     it('respects timeout option', async () => {
@@ -822,6 +946,52 @@ describe('BlaxelSandbox S3 Public Bucket Mount', () => {
     if (s3fsMountCall) {
       expect(s3fsMountCall[0].command).toContain('public_bucket=1');
     }
+  });
+
+  it('S3 mount errors when only accessKeyId is provided without secretAccessKey', async () => {
+    const sandbox = new BlaxelSandbox();
+    await sandbox._start();
+
+    const mockFilesystem = {
+      id: 'test-s3-partial-creds',
+      name: 'S3Filesystem',
+      provider: 's3',
+      status: 'ready',
+      getMountConfig: () => ({
+        type: 's3',
+        bucket: 'test-bucket',
+        region: 'us-east-1',
+        accessKeyId: 'key',
+        // secretAccessKey missing
+      }),
+    } as any;
+
+    const result = await sandbox.mount(mockFilesystem, '/data/s3-partial');
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('Both accessKeyId and secretAccessKey must be provided together');
+  });
+
+  it('S3 mount errors when only secretAccessKey is provided without accessKeyId', async () => {
+    const sandbox = new BlaxelSandbox();
+    await sandbox._start();
+
+    const mockFilesystem = {
+      id: 'test-s3-partial-creds2',
+      name: 'S3Filesystem',
+      provider: 's3',
+      status: 'ready',
+      getMountConfig: () => ({
+        type: 's3',
+        bucket: 'test-bucket',
+        region: 'us-east-1',
+        // accessKeyId missing
+        secretAccessKey: 'secret',
+      }),
+    } as any;
+
+    const result = await sandbox.mount(mockFilesystem, '/data/s3-partial2');
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('Both accessKeyId and secretAccessKey must be provided together');
   });
 });
 
@@ -1783,4 +1953,46 @@ describe('BlaxelSandbox Shared Conformance', () => {
 
   createSandboxLifecycleTests(getContext);
   createMountOperationsTests(getContext);
+});
+
+describe('BlaxelSandbox.clone', () => {
+  it('constructs an unstarted sibling without any I/O', () => {
+    const template = new BlaxelSandbox({ image: 'blaxel/base', memory: 4096 });
+
+    const child = template.clone({ id: 'mc-project-1' });
+
+    expect(child).toBeInstanceOf(BlaxelSandbox);
+    expect(child).not.toBe(template);
+    expect(child.id).toBe('mc-project-1');
+    expect(child.status).toBe('pending');
+  });
+
+  it('inherits template config and applies env override', () => {
+    const template = new BlaxelSandbox({ image: 'blaxel/base', memory: 4096, env: { BASE: '1' } });
+
+    const child = template.clone({ env: { GITHUB_TOKEN: 'ghs_abc' } });
+
+    expect(child['_constructorOptions']).toMatchObject({
+      image: 'blaxel/base',
+      memory: 4096,
+      env: { GITHUB_TOKEN: 'ghs_abc' },
+    });
+  });
+
+  it('maps idleTimeoutMinutes to a Blaxel TTL duration string', () => {
+    const template = new BlaxelSandbox({ image: 'blaxel/base', timeout: '5m' });
+
+    const child = template.clone({ idleTimeoutMinutes: 15 });
+
+    expect(child['_constructorOptions']).toMatchObject({ timeout: '15m' });
+  });
+
+  it('inherits template defaults when no overrides are passed', () => {
+    const template = new BlaxelSandbox({ image: 'blaxel/base', timeout: '5m', env: { BASE: '1' } });
+
+    const child = template.clone();
+
+    expect(child.id).not.toBe(template.id);
+    expect(child['_constructorOptions']).toMatchObject({ image: 'blaxel/base', timeout: '5m', env: { BASE: '1' } });
+  });
 });

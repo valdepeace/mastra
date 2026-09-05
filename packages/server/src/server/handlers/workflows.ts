@@ -1,6 +1,15 @@
+import type { Mastra } from '@mastra/core';
+import type { MastraServerCache } from '@mastra/core/cache';
 import type { RequestContext } from '@mastra/core/di';
-import { createCachingTransformStream, createReplayStream } from '@mastra/core/stream';
-import type { WorkflowInfo, ChunkType, StreamEvent, WorkflowStateField } from '@mastra/core/workflows';
+import type { Event } from '@mastra/core/events';
+import { createReplayStream } from '@mastra/core/stream';
+import type {
+  WorkflowInfo,
+  ChunkType,
+  StreamEvent,
+  WorkflowStateField,
+  WorkflowRunStatus,
+} from '@mastra/core/workflows';
 import { z } from 'zod/v4';
 import { MastraFGAPermissions } from '../fga-permissions';
 import { HTTPException } from '../http-exception';
@@ -11,6 +20,7 @@ import {
   createWorkflowRunResponseSchema,
   listWorkflowRunsQuerySchema,
   listWorkflowsResponseSchema,
+  workflowRunCountsResponseSchema,
   restartBodySchema,
   timeTravelBodySchema,
   resumeBodySchema,
@@ -31,6 +41,69 @@ import type { Context } from '../types';
 import { getWorkflowInfo, WorkflowRegistry } from '../utils';
 import { handleError } from './error';
 import { getEffectiveResourceId, validateRunOwnership } from './utils';
+
+/**
+ * Statuses a run cannot come back from. Streaming one of these runIds again would
+ * start a fresh execution under the same runId and overwrite its stored snapshot —
+ * the in-memory de-dupe that protects concurrent streams only covers runs still held
+ * in the workflow's run map, and a finished run has already been dropped from it.
+ */
+const TERMINAL_RUN_STATUSES: WorkflowRunStatus[] = ['success', 'failed', 'canceled', 'tripwire'];
+
+/**
+ * Runs whose chunks are already being written to the cache in this process,
+ * keyed by runId. A run has exactly one writer: without this, two concurrent
+ * requests for the same runId each cache every chunk and the replayed history
+ * comes back duplicated.
+ */
+const activeRunStreamCachers = new Set<string>();
+
+/**
+ * Cache a run's chunks for later replay and return the stream to hand the client.
+ *
+ * The cached history belongs to the run, not to whoever happens to be watching,
+ * so the caching side is driven by its own reader rather than by the client's
+ * consumption. If the client disconnects mid-run its branch is cancelled while
+ * this reader keeps draining, so `/observe` still replays a complete history —
+ * the failure that makes reconnection necessary is exactly the one the cache has
+ * to survive. Chunks buffer in the tee while a client lags, bounded by the run's
+ * own length.
+ */
+function cacheRunStream({
+  cache,
+  runId,
+  source,
+}: {
+  cache: MastraServerCache;
+  runId: string;
+  source: ReadableStream<ChunkType>;
+}): ReadableStream<ChunkType> {
+  if (activeRunStreamCachers.has(runId)) {
+    return source;
+  }
+
+  const [toCache, toClient] = source.tee();
+  activeRunStreamCachers.add(runId);
+
+  void (async () => {
+    const reader = toCache.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        // Cache failures must not take down the run being streamed.
+        await cache.listPush(runId, value).catch(() => {});
+      }
+    } catch {
+      // The source errored; the client's branch surfaces it.
+    } finally {
+      reader.releaseLock();
+      activeRunStreamCachers.delete(runId);
+    }
+  })();
+
+  return toClient;
+}
 
 export interface WorkflowContext extends Context {
   workflowId?: string;
@@ -139,6 +212,109 @@ export const LIST_WORKFLOWS_ROUTE = createRoute({
   }) as any,
 });
 
+type WorkflowRunCounts = { running: number; suspended: number };
+
+const RUN_COUNTS_CACHE_TTL_MS = 5_000;
+// Keyed by Mastra instance so multiple apps in one process never share counts.
+const runCountsCache = new WeakMap<object, { at: number; value: Record<string, WorkflowRunCounts> }>();
+let runCountsNow: () => number = () => Date.now();
+
+/** Test seam — lets TTL expiry be tested without wall-clock waits. */
+export function __setWorkflowRunCountsNow(now?: () => number) {
+  runCountsNow = now ?? (() => Date.now());
+}
+
+export const LIST_WORKFLOW_RUN_COUNTS_ROUTE = createRoute({
+  method: 'GET',
+  path: '/workflows/run-counts',
+  responseType: 'json',
+  responseSchema: workflowRunCountsResponseSchema,
+  summary: 'List workflow run counts',
+  description:
+    'Returns per-workflow counts of currently running and suspended (awaiting resume) runs, keyed by the workflow registry key used in the Mastra config',
+  tags: ['Workflows'],
+  requiresAuth: true,
+  handler: (async ({ mastra, requestContext }: any) => {
+    try {
+      const fgaProvider = mastra.getServer?.()?.fga;
+      const user = requestContext?.get('user');
+      // FGA with no user can never see anything — answer before touching storage.
+      if (fgaProvider && !user) {
+        return {};
+      }
+
+      const workflows = mastra.listWorkflows({ serialized: false });
+
+      const counts: Record<string, WorkflowRunCounts> = {};
+      const workflowIdToRegistryKey = new Map<string, string>();
+      for (const [registryKey, workflow] of Object.entries(workflows)) {
+        counts[registryKey] = { running: 0, suspended: 0 };
+        workflowIdToRegistryKey.set((workflow as any).id, registryKey);
+      }
+
+      // Runs are scoped to the caller like the runs-listing endpoint: the
+      // reserved request-context resource id takes precedence for security.
+      const effectiveResourceId = getEffectiveResourceId(requestContext, undefined);
+
+      // The shared cache holds the unscoped, unfiltered map — usable only when
+      // neither per-user FGA filtering nor a resource scope applies.
+      const cacheable = !fgaProvider && !effectiveResourceId;
+      if (cacheable) {
+        const cached = runCountsCache.get(mastra);
+        if (cached && runCountsNow() - cached.at < RUN_COUNTS_CACHE_TTL_MS) {
+          return cached.value;
+        }
+      }
+
+      const storage = mastra.getStorage();
+      const workflowsStore = storage ? await storage.getStore('workflows') : undefined;
+      if (workflowsStore) {
+        // Cross-workflow, engine-agnostic: both execution engines persist run
+        // status into the same store. Deliberately not listActiveWorkflowRuns,
+        // which means running+waiting and covers the default engine only.
+        const [running, suspended] = await Promise.all([
+          workflowsStore.listWorkflowRuns({ status: 'running', resourceId: effectiveResourceId }),
+          workflowsStore.listWorkflowRuns({ status: 'suspended', resourceId: effectiveResourceId }),
+        ]);
+        for (const run of running.runs) {
+          const registryKey = workflowIdToRegistryKey.get(run.workflowName);
+          const entry = registryKey ? counts[registryKey] : undefined;
+          if (entry) entry.running++;
+        }
+        for (const run of suspended.runs) {
+          const registryKey = workflowIdToRegistryKey.get(run.workflowName);
+          const entry = registryKey ? counts[registryKey] : undefined;
+          if (entry) entry.suspended++;
+        }
+      }
+
+      if (fgaProvider) {
+        const workflowList = Object.keys(counts).map(id => ({ id }));
+        const accessible = await fgaProvider.filterAccessible(
+          user,
+          workflowList,
+          'workflow',
+          MastraFGAPermissions.WORKFLOWS_READ,
+        );
+        const accessibleSet = new Set(accessible.map((w: any) => w.id));
+        for (const id of Object.keys(counts)) {
+          if (!accessibleSet.has(id)) {
+            delete counts[id];
+          }
+        }
+        return counts;
+      }
+
+      if (cacheable) {
+        runCountsCache.set(mastra, { at: runCountsNow(), value: counts });
+      }
+      return counts;
+    } catch (error) {
+      return handleError(error, 'Error getting workflow run counts');
+    }
+  }) as any,
+});
+
 export const GET_WORKFLOW_BY_ID_ROUTE = createRoute({
   method: 'GET',
   path: '/workflows/:workflowId',
@@ -149,14 +325,13 @@ export const GET_WORKFLOW_BY_ID_ROUTE = createRoute({
   description: 'Returns details for a specific workflow',
   tags: ['Workflows'],
   requiresAuth: true,
-  fga: { resourceType: 'workflow', resourceIdParam: 'workflowId', permission: MastraFGAPermissions.WORKFLOWS_READ },
   handler: (async ({ mastra, workflowId }: any) => {
     try {
       if (!workflowId) {
         throw new HTTPException(400, { message: 'Workflow ID is required' });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
-      return getWorkflowInfo(workflow);
+      return getWorkflowInfo(workflow, false);
     } catch (error) {
       return handleError(error, 'Error getting workflow');
     }
@@ -345,6 +520,10 @@ export const CREATE_WORKFLOW_RUN_ROUTE = createRoute({
   description: 'Creates a new workflow execution instance with an optional custom run ID',
   tags: ['Workflows'],
   requiresAuth: true,
+  // Creating a run is part of the execute flow (Studio/UI calls this before
+  // starting/streaming a workflow), so allow either permission. `write` is kept
+  // for back-compat with roles that already grant it.
+  requiresPermission: ['workflows:write', 'workflows:execute'],
   handler: async ({ mastra, workflowId, runId, resourceId, disableScorers, requestContext }) => {
     try {
       // Use effective resourceId (context key takes precedence over client-provided value)
@@ -398,17 +577,24 @@ export const STREAM_WORKFLOW_ROUTE = createRoute({
       if (!workflow) {
         throw new HTTPException(404, { message: 'Workflow not found' });
       }
+
+      const existingRun = await workflow.getWorkflowRunById(runId, { withNestedWorkflows: false });
+
+      if (existingRun && TERMINAL_RUN_STATUSES.includes(existingRun.status)) {
+        throw new HTTPException(409, {
+          message:
+            `Workflow run ${runId} already finished with status "${existingRun.status}". ` +
+            `Use /observe to read its stream back, or stream a new runId.`,
+        });
+      }
+
       const serverCache = mastra.getServerCache();
 
       const run = await workflow.createRun({ runId, resourceId: effectiveResourceId });
       const result = run.stream({ ...params, requestContext });
 
       if (serverCache) {
-        const { transform } = createCachingTransformStream<ChunkType>({
-          cache: serverCache,
-          cacheKey: runId,
-        });
-        return result.fullStream.pipeThrough(transform);
+        return cacheRunStream({ cache: serverCache, runId, source: result.fullStream });
       }
 
       return result.fullStream;
@@ -462,11 +648,7 @@ export const RESUME_STREAM_WORKFLOW_ROUTE = createRoute({
       const resumeResult = _run.resumeStream({ ...params, requestContext });
 
       if (serverCache) {
-        const { transform } = createCachingTransformStream<ChunkType>({
-          cache: serverCache,
-          cacheKey: runId,
-        });
-        return resumeResult.fullStream.pipeThrough(transform);
+        return cacheRunStream({ cache: serverCache, runId, source: resumeResult.fullStream });
       }
 
       return resumeResult.fullStream;
@@ -551,10 +733,16 @@ export const START_WORKFLOW_RUN_ROUTE = createRoute({
       await validateRunOwnership(run, effectiveResourceId);
 
       const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
-      void _run.start({
-        ...params,
-        requestContext,
-      });
+      // Fire-and-forget: attach .catch so a rejected start (e.g. invalid input
+      // schema) cannot become an unhandledRejection and tear down the process.
+      void _run
+        .start({
+          ...params,
+          requestContext,
+        })
+        .catch(error => {
+          mastra.getLogger().error('Failed to start workflow run', { error, workflowId, runId });
+        });
 
       return { message: 'Workflow run started' };
     } catch (e) {
@@ -670,6 +858,65 @@ export const RESUME_ASYNC_WORKFLOW_ROUTE = createRoute({
   },
 });
 
+/**
+ * Fire-and-forget resume: dispatches the resume and returns immediately with the runId,
+ * without waiting for the workflow to complete. For Inngest-backed workflows this avoids
+ * the `getRunOutput()` polling race that the awaiting `resume-async` route can hit.
+ *
+ * TODO(v2): in Mastra v2 this fire-and-forget behavior should become the behavior of the
+ * `resume-async` route (and `Run.resumeAsync()`), and this route should be removed. It is
+ * kept separate in v1 to avoid a breaking change to the existing `resume-async` response
+ * contract (which returns the full workflow result).
+ */
+export const RESUME_NO_WAIT_WORKFLOW_ROUTE = createRoute({
+  method: 'POST',
+  path: '/workflows/:workflowId/resume-no-wait',
+  responseType: 'json',
+  pathParamSchema: workflowIdPathParams,
+  queryParamSchema: runIdSchema,
+  bodySchema: resumeBodySchema,
+  responseSchema: createWorkflowRunResponseSchema,
+  summary: 'Resume workflow without waiting',
+  description:
+    'Resumes a suspended workflow execution without waiting (fire-and-forget) and returns immediately with the runId. The workflow continues executing in the background.',
+  tags: ['Workflows'],
+  requiresAuth: true,
+  handler: async ({ mastra, workflowId, runId, requestContext, ...params }) => {
+    try {
+      const effectiveResourceId = getEffectiveResourceId(requestContext, undefined);
+
+      if (!workflowId) {
+        throw new HTTPException(400, { message: 'Workflow ID is required' });
+      }
+
+      if (!runId) {
+        throw new HTTPException(400, { message: 'runId required to resume workflow' });
+      }
+
+      const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
+
+      if (!workflow) {
+        throw new HTTPException(404, { message: 'Workflow not found' });
+      }
+
+      const run = await workflow.getWorkflowRunById(runId);
+
+      if (!run) {
+        throw new HTTPException(404, { message: 'Workflow run not found' });
+      }
+
+      await validateRunOwnership(run, effectiveResourceId);
+
+      const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
+      const result = await _run.resumeAsync({ ...params, requestContext });
+
+      return result;
+    } catch (error) {
+      return handleError(error, 'Error resuming workflow step');
+    }
+  },
+});
+
 export const RESUME_WORKFLOW_ROUTE = createRoute({
   method: 'POST',
   path: '/workflows/:workflowId/resume',
@@ -710,7 +957,11 @@ export const RESUME_WORKFLOW_ROUTE = createRoute({
 
       const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
 
-      void _run.resume({ ...params, requestContext });
+      // Fire-and-forget: attach .catch so a rejected resume cannot become an
+      // unhandledRejection and tear down the process.
+      void _run.resume({ ...params, requestContext }).catch(error => {
+        mastra.getLogger().error('Failed to resume workflow run', { error, workflowId, runId });
+      });
 
       return { message: 'Workflow run resumed' };
     } catch (error) {
@@ -807,7 +1058,9 @@ export const RESTART_WORKFLOW_ROUTE = createRoute({
 
       const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
 
-      void _run.restart({ ...params, requestContext });
+      void _run.restart({ ...params, requestContext }).catch(error => {
+        mastra.getLogger().error('Failed to restart workflow run in background', { error, workflowId, runId });
+      });
 
       return { message: 'Workflow run restarted' };
     } catch (error) {
@@ -869,7 +1122,9 @@ export const RESTART_ALL_ACTIVE_WORKFLOW_RUNS_ROUTE = createRoute({
         throw new HTTPException(404, { message: 'Workflow not found' });
       }
 
-      void workflow.restartAllActiveWorkflowRuns();
+      void workflow.restartAllActiveWorkflowRuns().catch(error => {
+        mastra.getLogger().error('Failed to restart active workflow runs', { error, workflowId });
+      });
 
       return { message: 'All active workflow runs restarted' };
     } catch (error) {
@@ -966,7 +1221,11 @@ export const TIME_TRAVEL_WORKFLOW_ROUTE = createRoute({
 
       const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
 
-      void _run.timeTravel({ ...params, requestContext });
+      // Fire-and-forget: attach .catch so a rejected time travel cannot become
+      // an unhandledRejection and tear down the process.
+      void _run.timeTravel({ ...params, requestContext }).catch(error => {
+        mastra.getLogger().error('Failed to time travel workflow run', { error, workflowId, runId });
+      });
 
       return { message: 'Workflow run time travel started' };
     } catch (error) {
@@ -1017,11 +1276,7 @@ export const TIME_TRAVEL_STREAM_WORKFLOW_ROUTE = createRoute({
       const result = run.timeTravelStream({ ...params, requestContext });
 
       if (serverCache) {
-        const { transform } = createCachingTransformStream<ChunkType>({
-          cache: serverCache,
-          cacheKey: runId,
-        });
-        return result.fullStream.pipeThrough(transform);
+        return cacheRunStream({ cache: serverCache, runId, source: result.fullStream });
       }
 
       return result.fullStream;
@@ -1189,4 +1444,180 @@ export const OBSERVE_STREAM_LEGACY_WORKFLOW_ROUTE = createRoute({
       return handleError(error, 'Error observing workflow stream');
     }
   },
+});
+
+// ============================================================================
+// Worker Step Execution Endpoint
+// Used by standalone OrchestrationWorker instances with HttpRemoteStrategy.
+// ============================================================================
+
+// `workflowId` and `runId` are taken from path params (single source of
+// truth); they are intentionally omitted from the request body schema.
+const stepExecutionBodySchema = z.object({
+  stepId: z.string(),
+  executionPath: z.array(z.number().int().nonnegative()),
+  stepResults: z.record(z.string(), z.unknown()),
+  state: z.record(z.string(), z.unknown()),
+  requestContext: z.record(z.string(), z.unknown()),
+  input: z.unknown().optional(),
+  resumeData: z.unknown().optional(),
+  retryCount: z.number().int().nonnegative().optional(),
+  foreachIdx: z.number().int().nonnegative().optional(),
+  format: z.enum(['legacy', 'vnext']).optional(),
+  perStep: z.boolean().optional(),
+  validateInputs: z.boolean().optional(),
+});
+
+type StepExecutionBody = z.infer<typeof stepExecutionBodySchema>;
+
+interface StepExecutionHandlerArgs extends StepExecutionBody {
+  mastra: Mastra;
+  workflowId: string;
+  runId: string;
+}
+
+// Reuse the InProcessStrategy across requests for a given Mastra instance.
+// The strategy is stateless beyond its mastra reference, but allocating it
+// per request triggers a dynamic import on the hot path.
+//
+// The dynamic import is required by `pnpm --filter ./packages/server
+// check:core-imports`: `@mastra/core/worker` is a new subpath that older
+// peer-dep floors don't expose, so a static import would fail the check.
+// Once the floor is bumped, this can become a static import.
+type StepStrategy = { executeStep: (p: unknown) => Promise<unknown> };
+const strategyByMastra = new WeakMap<Mastra, StepStrategy>();
+
+async function getStepStrategy(mastra: Mastra): Promise<StepStrategy> {
+  let cached = strategyByMastra.get(mastra);
+  if (!cached) {
+    const { InProcessStrategy } = await import('@mastra/core/worker');
+    cached = new InProcessStrategy({ mastra }) as unknown as StepStrategy;
+    strategyByMastra.set(mastra, cached);
+  }
+  return cached;
+}
+
+// Step execution returns the worker's StepResult. Its shape is dynamic
+// and depends on the step's output schema.
+const stepExecutionResponseSchema = z.unknown();
+
+export const EXECUTE_WORKFLOW_STEP_ROUTE = createRoute({
+  method: 'POST',
+  path: '/workflows/:workflowId/runs/:runId/steps/execute',
+  responseType: 'json',
+  pathParamSchema: workflowRunPathParams,
+  bodySchema: stepExecutionBodySchema,
+  responseSchema: stepExecutionResponseSchema,
+  summary: 'Execute a workflow step',
+  description:
+    'Internal endpoint used by standalone OrchestrationWorker instances to execute workflow steps remotely via HttpRemoteStrategy.',
+  tags: ['Workflows', 'Worker'],
+  requiresAuth: true,
+  handler: (async ({ mastra, workflowId, runId, ...body }: StepExecutionHandlerArgs) => {
+    try {
+      // Auth is enforced by the framework via `requiresAuth: true` and the
+      // deployer's `authenticateToken` provider. Note that when NO auth
+      // provider is configured, the framework currently treats the route
+      // as public (see ServerAdapter.checkRouteAuth). Operators deploying
+      // standalone workers must configure an auth provider to gate this
+      // endpoint — there is no implicit fail-closed.
+      const strategy = await getStepStrategy(mastra);
+      const result = await strategy.executeStep({
+        workflowId,
+        runId,
+        stepId: body.stepId,
+        executionPath: body.executionPath,
+        stepResults: body.stepResults,
+        state: body.state,
+        requestContext: body.requestContext,
+        input: body.input,
+        resumeData: body.resumeData,
+        retryCount: body.retryCount,
+        foreachIdx: body.foreachIdx,
+        format: body.format,
+        perStep: body.perStep,
+        validateInputs: body.validateInputs,
+      });
+
+      return result;
+    } catch (error) {
+      return handleError(error, 'Error executing workflow step');
+    }
+  }) as any,
+});
+
+// Wire shape of an Event delivered through a push-mode broker. Validates the
+// fields `WorkflowEventProcessor` depends on; broker envelopes routinely carry
+// extra metadata that isn't part of `Event` itself, so we passthrough the rest.
+// `createdAt` is an ISO timestamp on the wire — the handler converts it to a
+// `Date` before forwarding to `Mastra.handleWorkflowEvent`.
+const workflowEventSchema = z.object({
+  id: z.string(),
+  type: z.string(),
+  data: z.unknown(),
+  runId: z.string(),
+  createdAt: z.string(),
+  index: z.number().optional(),
+  deliveryAttempt: z.number().optional(),
+});
+
+const receiveWorkflowEventBodySchema = z.object({
+  event: workflowEventSchema.passthrough(),
+});
+
+const receiveWorkflowEventResponseSchema = z.object({
+  ok: z.boolean(),
+  retry: z.boolean().optional(),
+});
+
+interface ReceiveWorkflowEventHandlerArgs {
+  mastra: Mastra;
+  event: Event;
+}
+
+/**
+ * Generic push receive endpoint for workflow events. A push-mode broker
+ * (GCP Pub/Sub push subscription, SNS, EventBridge) — or a per-broker adapter
+ * that decodes the broker's envelope first — POSTs each event here and the
+ * response code tells the broker whether to retry:
+ *
+ *   - 200/204 → ack
+ *   - 5xx     → transient, retry with backoff
+ *   - 4xx     → poison, drop / send to DLQ
+ *
+ * Auth is enforced through the framework's standard `requiresAuth` flow.
+ * Operators MUST configure an `authenticateToken` provider that recognizes
+ * whatever credential the broker attaches (e.g. a Google-signed OIDC token
+ * for GCP Pub/Sub push). Without an auth provider the endpoint is effectively
+ * public — same caveat as `EXECUTE_WORKFLOW_STEP_ROUTE`.
+ */
+export const RECEIVE_WORKFLOW_EVENT_ROUTE = createRoute({
+  method: 'POST',
+  path: '/workflows/events',
+  responseType: 'json',
+  bodySchema: receiveWorkflowEventBodySchema,
+  responseSchema: receiveWorkflowEventResponseSchema,
+  summary: 'Receive a workflow event from a push-mode broker',
+  description:
+    'Push-mode entry point for workflow events. Brokers (GCP Pub/Sub push, SNS, EventBridge) POST each event here; Mastra processes it through the same pipeline as pull-mode workers.',
+  tags: ['Workflows', 'Worker'],
+  requiresAuth: true,
+  // Broker push endpoint: it advances runtime state rather than editing
+  // definitions, so `workflows:execute` is the more accurate fit. `write` is
+  // kept for back-compat with service principals that already grant it.
+  requiresPermission: ['workflows:write', 'workflows:execute'],
+  handler: (async ({ mastra, event }: ReceiveWorkflowEventHandlerArgs) => {
+    try {
+      // The wire schema carries `createdAt` as a string; coerce to Date here
+      // before handing off to the in-process pipeline, which expects an `Event`.
+      const rawCreatedAt = (event as unknown as { createdAt: unknown }).createdAt;
+      const createdAt = rawCreatedAt instanceof Date ? rawCreatedAt : new Date(rawCreatedAt as string);
+      if (Number.isNaN(createdAt.getTime())) {
+        throw new HTTPException(400, { message: 'Invalid createdAt' });
+      }
+      return await mastra.handleWorkflowEvent({ ...event, createdAt });
+    } catch (error) {
+      return handleError(error, 'Error receiving workflow event');
+    }
+  }) as any,
 });

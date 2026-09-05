@@ -3,6 +3,7 @@ import { getAnalytics } from '../../analytics/index.js';
 import { requestApi } from './client.js';
 import { ApiCliError, errorEnvelope, toApiCliError } from './errors.js';
 import { parseInput, resolvePathParams, stripPathParamsFromInput } from './input.js';
+import { LEARNING_ROUTE_METADATA } from './learning-route-metadata.js';
 import { normalizeData } from './normalizers.js';
 import { normalizeSuccess, writeJson } from './output.js';
 import { normalizeResponse } from './response-normalizer.js';
@@ -13,6 +14,12 @@ import type { ApiGlobalOptions } from './target.js';
 import type { ApiCommandActionOptions, ApiCommandDescriptor, HttpMethod } from './types.js';
 
 const API_ANALYTICS_SHUTDOWN_TIMEOUT_MS = 1000;
+
+/**
+ * All route metadata addressable by CLI commands: generated `@mastra/server`
+ * routes plus hand-authored Mastra platform learning routes.
+ */
+export const CLI_ROUTE_METADATA = { ...API_ROUTE_METADATA, ...LEARNING_ROUTE_METADATA } as const;
 
 export const API_COMMANDS = {} as Record<string, ApiCommandDescriptor>;
 
@@ -25,6 +32,10 @@ export function registerApiCommand(program: CommanderCommand): void {
     .command('api')
     .description('Call Mastra APIs')
     .option('--url <url>', 'target Mastra server URL')
+    .option(
+      '--server-api-prefix <serverApiPrefix>',
+      'API route prefix of the Mastra server (default: /api; also honors MASTRA_API_PREFIX)',
+    )
     .option('--header <header>', 'custom HTTP header (repeatable)', collect, [])
     .option('--timeout <ms>', 'client-side request timeout')
     .option('--pretty', 'pretty-print JSON output', false);
@@ -221,8 +232,27 @@ export function registerApiCommand(program: CommanderCommand): void {
   });
 
   const trace = api.command('trace').description('Inspect observability traces');
-  addAction(trace, 'list', 'GET /observability/traces', { description: 'List observability traces', list: true });
-  addAction(trace, 'get', 'GET /observability/traces/:traceId', { description: 'Get trace details' });
+  addAction(trace, 'list', 'GET /observability/traces/light', {
+    description: 'List observability traces',
+    list: true,
+    verboseRouteKey: 'GET /observability/traces',
+    examples: [
+      { description: 'List lightweight traces', command: `mastra api trace list '{"page":0,"perPage":20}'` },
+      { description: 'List full traces', command: `mastra api trace list '{"page":0,"perPage":20}' --verbose` },
+    ],
+  });
+  addAction(trace, 'get', 'GET /observability/traces/:traceId/light', {
+    description: 'Get trace details',
+    verboseRouteKey: 'GET /observability/traces/:traceId',
+    examples: [
+      { description: 'Get lightweight trace details', command: 'mastra api trace get trace_123' },
+      { description: 'Get full trace details', command: 'mastra api trace get trace_123 --verbose' },
+    ],
+  });
+  addAction(trace, 'span', 'GET /observability/traces/:traceId/spans/:spanId', {
+    description: 'Get a trace span',
+    examples: [{ description: 'Get a specific trace span', command: 'mastra api trace span trace_123 span_456' }],
+  });
 
   const log = api.command('log').description('Inspect runtime logs');
   addAction(log, 'list', 'GET /observability/logs', {
@@ -234,6 +264,81 @@ export function registerApiCommand(program: CommanderCommand): void {
       {
         description: 'List info logs with pagination',
         command: `mastra api log list '{"level":"info","page":0,"perPage":50}'`,
+      },
+    ],
+  });
+
+  const metric = api.command('metric').description('Query observability metrics');
+  addAction(metric, 'aggregate', 'POST /observability/metrics/aggregate', {
+    description: 'Get an aggregate metric value',
+    input: 'required',
+    examples: [
+      {
+        description: 'Get an average latency metric',
+        command: `mastra api metric aggregate '{"name":"latency_ms","aggregation":"avg"}'`,
+      },
+    ],
+  });
+  addAction(metric, 'breakdown', 'POST /observability/metrics/breakdown', {
+    description: 'Get metric values grouped by a label or field',
+    input: 'required',
+    list: true,
+    examples: [
+      {
+        description: 'Break down latency by model',
+        command: `mastra api metric breakdown '{"name":"latency_ms","aggregation":"avg","groupBy":"model","limit":10}'`,
+      },
+    ],
+  });
+  addAction(metric, 'timeseries', 'POST /observability/metrics/timeseries', {
+    description: 'Get metric values over time',
+    input: 'required',
+    list: true,
+    examples: [
+      {
+        description: 'Get hourly average latency',
+        command: `mastra api metric timeseries '{"name":"latency_ms","aggregation":"avg","interval":"1h"}'`,
+      },
+    ],
+  });
+  addAction(metric, 'percentiles', 'POST /observability/metrics/percentiles', {
+    description: 'Get metric percentile values over time',
+    input: 'required',
+    list: true,
+    examples: [
+      {
+        description: 'Get latency percentiles',
+        command: `mastra api metric percentiles '{"name":"latency_ms","percentiles":[0.5,0.95,0.99],"interval":"1h"}'`,
+      },
+    ],
+  });
+  addAction(metric, 'names', 'GET /observability/discovery/metric-names', {
+    description: 'List discovered metric names',
+    input: 'optional',
+    list: true,
+    examples: [
+      { description: 'Search metric names', command: `mastra api metric names '{"prefix":"lat","limit":10}'` },
+    ],
+  });
+  addAction(metric, 'label-keys', 'GET /observability/discovery/metric-label-keys', {
+    description: 'List label keys for a metric',
+    input: 'required',
+    list: true,
+    examples: [
+      {
+        description: 'List label keys for a metric',
+        command: `mastra api metric label-keys '{"metricName":"latency_ms"}'`,
+      },
+    ],
+  });
+  addAction(metric, 'label-values', 'GET /observability/discovery/metric-label-values', {
+    description: 'List label values for a metric label key',
+    input: 'required',
+    list: true,
+    examples: [
+      {
+        description: 'Search label values for a metric label key',
+        command: `mastra api metric label-values '{"metricName":"latency_ms","labelKey":"model","prefix":"g","limit":10}'`,
       },
     ],
   });
@@ -307,6 +412,119 @@ export function registerApiCommand(program: CommanderCommand): void {
     input: 'optional',
     list: true,
   });
+
+  const learning = api
+    .command('learning')
+    .description('Query Trace Intelligence themes across agent traces (Mastra platform)');
+  addAction(learning, 'entities', 'GET /learning/entities', {
+    description: 'List entities with Trace Intelligence output',
+    input: 'required',
+    list: true,
+    examples: [
+      {
+        description: 'List agents with available trace signal themes',
+        command: `mastra api learning entities '{"entityType":"agent"}'`,
+      },
+    ],
+  });
+  addAction(learning, 'snapshots', 'GET /learning/entities/:entityId/theme-snapshots', {
+    description: 'List analysis snapshots for an entity and ordered trace signals',
+    input: 'required',
+    list: true,
+    examples: [
+      {
+        description: 'List snapshots for an agent across all four trace signals',
+        command: `mastra api learning snapshots my-agent '{"entityType":"agent","signalNames":"goal,outcome,behavior,sentiment"}'`,
+      },
+    ],
+  });
+  addAction(learning, 'flow', 'GET /learning/entities/:entityId/theme-flow', {
+    description: 'Get the cross-signal theme flow for one snapshot',
+    input: 'required',
+    examples: [
+      {
+        description: 'Get the goal-to-outcome flow for a snapshot',
+        command: `mastra api learning flow my-agent '{"entityType":"agent","signalNames":"goal,outcome","snapshotId":"snapshot_abc"}'`,
+      },
+    ],
+  });
+  addAction(learning, 'paths', 'GET /learning/entities/:entityId/theme-paths', {
+    description: 'Get per-trace theme assignments for one snapshot',
+    input: 'required',
+    examples: [
+      {
+        description: 'Map traces to themes across goal and outcome',
+        command: `mastra api learning paths my-agent '{"entityType":"agent","signalNames":"goal,outcome","snapshotId":"snapshot_abc","limit":100}'`,
+      },
+    ],
+  });
+
+  const learningTheme = learning.command('theme').description('List and inspect trace signal themes');
+  addAction(learningTheme, 'list', 'GET /learning/entities/:entityId/themes', {
+    description: 'List themes for one trace signal in one snapshot',
+    input: 'required',
+    list: true,
+    examples: [
+      {
+        description: 'List goal themes in a snapshot',
+        command: `mastra api learning theme list my-agent '{"entityType":"agent","signalName":"goal","snapshotId":"snapshot_abc"}'`,
+      },
+    ],
+  });
+  addAction(learningTheme, 'get', 'GET /learning/entities/:entityId/themes/:themeId', {
+    description: 'Get one theme in one snapshot',
+    input: 'required',
+    examples: [
+      {
+        description: 'Get one goal theme in a snapshot',
+        command: `mastra api learning theme get my-agent 42 '{"entityType":"agent","signalName":"goal","snapshotId":"snapshot_abc"}'`,
+      },
+    ],
+  });
+  addAction(learningTheme, 'examples', 'GET /learning/entities/:entityId/themes/:themeId/examples', {
+    description: 'List trace examples for one theme in one snapshot',
+    input: 'required',
+    list: true,
+    examples: [
+      {
+        description: 'List trace examples for a theme',
+        command: `mastra api learning theme examples my-agent 42 '{"entityType":"agent","signalName":"goal","snapshotId":"snapshot_abc","limit":10}'`,
+      },
+    ],
+  });
+  addAction(learningTheme, 'history', 'GET /learning/entities/:entityId/themes/:themeId/history', {
+    description: 'Get lifecycle history for one durable theme',
+    input: 'required',
+    examples: [
+      {
+        description: 'Get history for a theme across snapshots',
+        command: `mastra api learning theme history my-agent 42 '{"entityType":"agent","signalName":"goal"}'`,
+      },
+    ],
+  });
+
+  const learningNoise = learning.command('noise').description('Inspect unclustered (noise) traces');
+  addAction(learningNoise, 'get', 'GET /learning/entities/:entityId/noise', {
+    description: 'Get the noise bucket for one trace signal in one snapshot',
+    input: 'required',
+    examples: [
+      {
+        description: 'Get the goal noise bucket in a snapshot',
+        command: `mastra api learning noise get my-agent '{"entityType":"agent","signalName":"goal","snapshotId":"snapshot_abc"}'`,
+      },
+    ],
+  });
+  addAction(learningNoise, 'examples', 'GET /learning/entities/:entityId/noise/examples', {
+    description: 'List trace examples for the noise bucket in one snapshot',
+    input: 'required',
+    list: true,
+    examples: [
+      {
+        description: 'List noise trace examples',
+        command: `mastra api learning noise examples my-agent '{"entityType":"agent","signalName":"goal","snapshotId":"snapshot_abc","limit":10}'`,
+      },
+    ],
+  });
 }
 
 /**
@@ -322,7 +540,7 @@ export function registerApiCommand(program: CommanderCommand): void {
 function addAction(
   parent: CommanderCommand,
   name: string,
-  routeKey: keyof typeof API_ROUTE_METADATA,
+  routeKey: keyof typeof CLI_ROUTE_METADATA,
   options: ApiCommandActionOptions,
 ): void {
   const descriptor = buildDescriptor(parent, name, routeKey, options);
@@ -348,6 +566,9 @@ function addAction(
 
   if (descriptor.acceptsInput) {
     command.option('--schema', 'print request schema for this command');
+  }
+  if (descriptor.verbose) {
+    command.option('--verbose', 'return the full response instead of the lightweight default');
   }
 
   command.action(async (...args: unknown[]) => {
@@ -410,10 +631,13 @@ function looksLikeJsonObject(value: string): boolean {
 function buildDescriptor(
   parent: CommanderCommand,
   name: string,
-  routeKey: keyof typeof API_ROUTE_METADATA,
+  routeKey: keyof typeof CLI_ROUTE_METADATA,
   options: ApiCommandActionOptions,
 ): ApiCommandDescriptor {
-  const route = API_ROUTE_METADATA[routeKey];
+  const route = CLI_ROUTE_METADATA[routeKey];
+  const verboseRoute = options.verboseRouteKey
+    ? CLI_ROUTE_METADATA[options.verboseRouteKey as keyof typeof CLI_ROUTE_METADATA]
+    : undefined;
   const commandName = [...commandPath(parent), parseCommandName(name)].join(' ');
   const pathParamsFromInput = new Set(options.pathParamsFromInput ?? []);
   // Most path params become positional CLI args; a few commands intentionally read IDs from JSON input.
@@ -436,6 +660,14 @@ function buildDescriptor(
     bodyParams: [...route.bodyParams],
     defaultTimeoutMs: options.defaultTimeoutMs,
     examples: options.examples,
+    verbose: verboseRoute
+      ? {
+          path: verboseRoute.path,
+          responseShape: verboseRoute.responseShape,
+          queryParams: [...verboseRoute.queryParams],
+          bodyParams: [...verboseRoute.bodyParams],
+        }
+      : undefined,
   };
 }
 
@@ -471,6 +703,25 @@ function parseCommandName(name: string): string {
  *
  * @param analytics - Lazily-created analytics client, if telemetry is enabled.
  */
+function isUnauthorizedError(error: unknown): boolean {
+  return error instanceof ApiCliError && error.code === 'HTTP_ERROR' && error.details.status === 401;
+}
+
+/**
+ * True when the request hit an endpoint that the server doesn't know about.
+ *
+ * Used to detect cases like running a new CLI against an older `@mastra/server`
+ * that hasn't shipped the lightweight route yet, so we can transparently fall
+ * back to the verbose equivalent instead of failing the command outright.
+ */
+function isNotFoundError(error: unknown): boolean {
+  return (
+    error instanceof ApiCliError &&
+    error.code === 'HTTP_ERROR' &&
+    (error.details.status === 404 || error.details.status === 405)
+  );
+}
+
 async function shutdownApiAnalytics(analytics: ReturnType<typeof getAnalytics>): Promise<void> {
   if (!analytics) {
     return;
@@ -500,10 +751,12 @@ export async function executeDescriptor(
   descriptor: ApiCommandDescriptor,
   positionalValues: string[],
   inputText: string | undefined,
-  options: ApiGlobalOptions,
+  options: ApiGlobalOptions & { verbose?: boolean },
 ): Promise<void> {
   try {
-    const target = await resolveTarget(options);
+    const requestDescriptor =
+      options.verbose && descriptor.verbose ? { ...descriptor, ...descriptor.verbose } : descriptor;
+    const target = await resolveTarget(options, fetch, requestDescriptor.path);
 
     if (options.schema) {
       // Schema output is a discovery path, so it intentionally skips required argument validation.
@@ -511,21 +764,53 @@ export async function executeDescriptor(
       return;
     }
 
-    const input = parseInput(descriptor, inputText);
-    const pathParams = resolvePathParams(descriptor, positionalValues, input);
+    const input = parseInput(requestDescriptor, inputText);
+    const pathParams = resolvePathParams(requestDescriptor, positionalValues, input);
     // Do not send IDs twice when a route path param was supplied through JSON input.
     const requestInput = stripPathParamsFromInput(input, pathParams);
 
-    const response = await requestApi({
+    const requestOptions = {
       baseUrl: target.baseUrl,
       headers: target.headers,
-      timeoutMs: descriptor.defaultTimeoutMs && !options.timeout ? descriptor.defaultTimeoutMs : target.timeoutMs,
-      descriptor,
+      timeoutMs:
+        requestDescriptor.defaultTimeoutMs && !options.timeout ? requestDescriptor.defaultTimeoutMs : target.timeoutMs,
+      descriptor: requestDescriptor,
       pathParams,
       input: requestInput,
-    });
-    const normalized = normalizeData(descriptor, normalizeResponse(response));
-    writeJson(normalizeSuccess(normalized, descriptor.list, descriptor.responseShape), options.pretty);
+      apiPrefix: target.apiPrefix,
+    };
+    let response: unknown;
+    let effectiveDescriptor = requestDescriptor;
+    try {
+      response = await requestApi(requestOptions);
+    } catch (error) {
+      if (target.fallbackHeaders && isUnauthorizedError(error)) {
+        response = await requestApi({ ...requestOptions, headers: target.fallbackHeaders });
+      } else if (!options.verbose && descriptor.verbose && isNotFoundError(error)) {
+        // The default route is unavailable on this server (e.g. a new CLI
+        // talking to an older `@mastra/server` that hasn't shipped the
+        // lightweight endpoint). Transparently retry against the verbose
+        // route so the command still succeeds.
+        const verboseDescriptor = { ...descriptor, ...descriptor.verbose };
+        const verboseInput = parseInput(verboseDescriptor, inputText);
+        const verbosePathParams = resolvePathParams(verboseDescriptor, positionalValues, verboseInput);
+        const verboseRequestInput = stripPathParamsFromInput(verboseInput, verbosePathParams);
+        response = await requestApi({
+          ...requestOptions,
+          descriptor: verboseDescriptor,
+          pathParams: verbosePathParams,
+          input: verboseRequestInput,
+        });
+        effectiveDescriptor = verboseDescriptor;
+      } else {
+        throw error;
+      }
+    }
+    const normalized = normalizeData(effectiveDescriptor, normalizeResponse(response));
+    writeJson(
+      normalizeSuccess(normalized, effectiveDescriptor.list, effectiveDescriptor.responseShape),
+      options.pretty,
+    );
   } catch (error) {
     const apiError = error instanceof ApiCliError ? error : toApiCliError(error);
     writeJson(errorEnvelope(apiError), options.pretty, process.stderr);

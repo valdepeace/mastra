@@ -10,15 +10,41 @@ import {
   createRouteAdapterTestSuite,
   createDefaultTestContext,
   createStreamWithSensitiveData,
+  createStreamWithUnserializableChunk,
+  expectSerializedStreamChunks,
   consumeSSEStream,
   createMultipartTestSuite,
+  createBodyLimitTestSuite,
 } from '@internal/server-adapter-test-utils';
 import { Mastra } from '@mastra/core';
 import { registerApiRoute } from '@mastra/core/server';
+import {
+  TraceQueryExecutionError,
+  encodeTraceQueryCursor,
+  parseTraceQueryRequest,
+  planTraceQuery,
+} from '@mastra/core/storage';
+import { QUERY_TRACES } from '@mastra/server/handlers/observability-new-endpoints';
+import { MASTRA_IS_STUDIO_KEY, createRoute } from '@mastra/server/server-adapter';
 import type { ServerRoute } from '@mastra/server/server-adapter';
 import { Hono } from 'hono';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { z } from 'zod';
 import { MastraServer } from '../index';
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitFor(assertion: () => boolean, timeout = 500): Promise<void> {
+  const start = Date.now();
+  while (!assertion()) {
+    if (Date.now() - start > timeout) {
+      throw new Error('Timed out waiting for assertion');
+    }
+    await sleep(1);
+  }
+}
 
 // Wrapper describe block so the factory can call describe() inside
 describe('Hono Server Adapter', () => {
@@ -90,6 +116,8 @@ describe('Hono Server Adapter', () => {
       const isStream =
         contentType.includes('text/plain') ||
         contentType.includes('text/event-stream') ||
+        contentType.includes('audio/') ||
+        contentType.includes('application/octet-stream') ||
         response.headers?.get('transfer-encoding') === 'chunked';
 
       // Extract headers
@@ -106,11 +134,14 @@ describe('Hono Server Adapter', () => {
           headers,
         };
       } else {
+        // Read the body exactly once; parsing JSON from text avoids consuming
+        // the body twice when the payload is not valid JSON.
+        const rawText = await response.text();
         let data: unknown;
         try {
-          data = await response.json();
+          data = JSON.parse(rawText);
         } catch {
-          data = await response.text();
+          data = rawText;
         }
 
         return {
@@ -121,6 +152,423 @@ describe('Hono Server Adapter', () => {
         };
       }
     },
+  });
+
+  describe('Trace query error responses over HTTP', () => {
+    const timeRange = { from: '2026-08-01T00:00:00Z', to: '2026-09-01T00:00:00Z' };
+
+    function getErrorSchema(status: 400 | 409 | 422 | 501 | 504) {
+      const schema = QUERY_TRACES.openapi?.responses[status]?.content?.['application/json']?.schema;
+      if (!schema) throw new Error(`Missing trace-query error schema for ${status}`);
+      return schema;
+    }
+
+    function createMastraWithObservabilityStore(observabilityStore: object) {
+      const mastra = new Mastra({ logger: false });
+      const storage = {
+        getStore: vi.fn().mockResolvedValue(observabilityStore),
+      } as unknown as NonNullable<ReturnType<Mastra['getStorage']>>;
+      vi.spyOn(mastra, 'getStorage').mockReturnValue(storage);
+      return mastra;
+    }
+
+    async function requestTraceQuery(mastra: Mastra, body: unknown) {
+      const app = new Hono();
+      const adapter = new MastraServer({ app, mastra });
+      await adapter.init();
+      return app.request('/api/observability/traces/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    }
+
+    async function expectErrorResponse(response: Response, status: 400 | 409 | 422 | 501 | 504, body: unknown) {
+      expect(response.status).toBe(status);
+      expect(response.headers.get('content-type')).toContain('application/json');
+      const actual = await response.json();
+      expect(getErrorSchema(status).safeParse(actual).success).toBe(true);
+      expect(actual).toEqual(body);
+      return actual;
+    }
+
+    it('preserves a malformed cursor response', async () => {
+      const response = await requestTraceQuery(new Mastra({ logger: false }), {
+        timeRange,
+        page: { after: 'not-a-cursor' },
+      });
+
+      await expectErrorResponse(response, 400, {
+        code: 'TRACE_QUERY_CURSOR_MALFORMED',
+        message: 'The trace query cursor is malformed',
+      });
+    });
+
+    it('preserves a cursor conflict response', async () => {
+      const original = planTraceQuery(parseTraceQueryRequest({ timeRange }));
+      const after = encodeTraceQueryCursor(original, {
+        result: 'traces',
+        sortValue: '2026-08-20T10:00:00.000Z',
+        traceId: 'trace-a',
+      });
+      const response = await requestTraceQuery(new Mastra({ logger: false }), {
+        timeRange,
+        where: { op: 'eq', left: { path: 'threadId' }, right: { literal: 'thread-1' } },
+        page: { after },
+      });
+
+      await expectErrorResponse(response, 409, {
+        code: 'TRACE_QUERY_CURSOR_CONFLICT',
+        message: 'The cursor does not match the query',
+      });
+    });
+
+    it('preserves semantic validation issues', async () => {
+      const response = await requestTraceQuery(new Mastra({ logger: false }), {
+        timeRange,
+        where: { op: 'eq', left: { path: 'input' }, right: { literal: 'sensitive search' } },
+      });
+
+      const body = await expectErrorResponse(response, 422, {
+        code: 'TRACE_QUERY_INVALID',
+        message: 'The trace query is invalid',
+        issues: [
+          {
+            code: 'field_not_allowed',
+            path: ['where', 'left', 'path'],
+            message: 'The predicate field is not allowed here',
+          },
+        ],
+      });
+      expect(JSON.stringify(body)).not.toContain('sensitive search');
+    });
+
+    it('preserves an unsupported-store response', async () => {
+      const queryTraces = vi.fn();
+      const response = await requestTraceQuery(
+        createMastraWithObservabilityStore({ getFeatures: () => [], queryTraces }),
+        { timeRange },
+      );
+
+      await expectErrorResponse(response, 501, {
+        code: 'TRACE_QUERY_UNSUPPORTED',
+        message: 'Advanced trace queries are not supported by the configured observability store',
+      });
+      expect(queryTraces).not.toHaveBeenCalled();
+    });
+
+    it('preserves a timeout response without storage details', async () => {
+      const queryTraces = vi.fn().mockRejectedValue(new TraceQueryExecutionError());
+      const response = await requestTraceQuery(
+        createMastraWithObservabilityStore({ getFeatures: () => ['trace-query'], queryTraces }),
+        { timeRange },
+      );
+
+      const body = await expectErrorResponse(response, 504, {
+        code: 'TRACE_QUERY_EXECUTION_TIMEOUT',
+        message: 'The trace query exceeded its execution timeout',
+      });
+      expect(JSON.stringify(body)).not.toMatch(/select|parameter|stack|driver/i);
+    });
+  });
+
+  it('returns the documented malformed-body response for trace queries', async () => {
+    const mastra = new Mastra({ logger: false });
+    const app = new Hono();
+    const adapter = new MastraServer({ app, mastra });
+
+    await adapter.init();
+
+    const response = await app.request('/api/observability/traces/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{"timeRange":',
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get('content-type')).toContain('application/json');
+    await expect(response.json()).resolves.toEqual({
+      error: 'Invalid request body',
+      issues: [{ field: 'body', message: expect.any(String) }],
+    });
+  });
+
+  it('rejects an oversized trace-query body before planning or storage access', async () => {
+    const mastra = new Mastra({ logger: false });
+    const getStorage = vi.spyOn(mastra, 'getStorage');
+    const app = new Hono();
+    const adapter = new MastraServer({ app, mastra });
+
+    await adapter.init();
+
+    const response = await app.request('/api/observability/traces/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ padding: 'x'.repeat(256 * 1024) }),
+    });
+
+    expect(response.status).toBe(413);
+    expect(response.headers.get('content-type')).toContain('application/json');
+    await expect(response.json()).resolves.toEqual({ error: 'Request body too large' });
+    expect(getStorage).not.toHaveBeenCalled();
+  });
+
+  it('registers createRoute routes from server.apiRoutes with runtime validation', async () => {
+    const route = createRoute({
+      method: 'POST',
+      path: '/custom/validated',
+      responseType: 'json',
+      bodySchema: z.object({ name: z.string() }),
+      handler: async ({ name }) => ({ greeting: `Hello, ${name}` }),
+    });
+    const mastra = new Mastra({ logger: false, server: { apiRoutes: [route] } });
+    const app = new Hono();
+    const adapter = new MastraServer({ app, mastra });
+
+    await adapter.init();
+
+    const invalidResponse = await app.request('/custom/validated', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 42 }),
+    });
+    expect(invalidResponse.status).toBe(400);
+    await expect(invalidResponse.json()).resolves.toMatchObject({ error: 'Invalid request body' });
+
+    const validResponse = await app.request('/custom/validated', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Ada' }),
+    });
+    expect(validResponse.status).toBe(200);
+    await expect(validResponse.json()).resolves.toEqual({ greeting: 'Hello, Ada' });
+  });
+
+  it('preserves streaming responses for createRoute routes from server.apiRoutes', async () => {
+    const route = createRoute({
+      method: 'GET',
+      path: '/custom/stream',
+      responseType: 'stream',
+      requiresAuth: false,
+      handler: async () =>
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue('hello');
+            controller.close();
+          },
+        }),
+    });
+    const mastra = new Mastra({ logger: false, server: { apiRoutes: [route] } });
+    const app = new Hono();
+    const adapter = new MastraServer({ app, mastra });
+
+    await adapter.init();
+
+    const response = await app.request('/custom/stream');
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('text/plain');
+    expect(await response.text()).toContain('hello');
+  });
+
+  it('applies auth to createRoute routes from server.apiRoutes', async () => {
+    const protectedRoute = createRoute({
+      method: 'GET',
+      path: '/custom/secure',
+      responseType: 'json',
+      requiresAuth: true,
+      handler: async () => ({ secret: true }),
+    });
+    const publicRoute = createRoute({
+      method: 'GET',
+      path: '/custom/open',
+      responseType: 'json',
+      requiresAuth: false,
+      handler: async () => ({ open: true }),
+    });
+
+    const mastra = new Mastra({ logger: false, server: { apiRoutes: [protectedRoute, publicRoute] } });
+    const originalGetServer = mastra.getServer.bind(mastra);
+    mastra.getServer = () =>
+      ({
+        ...originalGetServer(),
+        auth: {
+          authenticateToken: async (token: string) => (token === 'valid-token' ? { id: 'user-1' } : null),
+          authorize: async () => true,
+        },
+      }) as any;
+
+    const app = new Hono();
+    const adapter = new MastraServer({
+      app,
+      mastra,
+      customRouteAuthConfig: new Map([['GET:/custom/open', false]]),
+    });
+    await adapter.init();
+
+    const unauthenticated = await app.request('/custom/secure');
+    expect(unauthenticated.status).toBe(401);
+
+    const authenticated = await app.request('/custom/secure', {
+      headers: { Authorization: 'Bearer valid-token' },
+    });
+    expect(authenticated.status).toBe(200);
+    await expect(authenticated.json()).resolves.toEqual({ secret: true });
+
+    const open = await app.request('/custom/open');
+    expect(open.status).toBe(200);
+    await expect(open.json()).resolves.toEqual({ open: true });
+  });
+
+  it('includes createRoute routes from server.apiRoutes in the OpenAPI spec', async () => {
+    const route = createRoute({
+      method: 'POST',
+      path: '/custom/spec',
+      responseType: 'json',
+      bodySchema: z.object({ name: z.string() }),
+      responseSchema: z.object({ name: z.string() }),
+      tags: ['Custom'],
+      handler: async ({ name }) => ({ name }),
+    });
+    const mastra = new Mastra({ logger: false, server: { apiRoutes: [route] } });
+    const app = new Hono();
+    const adapter = new MastraServer({ app, mastra, openapiPath: '/openapi.json' });
+
+    await adapter.init();
+
+    const response = await app.request('/api/openapi.json');
+    expect(response.status).toBe(200);
+    const spec = await response.json();
+    const operation = spec.paths['/custom/spec'].post;
+    expect(spec.paths['/custom/spec'].servers).toEqual([{ url: '/' }]);
+    expect(operation.tags).toEqual(['Custom']);
+    expect(operation.requestBody.content['application/json'].schema).toMatchObject({
+      type: 'object',
+      required: ['name'],
+    });
+    expect(operation.responses['200'].content['application/json'].schema).toMatchObject({
+      type: 'object',
+      required: ['name'],
+    });
+  });
+
+  describe('SSE stream handshake', () => {
+    let context: AdapterTestContext;
+
+    beforeEach(async () => {
+      context = await createDefaultTestContext();
+    });
+
+    it('writes an initial SSE comment when sseFlushOnConnect is true', async () => {
+      const app = new Hono();
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'GET',
+        path: '/test/waiting-stream',
+        responseType: 'stream',
+        streamFormat: 'sse',
+        sseFlushOnConnect: true,
+        handler: async () => new ReadableStream(),
+      };
+
+      app.use('*', adapter.createContextMiddleware());
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const response = await app.request(new Request('http://localhost/test/waiting-stream'));
+      const reader = response.body!.getReader();
+
+      try {
+        const firstChunk = await Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('Timed out waiting for SSE handshake')), 100),
+          ),
+        ]);
+
+        expect(new TextDecoder().decode(firstChunk.value)).toBe(': connected\n\n');
+      } finally {
+        await reader.cancel();
+      }
+    });
+
+    it('does not write an initial SSE comment when sseFlushOnConnect is not set', async () => {
+      const app = new Hono();
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'GET',
+        path: '/test/waiting-stream-no-flush',
+        responseType: 'stream',
+        streamFormat: 'sse',
+        handler: async () =>
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'text-delta', textDelta: 'hello' });
+              controller.close();
+            },
+          }),
+      };
+
+      app.use('*', adapter.createContextMiddleware());
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const response = await app.request(new Request('http://localhost/test/waiting-stream-no-flush'));
+      const reader = response.body!.getReader();
+
+      try {
+        const firstChunk = await Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('Timed out waiting for first chunk')), 100),
+          ),
+        ]);
+
+        const text = new TextDecoder().decode(firstChunk.value);
+        expect(text).not.toContain(': connected');
+        expect(text).toContain('data: ');
+      } finally {
+        await reader.cancel();
+      }
+    });
+
+    it('handles a rejected source cancellation when the client disconnects', async () => {
+      const app = new Hono();
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+      const cancel = vi.fn().mockRejectedValue(new Error('cancel failed'));
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'GET',
+        path: '/test/rejected-stream-cancellation',
+        responseType: 'stream',
+        streamFormat: 'sse',
+        sseFlushOnConnect: true,
+        handler: async () =>
+          new ReadableStream({
+            cancel,
+          }),
+      };
+
+      app.use('*', adapter.createContextMiddleware());
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const response = await app.request(new Request('http://localhost/test/rejected-stream-cancellation'));
+      const reader = response.body!.getReader();
+
+      await reader.read();
+      await reader.cancel();
+      await waitFor(() => cancel.mock.calls.length === 1);
+
+      expect(cancel).toHaveBeenCalledWith('request aborted');
+    });
   });
 
   describe('Stream Data Redaction', () => {
@@ -186,6 +634,47 @@ describe('Hono Server Adapter', () => {
       const finish = chunks.find(c => c.type === 'finish');
       expect(finish).toBeDefined();
       expect(finish.payload.metadata.request).toBeUndefined();
+    });
+
+    it('should pass SSE comment chunks through without data wrapping', async () => {
+      const app = new Hono();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/sse-comment',
+        responseType: 'stream',
+        streamFormat: 'sse',
+        handler: async () =>
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(': heartbeat\n\n');
+              controller.enqueue({ type: 'text-delta', payload: { text: 'hello' } });
+              controller.close();
+            },
+          }),
+      };
+
+      app.use('*', adapter.createContextMiddleware());
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const response = await app.request(
+        new Request('http://localhost/test/sse-comment', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        }),
+      );
+
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(text).toContain(': heartbeat\n\n');
+      expect(text).toContain('data: {"type":"text-delta","payload":{"text":"hello"}}\n\n');
+      expect(text).not.toContain('data: ": heartbeat');
     });
 
     it('should NOT redact sensitive data when streamOptions.redact is false', async () => {
@@ -317,6 +806,50 @@ describe('Hono Server Adapter', () => {
       const textDelta = chunks.find(c => c.type === 'text-delta');
       expect(textDelta).toBeDefined();
       expect(textDelta.textDelta).toBe('Hello');
+    });
+  });
+
+  // Repro for https://github.com/mastra-ai/mastra/issues/17821 — a chunk that
+  // JSON.stringify can't handle (e.g. a BigInt step output) used to throw inside
+  // the stream loop and silently close the HTTP stream, so Studio never received
+  // the remaining chunks and workflow nodes stayed visually "running" forever.
+  describe('Stream Chunk Serialization', () => {
+    let context: AdapterTestContext;
+
+    beforeEach(async () => {
+      context = await createDefaultTestContext();
+    });
+
+    it('serializes BigInt chunks and skips unserializable chunks without killing the stream', async () => {
+      const app = new Hono();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/unserializable-stream',
+        responseType: 'stream',
+        streamFormat: 'sse',
+        handler: async () => createStreamWithUnserializableChunk(),
+      };
+
+      app.use('*', adapter.createContextMiddleware());
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const response = await app.request(
+        new Request('http://localhost/test/unserializable-stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        }),
+      );
+
+      expect(response.status).toBe(200);
+      const chunks = await consumeSSEStream(response.body);
+      expectSerializedStreamChunks(chunks);
     });
   });
 
@@ -640,6 +1173,27 @@ describe('Hono Server Adapter', () => {
     });
   });
 
+  describe('Channel webhook diagnostics', () => {
+    it('warns for an unregistered channel webhook when no custom API routes exist', async () => {
+      const mastra = new Mastra({ logger: false });
+      const warnSpy = vi.spyOn(mastra.getLogger(), 'warn');
+      const app = new Hono();
+      const adapter = new MastraServer({ app, mastra });
+
+      await adapter.init();
+
+      const response = await app.request('/api/agents/support/channels/slack/webhook', {
+        method: 'POST',
+      });
+
+      expect(response.status).toBe(404);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('channels.adapters configuration'), {
+        agentId: 'support',
+        platform: 'slack',
+      });
+    });
+  });
+
   describe('Custom API Routes (registerApiRoute)', () => {
     let server: Server | null = null;
 
@@ -726,6 +1280,46 @@ describe('Hono Server Adapter', () => {
       expect(response.status).toBe(200);
       const data = await response.json();
       expect(data).toEqual({ echo: { test: 'data' } });
+    });
+
+    it('should propagate request abort signals to custom API route handlers', async () => {
+      const signalAbort = vi.fn();
+      let routeSignal: AbortSignal | undefined;
+      const customRoutes = [
+        registerApiRoute('/signal', {
+          method: 'GET',
+          handler: async c => {
+            routeSignal = c.req.raw.signal;
+            routeSignal.addEventListener('abort', signalAbort);
+            return c.json({ aborted: routeSignal.aborted });
+          },
+        }),
+      ];
+
+      const mastra = new Mastra({});
+      const app = new Hono();
+      const adapter = new MastraServer({
+        app,
+        mastra,
+        customApiRoutes: customRoutes,
+      });
+
+      await adapter.init();
+
+      const controller = new AbortController();
+      const response = await app.request(
+        new Request('http://localhost/signal', {
+          signal: controller.signal,
+        }),
+      );
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ aborted: false });
+      expect(routeSignal?.aborted).toBe(false);
+
+      controller.abort();
+      await waitFor(() => signalAbort.mock.calls.length > 0);
+      expect(routeSignal?.aborted).toBe(true);
     });
 
     it('should throw when a custom route path starts with the server prefix', async () => {
@@ -820,6 +1414,7 @@ describe('Hono Server Adapter', () => {
         handler: async ({ requestContext }) => {
           return {
             resourceId: requestContext?.get('mastra__resourceId') ?? null,
+            isStudio: requestContext?.get(MASTRA_IS_STUDIO_KEY) ?? null,
             customKey: requestContext?.get('myKey') ?? null,
           };
         },
@@ -835,6 +1430,7 @@ describe('Hono Server Adapter', () => {
           body: JSON.stringify({
             requestContext: {
               mastra__resourceId: 'injected-victim-id',
+              [MASTRA_IS_STUDIO_KEY]: true,
               myKey: 'safe-value',
             },
           }),
@@ -844,6 +1440,7 @@ describe('Hono Server Adapter', () => {
       expect(response.status).toBe(200);
       const data = await response.json();
       expect(data.resourceId).toBeNull();
+      expect(data.isStudio).toBeNull();
       expect(data.customKey).toBe('safe-value');
     });
 
@@ -901,6 +1498,7 @@ describe('Hono Server Adapter', () => {
           return {
             resourceId: requestContext?.get('mastra__resourceId') ?? null,
             threadId: requestContext?.get('mastra__threadId') ?? null,
+            isStudio: requestContext?.get(MASTRA_IS_STUDIO_KEY) ?? null,
             customKey: requestContext?.get('myKey') ?? null,
           };
         },
@@ -912,6 +1510,7 @@ describe('Hono Server Adapter', () => {
       const queryContext = JSON.stringify({
         mastra__resourceId: 'injected-victim-id',
         mastra__threadId: 'injected-thread-id',
+        [MASTRA_IS_STUDIO_KEY]: true,
         myKey: 'safe-value',
       });
 
@@ -925,7 +1524,108 @@ describe('Hono Server Adapter', () => {
       const data = await response.json();
       expect(data.resourceId).toBeNull();
       expect(data.threadId).toBeNull();
+      expect(data.isStudio).toBeNull();
       expect(data.customKey).toBe('safe-value');
     });
+
+    it('should set reserved Studio context from x-mastra-client-type header', async () => {
+      const mastra = new Mastra({});
+      const app = new Hono();
+      const adapter = new MastraServer({ app, mastra });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'GET',
+        path: '/test/context',
+        responseType: 'json',
+        handler: async ({ requestContext }) => {
+          return {
+            isStudio: requestContext?.get(MASTRA_IS_STUDIO_KEY) ?? null,
+          };
+        },
+      };
+
+      app.use('*', adapter.createContextMiddleware());
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const response = await app.request(
+        new Request('http://localhost/test/context', {
+          method: 'GET',
+          headers: { 'x-mastra-client-type': 'studio' },
+        }),
+      );
+
+      expect(response.status).toBe(200);
+      const data = await response.json();
+      expect(data.isStudio).toBe(true);
+    });
+
+    it('should not set reserved Studio context when x-mastra-client-type is not studio', async () => {
+      const mastra = new Mastra({});
+      const app = new Hono();
+      const adapter = new MastraServer({ app, mastra });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'GET',
+        path: '/test/context',
+        responseType: 'json',
+        handler: async ({ requestContext }) => {
+          return {
+            isStudio: requestContext?.get(MASTRA_IS_STUDIO_KEY) ?? null,
+          };
+        },
+      };
+
+      app.use('*', adapter.createContextMiddleware());
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      for (const headers of [{ 'x-mastra-client-type': 'playground' }, {}]) {
+        const response = await app.request(
+          new Request('http://localhost/test/context', {
+            method: 'GET',
+            headers,
+          }),
+        );
+
+        expect(response.status).toBe(200);
+        const data = await response.json();
+        expect(data.isStudio).toBeNull();
+      }
+    });
+  });
+
+  createBodyLimitTestSuite({
+    suiteName: 'Body Size Limit',
+
+    createApp: () => new Hono(),
+
+    setupAdapter: (app, mastra, bodyLimitOptions) => {
+      const adapter = new MastraServer({ app, mastra, bodyLimitOptions });
+      app.use('*', adapter.createContextMiddleware());
+      return { adapter, app };
+    },
+
+    registerRoute: (adapter, app, route) => adapter.registerRoute(app, route, { prefix: '' }),
+
+    executeRequest: async (app, method, url, options = {}) => {
+      const response = await app.request(
+        new Request(url, {
+          method,
+          headers: options.headers,
+          ...(options.body ? { body: options.body } : {}),
+        }),
+      );
+      return { status: response.status };
+    },
+
+    executeRequestWithoutContentLength: async (app, method, url, options = {}) => {
+      const request = new Request(url, {
+        method,
+        headers: options.headers,
+        ...(options.body ? { body: options.body } : {}),
+      });
+      expect(request.headers.has('content-length')).toBe(false);
+      const response = await app.request(request);
+      return { status: response.status };
+    },
   });
 });

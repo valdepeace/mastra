@@ -14,14 +14,17 @@ import type {
   TimeTravelWorkflowOptions,
   StreamWorkflowResult,
   StreamEvent,
+  WorkflowRegistry,
 } from '@internal/workflow-test-utils';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { Agent } from '../../agent';
+import { MastraNonRetryableError } from '../../error';
 import { EventEmitterPubSub } from '../../events/event-emitter';
 import { Mastra } from '../../mastra';
 import type { Processor } from '../../processors';
 import { ProcessorStepSchema } from '../../processors/step-schema';
+import { RequestContext } from '../../request-context';
 import { MockStore } from '../../storage/mock';
 import { createTool } from '../../tools/tool';
 import { createStep, createWorkflow } from '.';
@@ -32,6 +35,24 @@ import { createStep, createWorkflow } from '.';
 
 // Shared storage instance
 const sharedStorage = new MockStore();
+
+// Long-lived Mastra instance with every test workflow registered + workers running.
+// Most tests use their own per-run Mastra (created in the helpers below), but a few
+// shared tests call `workflow.createRun()` directly and therefore need the workflow to
+// be bound to a Mastra whose event workers are running. After each test we re-bind all
+// registry workflows back to this instance (the per-test Mastras re-bind them to
+// short-lived, stopped instances).
+let registeredMastra: Mastra | undefined;
+let registeredRegistry: WorkflowRegistry | undefined;
+
+const rebindRegistryWorkflows = () => {
+  if (!registeredMastra || !registeredRegistry) {
+    return;
+  }
+  for (const entry of Object.values(registeredRegistry)) {
+    (entry.workflow as any).__registerMastra?.(registeredMastra);
+  }
+};
 
 // @ts-expect-error - TS2589: EventedWorkflow types cause excessively deep type instantiation
 createWorkflowTestSuite({
@@ -44,17 +65,48 @@ createWorkflowTestSuite({
     Agent,
   }),
 
-  // Skip restart domain - restart() is not supported on evented workflows
   skip: {
-    restart: true,
+    // All domains should work on Evented Engine
+    restart: false, // Evented engine supports restart
   },
 
   // Provide access to storage for tests that need to spy on storage operations
   getStorage: () => sharedStorage,
 
+  // The evented processor deletes snapshot rows for non-paused terminal
+  // statuses the workflow declined to persist (#22209).
+  deletesDeclinedTerminalSnapshots: true,
+
+  // Register every test workflow with a single long-lived Mastra (with its event
+  // workers running) so tests that call `workflow.createRun()` directly work.
+  registerWorkflows: async registry => {
+    registeredRegistry = registry;
+    const workflows: Record<string, any> = {};
+    const agents: Record<string, any> = {};
+    const tools: Record<string, any> = {};
+    for (const [id, entry] of Object.entries(registry)) {
+      workflows[id] = entry.workflow;
+      if (entry.mastraAgents) Object.assign(agents, entry.mastraAgents);
+      if (entry.mastraTools) Object.assign(tools, entry.mastraTools);
+    }
+    registeredMastra = new Mastra({
+      logger: false,
+      storage: sharedStorage,
+      workflows,
+      agents: Object.keys(agents).length ? agents : undefined,
+      tools: Object.keys(tools).length ? tools : undefined,
+      pubsub: new EventEmitterPubSub(),
+    });
+    await registeredMastra.startWorkers();
+  },
+
   beforeAll: async () => {
     vi.unmock('crypto');
     vi.unmock('node:crypto');
+  },
+
+  afterAll: async () => {
+    await registeredMastra?.stopWorkers();
   },
 
   beforeEach: async () => {
@@ -64,81 +116,40 @@ createWorkflowTestSuite({
     await workflowsStore?.dangerouslyClearAll();
   },
 
-  // Skip only tests that actually fail - updated after BUG fixes 2026-02
+  afterEach: async () => {
+    // Per-test helpers create their own Mastra (which re-binds the workflow it runs to
+    // that short-lived, now-stopped instance). Re-bind everything to the long-lived
+    // Mastra so the next test still has a running engine if it uses createRun() directly.
+    rebindRegistryWorkflows();
+  },
+
   skipTests: {
-    // Validation - evented resolves instead of throwing
-    executionFlowNotDefined: true,
-    executionGraphNotCommitted: true,
-
-    // Foreach - timing flaky, empty array timeout
-    foreachPartialConcurrencyTiming: true,
-    emptyForeach: true,
-
-    // Abort - returns 'success' not 'canceled', timeout on signal wait
-    abortStatus: true,
-    abortDuringStep: true,
-
-    // Suspend/resume - parallel suspend has race condition (each step publishes workflow.suspend independently)
-    resumeParallelMulti: true,
-    resumeMultiSuspendError: true,
-    resumeBranchingStatus: true,
-    // Suspend/resume - still failing (loop/foreach coordination, nested input propagation)
-    resumeLoopInput: true,
-    resumeForeachIndex: true,
-    resumeForeachLabel: true, // Same issue as resumeForeachIndex
-    resumeForeachPartial: true, // Same issue as resumeForeachIndex
-    resumeForeachPartialIndex: true, // Same issue as resumeForeachIndex
-    resumeNested: true, // Nested resume works but input value from previous step lost (26 vs 27)
-    resumeDountil: true,
-
-    // Time travel - different result structure
-    timeTravelConditional: true,
-
-    // Streaming - legacy API timeout issue
-    streamingSuspendResumeLegacy: true,
-
-    // Branching - nested conditions with multiple nested workflows
-    branchingNestedConditions: true, // Complex nested branching not yet supported in evented
-
-    // Foreach state tests - stateSchema with bail/setState
-    foreachStateBatch: true, // State batch propagation in evented foreach not yet supported
-    foreachBail: true, // bail() in evented foreach not yet supported
-
-    // Error handling - logger test creates its own Mastra instance (default engine only)
-    errorLogger: true,
-
-    // Callback - state test uses stateSchema/setState (WIP in evented)
-    callbackStateOnError: true,
-
-    // Time travel - conditional perStep inherits timeTravelConditional issues
-    timeTravelConditionalPerStep: true,
-
-    // Resume error tests - evented engine error behavior may differ
-    resumeNotSuspendedWorkflow: true,
-    resumeInvalidData: true,
-
-    // Deep nested suspend/resume not supported in evented engine
-    resumeDeepNested: true,
-    // Incorrect branches after resume in nested workflows - evented fails
-    resumeIncorrectBranches: true,
-    // Map-branch resume requires direct Mastra registration (server restart sim)
-    resumeMapBranchCondition: true,
-    // Abort propagation to nested workflows times out in evented engine
-    abortNestedPropagation: true,
+    // Enable all tests - Default Engine is the reference implementation
+    // Enable opt-in tests that require storage
+    errorStorageRoundtrip: false,
+    //persistWorkflowSnapshot error-handling tests are skipped because it's not used in evented-engine
+    errorPersistWithoutStack: true,
+    errorPersistMastraError: true,
   },
 
   executeWorkflow: async (workflow, inputData, options = {}): Promise<WorkflowResult> => {
     // Create a fresh Mastra instance for each test execution
-    // This ensures proper isolation between tests
+    // This ensures proper isolation between tests.
+    // Carry through any mastraAgents/mastraTools declared for this workflow in the
+    // shared harness registry so declarative `.agent('id')` / `.tool('id')` builder
+    // calls can resolve their string references at execution time.
+    const registryEntry = registeredRegistry?.[workflow.id];
     const mastra = new Mastra({
       workflows: { [workflow.id]: workflow },
+      agents: registryEntry?.mastraAgents,
+      tools: registryEntry?.mastraTools,
       storage: sharedStorage,
       pubsub: new EventEmitterPubSub(),
     });
 
     try {
       // Start the event engine
-      await mastra.startEventEngine();
+      await mastra.startWorkers();
 
       // Create the run and execute using streaming API
       const run = await workflow.createRun({ runId: options.runId, resourceId: options.resourceId });
@@ -160,7 +171,7 @@ createWorkflowTestSuite({
       return result as WorkflowResult;
     } finally {
       // Always stop the event engine
-      await mastra.stopEventEngine();
+      await mastra.stopWorkers();
     }
   },
 
@@ -175,7 +186,7 @@ createWorkflowTestSuite({
 
     try {
       // Start the event engine
-      await mastra.startEventEngine();
+      await mastra.startWorkers();
 
       // Get the workflow run by ID
       const run = await workflow.createRun({ runId: options.runId });
@@ -185,12 +196,13 @@ createWorkflowTestSuite({
         resumeData: options.resumeData,
         step: options.step,
         label: options.label,
+        forEachIndex: options.forEachIndex,
       } as any);
 
       return result as WorkflowResult;
     } finally {
       // Always stop the event engine
-      await mastra.stopEventEngine();
+      await mastra.stopWorkers();
     }
   },
 
@@ -204,7 +216,7 @@ createWorkflowTestSuite({
 
     try {
       // Start the event engine
-      await mastra.startEventEngine();
+      await mastra.startWorkers();
 
       // Create a run and use timeTravel API
       const run = await workflow.createRun({ runId: options.runId });
@@ -221,7 +233,7 @@ createWorkflowTestSuite({
       return result as WorkflowResult;
     } finally {
       // Always stop the event engine
-      await mastra.stopEventEngine();
+      await mastra.stopWorkers();
     }
   },
 
@@ -233,7 +245,7 @@ createWorkflowTestSuite({
     });
 
     try {
-      await mastra.startEventEngine();
+      await mastra.startWorkers();
 
       const run = await workflow.createRun({
         runId: options.runId,
@@ -273,7 +285,7 @@ createWorkflowTestSuite({
         return { events, result: result as WorkflowResult };
       }
     } finally {
-      await mastra.stopEventEngine();
+      await mastra.stopWorkers();
     }
   },
 
@@ -285,7 +297,7 @@ createWorkflowTestSuite({
     });
 
     try {
-      await mastra.startEventEngine();
+      await mastra.startWorkers();
 
       const run = await workflow.createRun({ runId: options.runId });
 
@@ -303,7 +315,7 @@ createWorkflowTestSuite({
       const result = await streamResult.result;
       return { events, result: result as WorkflowResult };
     } finally {
-      await mastra.stopEventEngine();
+      await mastra.stopWorkers();
     }
   },
 });
@@ -319,6 +331,312 @@ describe('Workflow (Evented Engine Specific)', () => {
     vi.resetAllMocks();
     const workflowsStore = await testStorage.getStore('workflows');
     await workflowsStore?.dangerouslyClearAll();
+  });
+
+  it('should run onStart before execution and abort the run when it throws', async () => {
+    const stepAction = vi.fn().mockResolvedValue({ value: 'done' });
+    const step1 = createStep({
+      id: 'step1',
+      execute: stepAction,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+    });
+
+    const onStart = vi.fn();
+    const okWorkflow = createWorkflow({
+      id: 'on-start-ok-workflow',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      steps: [step1],
+      options: { validateInputs: false, onStart },
+    });
+    okWorkflow.then(step1).commit();
+
+    const gatedAction = vi.fn().mockResolvedValue({ value: 'done' });
+    const gatedStep = createStep({
+      id: 'gated-step',
+      execute: gatedAction,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+    });
+    const gatedWorkflow = createWorkflow({
+      id: 'on-start-gated-workflow',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      steps: [gatedStep],
+      options: {
+        validateInputs: false,
+        onStart: async () => {
+          throw new Error('quota exceeded');
+        },
+      },
+    });
+    gatedWorkflow.then(gatedStep).commit();
+
+    const mastra = new Mastra({
+      workflows: {
+        'on-start-ok-workflow': okWorkflow,
+        'on-start-gated-workflow': gatedWorkflow,
+      },
+      storage: testStorage,
+      pubsub: new EventEmitterPubSub(),
+    });
+    await mastra.startWorkers();
+
+    try {
+      const okRun = await okWorkflow.createRun();
+      const okResult = await okRun.start({ inputData: {} });
+      expect(okResult.status).toBe('success');
+      expect(onStart).toHaveBeenCalledTimes(1);
+      expect(onStart.mock.calls[0]![0]!.runId).toBe(okRun.runId);
+
+      const gatedRun = await gatedWorkflow.createRun();
+      await expect(gatedRun.start({ inputData: {} })).rejects.toThrow('quota exceeded');
+      expect(gatedAction).not.toHaveBeenCalled();
+
+      // The hook runs ahead of the initial run-record write in start(), but createRun()
+      // has already persisted a pending record by then, so the gated run is parked at
+      // 'pending' rather than absent. Pinning that so the guarantee cannot drift.
+      const workflowsStore = await testStorage.getStore('workflows');
+      const gatedRecord = await workflowsStore?.getWorkflowRunById({
+        runId: gatedRun.runId,
+        workflowName: 'on-start-gated-workflow',
+      });
+      expect((gatedRecord?.snapshot as any)?.status).toBe('pending');
+
+      // Control: the allowed run advanced past pending, so the assertion above reflects the
+      // gate holding rather than this engine never updating the record.
+      const okRecord = await workflowsStore?.getWorkflowRunById({
+        runId: okRun.runId,
+        workflowName: 'on-start-ok-workflow',
+      });
+      expect((okRecord?.snapshot as any)?.status).toBe('success');
+    } finally {
+      await mastra.stopWorkers();
+    }
+  });
+
+  describe('parallel setState merging (issue #22319)', () => {
+    const stateSchema = z.object({ first: z.number(), second: z.number() });
+
+    const makeBranchStep = (id: string, delayMs: number, update: Record<string, number>) =>
+      createStep({
+        id,
+        inputSchema: z.object({}),
+        outputSchema: z.object({ value: z.string() }),
+        stateSchema,
+        execute: async ({ setState }) => {
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+          await setState(update as any);
+          return { value: id };
+        },
+      });
+
+    const runWorkflow = async (workflow: any, id: string) => {
+      const mastra = new Mastra({
+        workflows: { [id]: workflow },
+        storage: testStorage,
+        pubsub: new EventEmitterPubSub(),
+      });
+      await mastra.startWorkers();
+      try {
+        const run = await workflow.createRun();
+        return await run.start({
+          inputData: {},
+          initialState: { first: 0, second: 0 },
+          outputOptions: { includeState: true },
+        });
+      } finally {
+        await mastra.stopWorkers();
+      }
+    };
+
+    it.for([
+      ['slow-first', 50, 10],
+      ['fast-first', 10, 50],
+    ] as const)('merges setState updates from both parallel branches (%s)', async ([name, delay1, delay2]) => {
+      const id = `parallel-set-state-${name}`;
+      const step1 = makeBranchStep('branch1', delay1, { first: 1 });
+      const step2 = makeBranchStep('branch2', delay2, { second: 1 });
+
+      const workflow = createWorkflow({
+        id,
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        stateSchema,
+        steps: [step1, step2],
+      });
+      workflow.parallel([step1, step2]).commit();
+
+      const result = await runWorkflow(workflow, id);
+      expect(result.status).toBe('success');
+      expect((result as any).state).toEqual({ first: 1, second: 1 });
+    });
+
+    it('merges setState updates from multiple executed conditional branches', async () => {
+      const id = 'conditional-set-state-merge';
+      const step1 = makeBranchStep('branch1', 30, { first: 1 });
+      const step2 = makeBranchStep('branch2', 5, { second: 1 });
+
+      const workflow = createWorkflow({
+        id,
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        stateSchema,
+        steps: [step1, step2],
+      });
+      workflow
+        .branch([
+          [async () => true, step1],
+          [async () => true, step2],
+        ])
+        .commit();
+
+      const result = await runWorkflow(workflow, id);
+      expect(result.status).toBe('success');
+      expect((result as any).state).toEqual({ first: 1, second: 1 });
+    });
+
+    it('exposes the merged state to the step after the parallel block', async () => {
+      const id = 'parallel-set-state-after';
+      const step1 = makeBranchStep('branch1', 30, { first: 1 });
+      const step2 = makeBranchStep('branch2', 5, { second: 1 });
+      const observedStates: Record<string, number>[] = [];
+      const afterStep = createStep({
+        id: 'after',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        stateSchema,
+        execute: async ({ state }) => {
+          observedStates.push(state as any);
+          return {};
+        },
+      });
+
+      const workflow = createWorkflow({
+        id,
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        stateSchema,
+        steps: [step1, step2, afterStep],
+      });
+      workflow.parallel([step1, step2]).then(afterStep).commit();
+
+      const result = await runWorkflow(workflow, id);
+      expect(result.status).toBe('success');
+      expect(observedStates[0]).toEqual({ first: 1, second: 1 });
+      // Step results must not leak the internal delta bookkeeping
+      expect(JSON.stringify(result.steps)).not.toContain('__stateDelta');
+    });
+  });
+
+  describe('terminal snapshot cleanup (issue #22209)', () => {
+    const makeStep = (id: string, execute: () => Promise<any>) =>
+      createStep({
+        id,
+        execute,
+        inputSchema: z.object({}),
+        outputSchema: z.object({ value: z.string() }),
+      });
+
+    /** Persist in-flight statuses, decline terminal ones — the durable agentic-loop pattern. */
+    const declineTerminals = ({ workflowStatus }: { workflowStatus: string }) =>
+      ['pending', 'paused', 'suspended', 'running', 'waiting'].includes(workflowStatus);
+
+    const readRow = async (workflowName: string, runId: string) => {
+      const workflowsStore = await testStorage.getStore('workflows');
+      return workflowsStore?.getWorkflowRunById({ runId, workflowName });
+    };
+
+    it('deletes the snapshot row when the workflow declines to persist a success terminal', async () => {
+      const workflow = createWorkflow({
+        id: 'decline-terminal-success-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({ value: z.string() }),
+        options: { validateInputs: false, shouldPersistSnapshot: declineTerminals },
+      });
+      workflow.then(makeStep('ok-step', async () => ({ value: 'done' }))).commit();
+
+      // Control: identical workflow with default persistence keeps its terminal row.
+      const controlWorkflow = createWorkflow({
+        id: 'default-persist-success-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({ value: z.string() }),
+        options: { validateInputs: false },
+      });
+      controlWorkflow.then(makeStep('ok-step-control', async () => ({ value: 'done' }))).commit();
+
+      const mastra = new Mastra({
+        workflows: {
+          'decline-terminal-success-workflow': workflow,
+          'default-persist-success-workflow': controlWorkflow,
+        },
+        storage: testStorage,
+        pubsub: new EventEmitterPubSub(),
+      });
+      await mastra.startWorkers();
+
+      try {
+        const run = await workflow.createRun();
+        const result = await run.start({ inputData: {} });
+        expect(result.status).toBe('success');
+        // Terminal runs the workflow declined to persist can never be resumed —
+        // the earlier 'running'/'pending' row must be deleted, not left behind
+        // looking byte-identical to an orphaned run.
+        expect(await readRow('decline-terminal-success-workflow', run.runId)).toBeNull();
+
+        const controlRun = await controlWorkflow.createRun();
+        const controlResult = await controlRun.start({ inputData: {} });
+        expect(controlResult.status).toBe('success');
+        const controlRow = await readRow('default-persist-success-workflow', controlRun.runId);
+        expect((controlRow?.snapshot as any)?.status).toBe('success');
+      } finally {
+        await mastra.stopWorkers();
+      }
+    });
+
+    it('deletes the snapshot row when the workflow declines to persist a failed terminal', async () => {
+      const workflow = createWorkflow({
+        id: 'decline-terminal-failed-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({ value: z.string() }),
+        options: { validateInputs: false, shouldPersistSnapshot: declineTerminals },
+      });
+      workflow
+        .then(
+          makeStep('boom-step', async () => {
+            throw new Error('boom');
+          }),
+        )
+        .commit();
+
+      const mastra = new Mastra({
+        workflows: { 'decline-terminal-failed-workflow': workflow },
+        storage: testStorage,
+        pubsub: new EventEmitterPubSub(),
+      });
+      await mastra.startWorkers();
+
+      try {
+        const run = await workflow.createRun();
+        const result = await run.start({ inputData: {} });
+        expect(result.status).toBe('failed');
+        expect(await readRow('decline-terminal-failed-workflow', run.runId)).toBeNull();
+      } finally {
+        await mastra.stopWorkers();
+      }
+    });
+  });
+
+  it('should create a processor step for state signal only processors', () => {
+    const processor: Processor = {
+      id: 'state-only-processor',
+      computeStateSignal: () => ({ cacheKey: 'state-only-cache', contents: 'state' }),
+    };
+
+    const step = createStep(processor);
+
+    expect(step.id).toBe('processor:state-only-processor');
   });
 
   it('should preserve processorStates across nested processor workflows', async () => {
@@ -383,7 +701,7 @@ describe('Workflow (Evented Engine Specific)', () => {
       storage: testStorage,
       pubsub: new EventEmitterPubSub(),
     });
-    await mastra.startEventEngine();
+    await mastra.startWorkers();
 
     try {
       const run = await parentProcessorWorkflow.createRun();
@@ -406,7 +724,7 @@ describe('Workflow (Evented Engine Specific)', () => {
       expect(result.status).toBe('success');
       expect((processorStates.get('tracking-processor') as any)?.customState).toEqual({ messageCount: 1 });
     } finally {
-      await mastra.stopEventEngine();
+      await mastra.stopWorkers();
     }
   });
 
@@ -451,7 +769,7 @@ describe('Workflow (Evented Engine Specific)', () => {
         storage: testStorage,
         pubsub: new EventEmitterPubSub(),
       });
-      await mastra.startEventEngine();
+      await mastra.startWorkers();
 
       const runId = 'test-run-id';
       let watchData: StreamEvent[] = [];
@@ -491,7 +809,7 @@ describe('Workflow (Evented Engine Specific)', () => {
       expect(step1Action).toHaveBeenCalled();
       expect(step2Action).not.toHaveBeenCalled();
 
-      await mastra.stopEventEngine();
+      await mastra.stopWorkers();
     });
 
     // Note: "should handle basic suspend and resume flow" moved to shared suite
@@ -528,7 +846,7 @@ describe('Workflow (Evented Engine Specific)', () => {
         storage: testStorage,
         pubsub: new EventEmitterPubSub(),
       });
-      await mastra.startEventEngine();
+      await mastra.startWorkers();
 
       const runId = 'test-run-id';
       let watchData: StreamEvent[] = [];
@@ -563,8 +881,12 @@ describe('Workflow (Evented Engine Specific)', () => {
       ]);
       // Result verification covered by shared suite
       expect(executionResult.status).toBe('success');
+      expect(watchData.at(-1)?.payload).toMatchObject({
+        workflowStatus: 'success',
+        finalWorkflowResult: executionResult.result,
+      });
 
-      await mastra.stopEventEngine();
+      await mastra.stopWorkers();
     });
 
     it.skip('should continue streaming current run on subsequent stream calls - evented runtime pubsub differs from default', async () => {
@@ -643,7 +965,7 @@ describe('Workflow (Evented Engine Specific)', () => {
         workflows: { 'test-workflow': promptEvalWorkflow },
         pubsub: new EventEmitterPubSub(),
       });
-      await mastra.startEventEngine();
+      await mastra.startWorkers();
 
       const run = await promptEvalWorkflow.createRun();
 
@@ -655,7 +977,7 @@ describe('Workflow (Evented Engine Specific)', () => {
 
       expect(result.status).toBe('suspended');
 
-      await mastra.stopEventEngine();
+      await mastra.stopWorkers();
     });
 
     // Note: "should handle custom event emission using writer" moved to shared suite
@@ -710,7 +1032,7 @@ describe('Workflow (Evented Engine Specific)', () => {
         workflows: { 'test-resume-writer': testWorkflow },
         pubsub: new EventEmitterPubSub(),
       });
-      await mastra.startEventEngine();
+      await mastra.startWorkers();
 
       // Create run and start workflow
       const run = await testWorkflow.createRun();
@@ -752,7 +1074,7 @@ describe('Workflow (Evented Engine Specific)', () => {
       const resumeResult = await streamResult.result;
       expect(resumeResult.status).toBe('success');
 
-      await mastra.stopEventEngine();
+      await mastra.stopWorkers();
     });
 
     it('should handle errors from agent.stream() with full error details', async () => {
@@ -811,7 +1133,7 @@ describe('Workflow (Evented Engine Specific)', () => {
         storage: testStorage,
         pubsub: new EventEmitterPubSub(),
       });
-      await mastra.startEventEngine();
+      await mastra.startWorkers();
 
       const run = await workflow.createRun();
       const result = await run.start({ inputData: {} });
@@ -830,10 +1152,334 @@ describe('Workflow (Evented Engine Specific)', () => {
         expect((result.error as any).isRetryable).toBe(true);
       }
 
-      await mastra.stopEventEngine();
+      await mastra.stopWorkers();
     });
 
     // Note: "should preserve error details in streaming workflow" moved to shared suite
     // (streaming domain: should preserve error details in streaming workflow)
+  });
+
+  describe('foreach failure progress (issue #21749)', () => {
+    it('does not re-execute successful iterations when time travelling to a failed foreach', async () => {
+      const executions = [0, 0];
+
+      const seed = createStep({
+        id: 'evented-foreach-seed',
+        inputSchema: z.object({}),
+        outputSchema: z.array(z.number()),
+        execute: async () => [0, 1],
+      });
+
+      const processItem = createStep({
+        id: 'evented-process-item',
+        inputSchema: z.number(),
+        outputSchema: z.number(),
+        execute: async ({ inputData }) => {
+          executions[inputData]! += 1;
+          if (inputData === 1 && executions[inputData] === 1) {
+            throw new Error('transient failure');
+          }
+          return inputData;
+        },
+      });
+
+      const workflow = createWorkflow({
+        id: 'evented-foreach-failure-progress',
+        inputSchema: z.object({}),
+        outputSchema: z.array(z.number()),
+        retryConfig: { attempts: 0 },
+      });
+      workflow.then(seed).foreach(processItem, { concurrency: 1 }).commit();
+
+      const mastra = new Mastra({
+        logger: false,
+        storage: testStorage,
+        pubsub: new EventEmitterPubSub(),
+        workflows: { 'evented-foreach-failure-progress': workflow },
+      });
+      await mastra.startWorkers();
+
+      try {
+        const run = await workflow.createRun();
+        const first = await run.start({ inputData: {} });
+
+        expect(first.status).toBe('failed');
+        expect(executions).toEqual([1, 1]);
+
+        const result = await run.timeTravel({ step: 'evented-process-item' });
+
+        // Iteration 0 already succeeded and must not run a second time.
+        expect(executions).toEqual([1, 2]);
+        expect(result.status).toBe('success');
+      } finally {
+        await mastra.stopWorkers();
+      }
+    });
+  });
+
+  describe('non-retryable workflow failures', () => {
+    it('does not retry workflow steps that throw MastraNonRetryableError', async () => {
+      let calls = 0;
+
+      const fatalStep = createStep({
+        id: 'evented-fatal-step',
+        execute: async () => {
+          calls++;
+          throw new MastraNonRetryableError('permanent failure');
+        },
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      });
+
+      const workflow = createWorkflow({
+        id: 'evented-non-retryable-fatal-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        retryConfig: { attempts: 3, delay: 0 },
+        steps: [fatalStep],
+      });
+      workflow.then(fatalStep).commit();
+
+      const mastra = new Mastra({
+        logger: false,
+        storage: testStorage,
+        pubsub: new EventEmitterPubSub(),
+        workflows: { 'evented-non-retryable-fatal-workflow': workflow },
+      });
+      await mastra.startWorkers();
+
+      try {
+        const run = await workflow.createRun();
+        const result = await run.start({ inputData: {} });
+
+        expect(result.status).toBe('failed');
+        expect(calls).toBe(1);
+
+        const stepResult = result.steps['evented-fatal-step'];
+        expect(stepResult?.status).toBe('failed');
+        expect(stepResult?.nonRetryable).toBe(true);
+      } finally {
+        await mastra.stopWorkers();
+      }
+    });
+
+    it('does not retry nested workflows with non-retryable step failures', async () => {
+      let calls = 0;
+
+      const fatalStep = createStep({
+        id: 'evented-nested-fatal-step',
+        execute: async () => {
+          calls++;
+          throw new MastraNonRetryableError('permanent failure');
+        },
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      });
+
+      const nestedWorkflow = createWorkflow({
+        id: 'evented-nested-fatal-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        steps: [fatalStep],
+      });
+      nestedWorkflow.then(fatalStep).commit();
+
+      const workflow = createWorkflow({
+        id: 'evented-non-retryable-parent-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        retryConfig: { attempts: 3, delay: 0 },
+        steps: [nestedWorkflow],
+      });
+      workflow.then(nestedWorkflow).commit();
+
+      const mastra = new Mastra({
+        logger: false,
+        storage: testStorage,
+        pubsub: new EventEmitterPubSub(),
+        workflows: { 'evented-non-retryable-parent-workflow': workflow },
+      });
+      await mastra.startWorkers();
+
+      try {
+        const run = await workflow.createRun();
+        const result = await run.start({ inputData: {} });
+
+        expect(result.status).toBe('failed');
+        expect(calls).toBe(1);
+
+        const stepResult = result.steps['evented-nested-fatal-workflow'];
+        expect(stepResult?.status).toBe('failed');
+        expect(stepResult?.nonRetryable).toBe(true);
+      } finally {
+        await mastra.stopWorkers();
+      }
+    });
+
+    it('retries workflow steps that throw transient errors until attempts are exhausted', async () => {
+      let calls = 0;
+
+      const transientStep = createStep({
+        id: 'evented-transient-step',
+        execute: async () => {
+          calls++;
+          throw new Error('transient failure');
+        },
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      });
+
+      const workflow = createWorkflow({
+        id: 'evented-retryable-transient-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        retryConfig: { attempts: 3, delay: 0 },
+        steps: [transientStep],
+      });
+      workflow.then(transientStep).commit();
+
+      const mastra = new Mastra({
+        logger: false,
+        storage: testStorage,
+        pubsub: new EventEmitterPubSub(),
+        workflows: { 'evented-retryable-transient-workflow': workflow },
+      });
+      await mastra.startWorkers();
+
+      try {
+        const run = await workflow.createRun();
+        const result = await run.start({ inputData: {} });
+
+        expect(result.status).toBe('failed');
+        expect(calls).toBe(4);
+
+        const stepResult = result.steps['evented-transient-step'];
+        expect(stepResult?.status).toBe('failed');
+        expect(stepResult?.nonRetryable).toBeUndefined();
+      } finally {
+        await mastra.stopWorkers();
+      }
+    });
+  });
+
+  describe('resume FGA checks', () => {
+    async function createSuspendedRun({
+      fgaProvider,
+      internal = false,
+    }: {
+      fgaProvider?: {
+        require: ReturnType<typeof vi.fn>;
+        check: ReturnType<typeof vi.fn>;
+        filterAccessible: ReturnType<typeof vi.fn>;
+      };
+      internal?: boolean;
+    } = {}) {
+      const storage = new MockStore();
+      const step = createStep({
+        id: 'evented-resume-fga-step',
+        inputSchema: z.object({ value: z.string() }),
+        outputSchema: z.object({ value: z.string() }),
+        suspendSchema: z.object({ waiting: z.boolean() }),
+        resumeSchema: z.object({ approved: z.boolean() }),
+        execute: async ({ inputData, resumeData, suspend }) => {
+          if (!resumeData?.approved) await suspend({ waiting: true });
+          return inputData;
+        },
+      });
+      const workflow = createWorkflow({
+        id: `evented-resume-fga-workflow-${crypto.randomUUID()}`,
+        inputSchema: z.object({ value: z.string() }),
+        outputSchema: z.object({ value: z.string() }),
+        steps: [step],
+      });
+      workflow.then(step).commit();
+      const mastra = new Mastra({
+        logger: false,
+        storage,
+        pubsub: new EventEmitterPubSub(),
+        workflows: { [workflow.id]: workflow },
+        server: fgaProvider ? { fga: fgaProvider } : undefined,
+      });
+      if (internal) mastra.__registerInternalWorkflow(workflow);
+      await mastra.startWorkers();
+      const run = await workflow.createRun({ resourceId: 'tenant-1' });
+      const startResult = await run.start({
+        inputData: { value: 'ok' },
+        actor: { actorKind: 'system', sourceWorkflow: 'test-setup' },
+      });
+      if (startResult.status === 'failed') throw startResult.error;
+      expect(startResult).toMatchObject({ status: 'suspended' });
+      return { mastra, run, workflow };
+    }
+
+    it('checks workflows:execute when resuming a run', async () => {
+      const fgaProvider = { require: vi.fn(), check: vi.fn(), filterAccessible: vi.fn() };
+      const { mastra, run, workflow } = await createSuspendedRun({ fgaProvider });
+      const requestContext = new RequestContext();
+      requestContext.set('user', { id: 'user-1' });
+      try {
+        await run.resume({ resumeData: { approved: true }, requestContext });
+        expect(fgaProvider.require).toHaveBeenCalledWith(
+          { id: 'user-1' },
+          expect.objectContaining({
+            resource: { type: 'workflow', id: workflow.id },
+            permission: 'workflows:execute',
+            context: expect.objectContaining({ resourceId: 'tenant-1', requestContext }),
+          }),
+        );
+      } finally {
+        await mastra.stopWorkers();
+      }
+    });
+
+    it('fails closed on resume when no user or trusted actor is available', async () => {
+      const fgaProvider = { require: vi.fn(), check: vi.fn(), filterAccessible: vi.fn() };
+      const { mastra, run } = await createSuspendedRun({ fgaProvider });
+      try {
+        await expect(run.resume({ resumeData: { approved: true } })).rejects.toThrow('authenticated user is required');
+        expect(fgaProvider.require).not.toHaveBeenCalled();
+      } finally {
+        await mastra.stopWorkers();
+      }
+    });
+
+    it('supports trusted actors on resume', async () => {
+      const fgaProvider = { require: vi.fn(), check: vi.fn(), filterAccessible: vi.fn() };
+      const { mastra, run } = await createSuspendedRun({ fgaProvider });
+      try {
+        const requestContext = new RequestContext();
+        requestContext.set('organizationId', 'org-1');
+        await expect(
+          run.resume({
+            resumeData: { approved: true },
+            requestContext,
+            actor: { actorKind: 'system', sourceWorkflow: 'agentic-loop' },
+          }),
+        ).resolves.toMatchObject({ status: 'success' });
+        expect(fgaProvider.require).not.toHaveBeenCalled();
+      } finally {
+        await mastra.stopWorkers();
+      }
+    });
+
+    it('allows resume without an FGA provider', async () => {
+      const { mastra, run } = await createSuspendedRun();
+      try {
+        await expect(run.resume({ resumeData: { approved: true } })).resolves.toMatchObject({ status: 'success' });
+      } finally {
+        await mastra.stopWorkers();
+      }
+    });
+
+    it('allows internal workflow resumes without an end-user identity', async () => {
+      const fgaProvider = { require: vi.fn(), check: vi.fn(), filterAccessible: vi.fn() };
+      const { mastra, run } = await createSuspendedRun({ fgaProvider, internal: true });
+      try {
+        await expect(run.resume({ resumeData: { approved: true } })).resolves.toMatchObject({ status: 'success' });
+        expect(fgaProvider.require).not.toHaveBeenCalled();
+      } finally {
+        await mastra.stopWorkers();
+      }
+    });
   });
 });

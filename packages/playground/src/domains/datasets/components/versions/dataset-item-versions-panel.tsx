@@ -1,6 +1,10 @@
 'use client';
 
-import { Button, ButtonWithTooltip, ButtonsGroup, Checkbox, Column, ItemList } from '@mastra/playground-ui';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { ButtonsGroup } from '@mastra/playground-ui/components/ButtonsGroup';
+import { Checkbox } from '@mastra/playground-ui/components/Checkbox';
+import { Column } from '@mastra/playground-ui/components/Columns';
+import { getItemListVersionStatusLabel, ItemList } from '@mastra/playground-ui/components/ItemList';
 import { GitCompareIcon } from 'lucide-react';
 import { useState } from 'react';
 import { useDatasetItemVersions } from '../../hooks/use-dataset-item-versions';
@@ -15,9 +19,6 @@ export interface DatasetItemVersionsPanelProps {
   activeVersion?: number | null;
 }
 
-/**
- * Panel showing dataset item version history.
- */
 export function DatasetItemVersionsPanel({
   datasetId,
   itemId,
@@ -73,18 +74,18 @@ export function DatasetItemVersionsPanel({
   return (
     <Column className="min-w-56">
       {isSelectionActive ? (
-        <Column.Toolbar className="grid justify-stretch gap-3 w-full">
+        <Column.Toolbar className="grid w-full justify-stretch gap-3">
           <ButtonsGroup>
             <Button onClick={handleCancelSelection}>Cancel</Button>
-            <ButtonWithTooltip
+            <Button
               variant="primary"
               disabled={selectedIds.size !== 2}
               onClick={handleExecuteCompare}
-              tooltipContent={selectedIds.size !== 2 ? 'Check 2 versions to compare' : undefined}
+              tooltip={selectedIds.size !== 2 ? 'Check 2 versions to compare' : undefined}
               className="grow"
             >
               Compare
-            </ButtonWithTooltip>
+            </Button>
           </ButtonsGroup>
         </Column.Toolbar>
       ) : (
@@ -140,6 +141,10 @@ export function DatasetItemVersionsPanel({
                       isFeatured={isVersionSelected(item)}
                       onClick={() => handleVersionClick(item)}
                       className="py-2"
+                      tooltip={getItemListVersionStatusLabel({
+                        isLatest: item.isLatest,
+                        isDeleted: item.isDeleted,
+                      })}
                     >
                       <ItemList.VersionCell
                         version={item.datasetVersion}

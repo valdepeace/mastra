@@ -4,9 +4,9 @@ import { z } from 'zod/v4';
 import type { MessageList } from '../../../agent/message-list';
 import { RequestContext } from '../../../request-context';
 import { ToolStream } from '../../../tools/stream';
-import { createStep } from '../../../workflows';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '../../../workflows/constants';
 import type { ExecuteFunctionParams } from '../../../workflows/step';
+import { createStep } from '../../../workflows/workflow';
 import { createLLMMappingStep } from './llm-mapping-step';
 
 type ToolCallOutput = {
@@ -15,8 +15,10 @@ type ToolCallOutput = {
   args: Record<string, any>;
   result?: any;
   error?: Error;
+  aborted?: boolean;
   providerMetadata?: Record<string, any>;
   providerExecuted?: boolean;
+  approval?: { id: string; approved: boolean; reason?: string };
 };
 
 describe('createLLMMappingStep HITL behavior', () => {
@@ -212,8 +214,113 @@ describe('createLLMMappingStep HITL behavior', () => {
     // Assert: Should bail (suspend execution) because updateSummary needs HITL
     expect(bail).toHaveBeenCalled();
     expect(result.stepResult.isContinued).toBe(false);
-    // Should NOT emit tool-result chunks
-    expect(controller.enqueue).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'tool-result' }));
+    // ...but the tool that DID resolve must still be streamed and persisted before bailing,
+    // otherwise its result is lost for good (issue #21637).
+    expect(controller.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'tool-result', payload: expect.objectContaining({ toolCallId: 'call-1' }) }),
+    );
+    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolInvocation: expect.objectContaining({ toolCallId: 'call-1', state: 'result' }),
+      }),
+    );
+    // The still-pending tool must not be recorded or emitted.
+    expect(controller.enqueue).not.toHaveBeenCalledWith(
+      expect.objectContaining({ payload: expect.objectContaining({ toolCallId: 'call-2' }) }),
+    );
+    expect(messageList.updateToolInvocation).not.toHaveBeenCalledWith(
+      expect.objectContaining({ toolInvocation: expect.objectContaining({ toolCallId: 'call-2' }) }),
+    );
+  });
+
+  it('should flush a completed server tool result before bailing for a pending client tool (#21637)', async () => {
+    // The reporter's scenario: the model calls a server-side tool (createTool with execute)
+    // and a client-side tool (forwarded via toolsets, no execute) in the same step. The
+    // server tool finishes before the stream closes; its result must reach the client and
+    // the message list, or the client waits forever on an `input-available` part that never
+    // resolves and history claims the tool never ran.
+    const inputData: ToolCallOutput[] = [
+      {
+        toolCallId: 'call-server',
+        toolName: 'get_record',
+        args: { id: '42' },
+        result: { record: { id: '42', name: 'Acme' } },
+      },
+      {
+        toolCallId: 'call-client',
+        toolName: 'get_record_status',
+        args: { id: '42' },
+        result: undefined, // resolved later by the browser
+      },
+    ];
+
+    const result = await llmMappingStep.execute(createExecuteParams(inputData));
+
+    // The completed server tool is streamed as a terminal result...
+    expect(controller.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'tool-result',
+        payload: expect.objectContaining({
+          toolCallId: 'call-server',
+          toolName: 'get_record',
+          result: { record: { id: '42', name: 'Acme' } },
+        }),
+      }),
+    );
+    // ...and committed to history so a later turn knows it ran.
+    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolInvocation: expect.objectContaining({
+          toolCallId: 'call-server',
+          state: 'result',
+          result: { record: { id: '42', name: 'Acme' } },
+        }),
+      }),
+    );
+    // The turn still ends so the pending client tool can be resolved by the client.
+    expect(bail).toHaveBeenCalled();
+    expect(result.stepResult.isContinued).toBe(false);
+  });
+
+  it('should enqueue tool-output-denied when a requireApproval tool is declined (#20880)', async () => {
+    const inputData: ToolCallOutput[] = [
+      {
+        toolCallId: 'call-denied',
+        toolName: 'sensitive-op',
+        args: { action: 'delete' },
+        result: undefined,
+        approval: {
+          id: 'approval-1',
+          approved: false,
+          reason: 'Tool call was not approved by the user',
+        },
+      },
+    ];
+
+    const result = await llmMappingStep.execute(createExecuteParams(inputData));
+
+    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'tool-invocation',
+        toolInvocation: expect.objectContaining({
+          state: 'output-denied',
+          toolCallId: 'call-denied',
+          toolName: 'sensitive-op',
+          approval: expect.objectContaining({ approved: false }),
+        }),
+      }),
+    );
+    expect(controller.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'tool-output-denied',
+        payload: expect.objectContaining({
+          toolCallId: 'call-denied',
+          toolName: 'sensitive-op',
+          approval: expect.objectContaining({ approved: false }),
+        }),
+      }),
+    );
+    expect(result.stepResult.isContinued).toBe(true);
   });
 
   it('should emit tool-error for tools with errors and continue the loop for self-recovery', async () => {
@@ -244,6 +351,112 @@ describe('createLLMMappingStep HITL behavior', () => {
     // Should NOT bail — the agentic loop should continue so the model can see the error and retry
     expect(bail).not.toHaveBeenCalled();
     expect(result.stepResult.isContinued).toBe(true);
+    // Should record the failure as `output-error` with the message in `errorText`,
+    // not as a successful `result`, so it stays distinguishable on recall/replay.
+    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'tool-invocation',
+        toolInvocation: expect.objectContaining({
+          state: 'output-error',
+          toolCallId: 'call-1',
+          toolName: 'brokenTool',
+          errorText: 'Tool execution failed',
+        }),
+      }),
+    );
+  });
+
+  it('should NOT record a result and should bail when a tool was aborted (no fabricated success)', async () => {
+    // An `aborted` tool (cancelled by request abort) has no result/error. It must not be
+    // recorded as a result, emit a tool-error, or be mistaken for a pending HITL tool —
+    // the loop bails, leaving the call incomplete.
+    const inputData: ToolCallOutput[] = [
+      {
+        toolCallId: 'call-1',
+        toolName: 'slowServerTool',
+        args: { q: 'important' },
+        result: undefined,
+        aborted: true,
+      },
+    ];
+
+    const result = await llmMappingStep.execute(createExecuteParams(inputData));
+
+    // No fabricated success: the message history is never updated with a result for the
+    // aborted call (this is what gets persisted, so it is the meaningful assertion).
+    expect(messageList.updateToolInvocation).not.toHaveBeenCalled();
+    // No result/error chunks emitted for the aborted call.
+    expect(controller.enqueue).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'tool-result' }));
+    expect(controller.enqueue).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'tool-error' }));
+    // The loop ends rather than continuing or suspending for input that will never arrive.
+    expect(bail).toHaveBeenCalled();
+    expect(result.stepResult.isContinued).toBe(false);
+  });
+
+  it('should not let an aborted tool force a suspend when a real error needs the loop to continue', async () => {
+    // An aborted tool is neither a retryable error nor a pending HITL call. Sharing a turn
+    // with a genuinely errored tool, it must not be misclassified as pending HITL and
+    // suppress the loop continuation that lets the model recover from the real error.
+    const inputData: ToolCallOutput[] = [
+      {
+        toolCallId: 'aborted-1',
+        toolName: 'slowServerTool',
+        args: { q: 'important' },
+        result: undefined,
+        aborted: true,
+      },
+      {
+        toolCallId: 'err-1',
+        toolName: 'brokenTool',
+        args: { param: 'test' },
+        result: undefined,
+        error: new Error('Tool execution failed'),
+      },
+    ];
+
+    const result = await llmMappingStep.execute(createExecuteParams(inputData));
+
+    // The real error is surfaced and the loop continues (self-recovery), rather than bailing.
+    expect(bail).not.toHaveBeenCalled();
+    expect(result.stepResult.isContinued).toBe(true);
+    expect(controller.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'tool-error', payload: expect.objectContaining({ toolCallId: 'err-1' }) }),
+    );
+    // The aborted tool itself is never recorded as a result.
+    expect(messageList.updateToolInvocation).not.toHaveBeenCalledWith(
+      expect.objectContaining({ toolInvocation: expect.objectContaining({ toolCallId: 'aborted-1' }) }),
+    );
+  });
+
+  it('should keep a pending client tool suspendable while NOT recording an aborted server tool', async () => {
+    // The reporter's scenario: a server tool aborted in the same turn as a pending client
+    // (HITL) tool. The client tool must still drive the bail/suspend (so it can resume via
+    // addToolOutput), but the aborted server tool must not be recorded as a result.
+    const inputData: ToolCallOutput[] = [
+      {
+        toolCallId: 'srv-1',
+        toolName: 'slowServerTool',
+        args: { q: 'important' },
+        result: undefined,
+        aborted: true,
+      },
+      {
+        toolCallId: 'cli-1',
+        toolName: 'clientTool',
+        args: { topic: 'x' },
+        result: undefined, // pending HITL, resolved later from the browser
+      },
+    ];
+
+    const result = await llmMappingStep.execute(createExecuteParams(inputData));
+
+    // Bail (suspend) so the pending client tool can be resumed.
+    expect(bail).toHaveBeenCalled();
+    expect(result.stepResult.isContinued).toBe(false);
+    // The aborted server tool is never recorded as a result, and no error/result chunk is emitted.
+    expect(messageList.updateToolInvocation).not.toHaveBeenCalled();
+    expect(controller.enqueue).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'tool-result' }));
+    expect(controller.enqueue).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'tool-error' }));
   });
 
   it('should continue the agentic loop (not bail) when all errors are tool-not-found', async () => {
@@ -1002,6 +1215,131 @@ describe('createLLMMappingStep toModelOutput', () => {
         }),
       }),
     );
+
+    // The emitted tool-result chunk should also carry modelOutput on providerMetadata
+    // so harness consumers (e.g. mastracode TUI) can read it without going through the messageList.
+    expect(controller.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'tool-result',
+        payload: expect.objectContaining({
+          toolCallId: 'call-1',
+          providerMetadata: expect.objectContaining({
+            mastra: expect.objectContaining({
+              modelOutput: {
+                type: 'text',
+                value: 'Transformed: {"temperature":72,"conditions":"sunny"}',
+              },
+            }),
+          }),
+        }),
+      }),
+    );
+  });
+
+  it('should preserve media parts in toModelOutput', async () => {
+    const toModelOutputMock = vi.fn(() => ({
+      type: 'content',
+      value: [
+        { type: 'media', data: 'base64png', mediaType: 'image/png' },
+        { type: 'media', data: 'base64pdf', mediaType: 'application/pdf' },
+        { type: 'text', text: 'caption' },
+      ],
+    }));
+
+    const llmMappingStep = createLLMMappingStep(
+      {
+        models: {} as any,
+        controller,
+        messageList,
+        runId: 'test-run',
+        _internal: { generateId: () => 'test-message-id' },
+        tools: {
+          screenshot: {
+            execute: async () => ({ base64: 'abc' }),
+            toModelOutput: toModelOutputMock,
+            inputSchema: z.object({}),
+          },
+        },
+      } as any,
+      llmExecutionStep,
+    );
+
+    const inputData: ToolCallOutput[] = [
+      {
+        toolCallId: 'call-1',
+        toolName: 'screenshot',
+        args: {},
+        result: { base64: 'abc' },
+      },
+    ];
+
+    await llmMappingStep.execute(createExecuteParams(inputData));
+
+    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        providerMetadata: expect.objectContaining({
+          mastra: expect.objectContaining({
+            modelOutput: {
+              type: 'content',
+              value: [
+                { type: 'media', data: 'base64png', mediaType: 'image/png' },
+                { type: 'media', data: 'base64pdf', mediaType: 'application/pdf' },
+                { type: 'text', text: 'caption' },
+              ],
+            },
+          }),
+        }),
+      }),
+    );
+  });
+
+  it('should not throw when toModelOutput returns malformed content entries', async () => {
+    const toModelOutputMock = vi.fn(() => ({
+      type: 'content',
+      value: [null, undefined, 'not-an-object', { type: 'media', data: 'abc', mediaType: 'image/png' }],
+    }));
+
+    const llmMappingStep = createLLMMappingStep(
+      {
+        models: {} as any,
+        controller,
+        messageList,
+        runId: 'test-run',
+        _internal: { generateId: () => 'test-message-id' },
+        tools: {
+          screenshot: {
+            execute: async () => ({ base64: 'abc' }),
+            toModelOutput: toModelOutputMock,
+            inputSchema: z.object({}),
+          },
+        },
+      } as any,
+      llmExecutionStep,
+    );
+
+    const inputData: ToolCallOutput[] = [
+      {
+        toolCallId: 'call-1',
+        toolName: 'screenshot',
+        args: {},
+        result: { base64: 'abc' },
+      },
+    ];
+
+    await expect(llmMappingStep.execute(createExecuteParams(inputData))).resolves.not.toThrow();
+
+    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        providerMetadata: expect.objectContaining({
+          mastra: expect.objectContaining({
+            modelOutput: {
+              type: 'content',
+              value: [null, undefined, 'not-an-object', { type: 'media', data: 'abc', mediaType: 'image/png' }],
+            },
+          }),
+        }),
+      }),
+    );
   });
 
   it('should NOT call toModelOutput for tools without it defined', async () => {
@@ -1194,5 +1532,199 @@ describe('createLLMMappingStep toModelOutput', () => {
 
     // toModelOutput should NOT be called for undefined results
     expect(toModelOutputMock).not.toHaveBeenCalled();
+  });
+
+  // ---- MAPPING span coverage (issue #15486) ----
+
+  type MockChildSpan = {
+    createOptions: any;
+    endOptions?: any;
+    errorOptions?: any;
+    ended: boolean;
+    errored: boolean;
+    end: Mock;
+    error: Mock;
+  };
+
+  function createMockParentSpan() {
+    const childSpans: MockChildSpan[] = [];
+    const parentSpan: any = {
+      createChildSpan: vi.fn((opts: any) => {
+        const child: MockChildSpan = {
+          createOptions: opts,
+          ended: false,
+          errored: false,
+          end: vi.fn(),
+          error: vi.fn(),
+        };
+        child.end = vi.fn((endOpts: any) => {
+          child.endOptions = endOpts;
+          child.ended = true;
+        }) as any;
+        child.error = vi.fn((errOpts: any) => {
+          child.errorOptions = errOpts;
+          child.errored = true;
+        }) as any;
+        childSpans.push(child);
+        return child;
+      }),
+    };
+    return { parentSpan, childSpans };
+  }
+
+  it('should emit a MAPPING child span when toModelOutput is defined and runs', async () => {
+    const { parentSpan, childSpans } = createMockParentSpan();
+    const toModelOutputMock = vi.fn((output: any) => ({ type: 'text', value: output.temperature }));
+
+    const llmMappingStep = createLLMMappingStep(
+      {
+        models: {} as any,
+        controller,
+        messageList,
+        runId: 'test-run',
+        _internal: { generateId: () => 'test-message-id' },
+        tools: {
+          weather: {
+            execute: async () => ({ temperature: 72 }),
+            toModelOutput: toModelOutputMock,
+            inputSchema: z.object({}),
+          },
+        },
+        modelSpanTracker: {
+          getTracingContext: () => ({ currentSpan: parentSpan }),
+        },
+      } as any,
+      llmExecutionStep,
+    );
+
+    const inputData: ToolCallOutput[] = [
+      { toolCallId: 'call-1', toolName: 'weather', args: {}, result: { temperature: 72 } },
+    ];
+
+    await llmMappingStep.execute(createExecuteParams(inputData));
+
+    expect(parentSpan.createChildSpan).toHaveBeenCalledTimes(1);
+    expect(childSpans).toHaveLength(1);
+    const [span] = childSpans;
+    expect(span.createOptions).toMatchObject({
+      type: 'mapping',
+      name: "tool output mapping: 'weather'",
+      entityType: 'tool',
+      entityId: 'weather',
+      entityName: 'weather',
+      input: { temperature: 72 },
+      attributes: {
+        mappingType: 'toModelOutput',
+        toolCallId: 'call-1',
+      },
+    });
+    expect(span.ended).toBe(true);
+    expect(span.endOptions).toEqual({ output: { type: 'text', value: 72 } });
+    expect(span.errored).toBe(false);
+  });
+
+  it('should NOT emit a MAPPING span when the tool has no toModelOutput', async () => {
+    const { parentSpan, childSpans } = createMockParentSpan();
+
+    const llmMappingStep = createLLMMappingStep(
+      {
+        models: {} as any,
+        controller,
+        messageList,
+        runId: 'test-run',
+        _internal: { generateId: () => 'test-message-id' },
+        tools: {
+          plain: {
+            execute: async () => ({ temperature: 72 }),
+            inputSchema: z.object({}),
+          },
+        },
+        modelSpanTracker: {
+          getTracingContext: () => ({ currentSpan: parentSpan }),
+        },
+      } as any,
+      llmExecutionStep,
+    );
+
+    const inputData: ToolCallOutput[] = [
+      { toolCallId: 'call-1', toolName: 'plain', args: {}, result: { temperature: 72 } },
+    ];
+
+    await llmMappingStep.execute(createExecuteParams(inputData));
+
+    expect(parentSpan.createChildSpan).not.toHaveBeenCalled();
+    expect(childSpans).toHaveLength(0);
+  });
+
+  it('should NOT emit a MAPPING span when tool result is null/undefined even if toModelOutput is defined', async () => {
+    const { parentSpan, childSpans } = createMockParentSpan();
+
+    const llmMappingStep = createLLMMappingStep(
+      {
+        models: {} as any,
+        controller,
+        messageList,
+        runId: 'test-run',
+        _internal: { generateId: () => 'test-message-id' },
+        tools: {
+          hitlTool: {
+            toModelOutput: vi.fn(),
+            inputSchema: z.object({}),
+          },
+        },
+        modelSpanTracker: {
+          getTracingContext: () => ({ currentSpan: parentSpan }),
+        },
+      } as any,
+      llmExecutionStep,
+    );
+
+    const inputData: ToolCallOutput[] = [{ toolCallId: 'call-1', toolName: 'hitlTool', args: {}, result: undefined }];
+
+    await llmMappingStep.execute(createExecuteParams(inputData));
+
+    expect(parentSpan.createChildSpan).not.toHaveBeenCalled();
+    expect(childSpans).toHaveLength(0);
+  });
+
+  it('should mark the MAPPING span as errored and re-throw when toModelOutput throws', async () => {
+    const { parentSpan, childSpans } = createMockParentSpan();
+    const failure = new Error('transform failed');
+    const toModelOutputMock = vi.fn(() => {
+      throw failure;
+    });
+
+    const llmMappingStep = createLLMMappingStep(
+      {
+        models: {} as any,
+        controller,
+        messageList,
+        runId: 'test-run',
+        _internal: { generateId: () => 'test-message-id' },
+        tools: {
+          broken: {
+            execute: async () => ({ data: 'raw' }),
+            toModelOutput: toModelOutputMock,
+            inputSchema: z.object({}),
+          },
+        },
+        modelSpanTracker: {
+          getTracingContext: () => ({ currentSpan: parentSpan }),
+        },
+      } as any,
+      llmExecutionStep,
+    );
+
+    const inputData: ToolCallOutput[] = [
+      { toolCallId: 'call-1', toolName: 'broken', args: {}, result: { data: 'raw' } },
+    ];
+
+    await expect(llmMappingStep.execute(createExecuteParams(inputData))).rejects.toBe(failure);
+
+    expect(childSpans).toHaveLength(1);
+    const [span] = childSpans;
+    expect(span.ended).toBe(false);
+    expect(span.errored).toBe(true);
+    expect(span.errorOptions).toEqual({ error: failure, endSpan: true });
   });
 });

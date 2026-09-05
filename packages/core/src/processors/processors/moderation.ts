@@ -6,7 +6,8 @@ import { TripWire } from '../../agent/trip-wire';
 import type { ProviderOptions } from '../../llm/model/provider-options';
 import type { MastraModelConfig } from '../../llm/model/shared.types';
 import type { ObservabilityContext } from '../../observability';
-import { resolveObservabilityContext } from '../../observability';
+import { InternalSpans, resolveObservabilityContext } from '../../observability';
+import type { RequestContext } from '../../request-context';
 import type { PublicSchema } from '../../schema';
 import { toStandardSchema, standardSchemaToJSONSchema } from '../../schema';
 import type { ChunkType } from '../../stream';
@@ -157,6 +158,9 @@ export class ModerationProcessor implements Processor<'moderation'> {
       name: 'Content Moderator',
       instructions: options.instructions || this.createDefaultInstructions(),
       model: options.model,
+      options: {
+        tracingPolicy: { internal: InternalSpans.ALL },
+      },
     });
   }
 
@@ -164,10 +168,11 @@ export class ModerationProcessor implements Processor<'moderation'> {
     args: {
       messages: MastraDBMessage[];
       abort: (reason?: string) => never;
+      requestContext?: RequestContext;
     } & Partial<ObservabilityContext>,
   ): Promise<MastraDBMessage[]> {
     try {
-      const { messages, abort, ...rest } = args;
+      const { messages, abort, requestContext, ...rest } = args;
       const observabilityContext = resolveObservabilityContext(rest);
 
       if (messages.length === 0) {
@@ -192,7 +197,7 @@ export class ModerationProcessor implements Processor<'moderation'> {
           continue;
         }
 
-        const moderationResult = await this.moderateContent(textContent, false, observabilityContext);
+        const moderationResult = await this.moderateContent(textContent, false, observabilityContext, requestContext);
         results.push(moderationResult);
 
         if (this.isModerationFlagged(moderationResult)) {
@@ -220,6 +225,7 @@ export class ModerationProcessor implements Processor<'moderation'> {
     args: {
       messages: MastraDBMessage[];
       abort: (reason?: string) => never;
+      requestContext?: RequestContext;
     } & Partial<ObservabilityContext>,
   ): Promise<MastraDBMessage[]> {
     return this.processInput(args);
@@ -231,10 +237,11 @@ export class ModerationProcessor implements Processor<'moderation'> {
       streamParts: ChunkType[];
       state: Record<string, any>;
       abort: (reason?: string) => never;
+      requestContext?: RequestContext;
     } & Partial<ObservabilityContext>,
   ): Promise<ChunkType | null | undefined> {
     try {
-      const { part, streamParts, abort, ...rest } = args;
+      const { part, streamParts, abort, requestContext, ...rest } = args;
       const observabilityContext = resolveObservabilityContext(rest);
 
       // Only process text-delta chunks for moderation
@@ -245,7 +252,12 @@ export class ModerationProcessor implements Processor<'moderation'> {
       // Build context from chunks based on chunkWindow (streamParts includes the current part)
       const contentToModerate = this.buildContextFromChunks(streamParts);
 
-      const moderationResult = await this.moderateContent(contentToModerate, true, observabilityContext);
+      const moderationResult = await this.moderateContent(
+        contentToModerate,
+        true,
+        observabilityContext,
+        requestContext,
+      );
 
       if (this.isModerationFlagged(moderationResult)) {
         this.handleFlaggedContent(moderationResult, this.strategy, abort);
@@ -274,11 +286,12 @@ export class ModerationProcessor implements Processor<'moderation'> {
     content: string,
     isStream = false,
     observabilityContext?: ObservabilityContext,
+    requestContext?: RequestContext,
   ): Promise<ModerationResult> {
     const prompt = this.createModerationPrompt(content, isStream);
 
     try {
-      const model = await this.moderationAgent.getModel();
+      const model = await this.moderationAgent.getModel({ requestContext });
       const schema = z.object({
         category_scores: z
           .array(
@@ -309,6 +322,7 @@ export class ModerationProcessor implements Processor<'moderation'> {
             temperature: 0,
           },
           providerOptions: this.providerOptions,
+          requestContext,
           ...observabilityContext,
         });
 
@@ -322,6 +336,7 @@ export class ModerationProcessor implements Processor<'moderation'> {
           output: standardSchemaToJSONSchema(standardSchema),
           temperature: 0,
           providerOptions: this.providerOptions as SharedV2ProviderOptions,
+          requestContext,
           ...observabilityContext,
         });
 

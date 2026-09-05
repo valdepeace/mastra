@@ -2,7 +2,7 @@ import { z } from 'zod/v4';
 import { createTool } from '../../tools';
 import { WORKSPACE_TOOLS } from '../constants';
 import { SandboxFeatureNotSupportedError } from '../errors';
-import { emitWorkspaceMetadata, requireSandbox } from './helpers';
+import { emitWorkspaceMetadata, getDynamicSandboxCacheKeyHint, requireSandbox } from './helpers';
 import { truncateOutput, sandboxToModelOutput } from './output-helpers';
 import { startWorkspaceSpan } from './tracing';
 
@@ -14,6 +14,7 @@ export const killProcessTool = createTool({
 
 Use this to stop a long-running background process that was started with execute_command (background: true). Returns the last ${KILL_TAIL_LINES} lines of output.`,
   toModelOutput: sandboxToModelOutput,
+  outputSchema: z.string(),
   inputSchema: z.object({
     pid: z.string().describe('The process ID of the background process to kill'),
   }),
@@ -53,7 +54,7 @@ Use this to stop a long-running background process that was started with execute
           data: { exitCode: handle?.exitCode ?? -1, success: false, killed: false, toolCallId },
         });
         span.end({ success: false });
-        return `Process ${pid} was not found or had already exited.`;
+        return `Process ${pid} was not found or had already exited.${getDynamicSandboxCacheKeyHint(workspace)}`;
       }
 
       await context?.writer?.custom({

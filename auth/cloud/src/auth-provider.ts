@@ -11,14 +11,15 @@ import type {
   IUserProvider,
   ISSOProvider,
   ISessionProvider,
+  MastraAuthRequest,
   Session,
   SSOCallbackResult,
   SSOLoginConfig,
-} from '@mastra/core/auth';
-import type { EEUser } from '@mastra/core/auth/ee';
-import type { MastraAuthProviderOptions } from '@mastra/core/server';
-import { MastraAuthProvider } from '@mastra/core/server';
-import type { HonoRequest } from 'hono';
+} from '@internal/auth';
+import { getRequestHeader } from '@internal/auth';
+import type { EEUser } from '@internal/auth/ee';
+import type { MastraAuthProviderOptions } from '@internal/auth/provider';
+import { MastraAuthProvider } from '@internal/auth/provider';
 
 import { MastraCloudAuth } from './client';
 import { parseSessionCookie } from './session/cookie';
@@ -109,14 +110,12 @@ export class MastraCloudAuthProvider
    * Checks session cookie first, falls back to bearer token for API clients.
    *
    * @param token - Bearer token (from Authorization header)
-   * @param request - Hono or raw Request
+   * @param request - Request used for cookie access
    * @returns Authenticated user with role, or null if invalid
    */
-  async authenticateToken(token: string, request: HonoRequest | Request): Promise<CloudUser | null> {
+  async authenticateToken(token: string, request: MastraAuthRequest): Promise<CloudUser | null> {
     try {
-      // Get raw Request for cookie access
-      const rawRequest = 'raw' in request ? request.raw : request;
-      const cookieHeader = rawRequest.headers.get('cookie');
+      const cookieHeader = getRequestHeader(request, 'cookie');
 
       // Parse session token from cookie
       const sessionToken = parseSessionCookie(cookieHeader);
@@ -158,10 +157,11 @@ export class MastraCloudAuthProvider
   // ============================================================================
 
   /**
-   * Cached login result for getLoginCookies() to retrieve cookies.
+   * Cached login results for getLoginCookies() to retrieve cookies.
+   * Keyed by the OAuth state parameter to prevent race conditions.
    * @internal
    */
-  private _lastLoginResult: { url: string; cookies: string[] } | null = null;
+  private _loginResults = new Map<string, { url: string; cookies: string[] }>();
 
   /**
    * Get URL to redirect user to for SSO login.
@@ -195,8 +195,14 @@ export class MastraCloudAuthProvider
       requestOrigin: origin,
     });
 
-    // Cache result for getLoginCookies() to retrieve
-    this._lastLoginResult = result;
+    // Clean up old entries if map grows too large to prevent memory leaks
+    if (this._loginResults.size > 100) {
+      const firstKey = this._loginResults.keys().next().value;
+      if (firstKey) this._loginResults.delete(firstKey);
+    }
+
+    // Cache result by state for getLoginCookies() to retrieve
+    this._loginResults.set(state, result);
 
     return result.url;
   }
@@ -205,12 +211,17 @@ export class MastraCloudAuthProvider
    * Get cookies to set during login redirect (PKCE verifier).
    * Must be called after getLoginUrl() in same request.
    *
+   * @param _redirectUri - OAuth callback URL
+   * @param state - State parameter
    * @returns Array of Set-Cookie header values
    */
-  getLoginCookies(): string[] | undefined {
-    const cookies = this._lastLoginResult?.cookies;
-    this._lastLoginResult = null; // Clear after retrieval
-    return cookies;
+  getLoginCookies(_redirectUri: string, state: string): string[] | undefined {
+    const result = this._loginResults.get(state);
+    if (result) {
+      this._loginResults.delete(state); // Clear after retrieval
+      return result.cookies;
+    }
+    return undefined;
   }
 
   /**

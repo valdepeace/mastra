@@ -9,6 +9,7 @@
 import type { IMastraLogger } from '../../logger';
 import type { Mastra } from '../../mastra';
 import type { RequestContext } from '../../request-context';
+import type { ClientObservabilityProxy } from './client';
 import type { FeedbackEvent, FeedbackInput } from './feedback';
 import type { LoggerContext, LogEvent } from './logging';
 import type { MetricsContext, MetricEvent } from './metrics';
@@ -122,7 +123,7 @@ export interface ObservabilityContext {
 // ============================================================================
 
 /** Where a registered definition came from. */
-export type DefinitionSource = 'code' | 'stored';
+export type DefinitionSource = 'code' | 'stored' | 'fs';
 
 /** What kind of scoring flow produced the score. */
 export type ScorerScoreSource = 'live' | 'trace' | 'experiment';
@@ -160,6 +161,33 @@ export interface ObservabilityEventBus<TEvent> {
  * Used by the unified ObservabilityBus that handles all signals.
  */
 export type ObservabilityEvent = TracingEvent | LogEvent | MetricEvent | ScoreEvent | FeedbackEvent;
+
+/** Signal whose event was dropped by the observability exporter pipeline. */
+export type ObservabilityDropSignal = 'tracing' | 'log' | 'metric' | 'score' | 'feedback';
+
+/** Reason an observability event was dropped by the exporter pipeline. */
+export type ObservabilityDropReason = 'unsupported-storage' | 'retry-exhausted';
+
+/** Sanitized error details for observability drop events. */
+export interface ObservabilityDropError {
+  id?: string;
+  domain?: string;
+  message: string;
+}
+
+/**
+ * Structured event emitted when the exporter pipeline drops observability events.
+ */
+export interface ObservabilityDropEvent {
+  type: 'drop';
+  signal: ObservabilityDropSignal;
+  reason: ObservabilityDropReason;
+  count: number;
+  timestamp: Date;
+  exporterName: string;
+  storageName?: string;
+  error?: ObservabilityDropError;
+}
 
 // ============================================================================
 // ObservabilityInstance
@@ -281,6 +309,8 @@ export interface ObservabilityInstance {
 // ============================================================================
 
 export interface ObservabilityEntrypoint {
+  flush(): Promise<void>;
+
   shutdown(): Promise<void>;
 
   setMastraContext(options: { mastra: Mastra }): void;
@@ -326,6 +356,18 @@ export interface ObservabilityEntrypoint {
     correlationContext?: CorrelationContext;
     feedback: FeedbackInput;
   }): Promise<void>;
+
+  /**
+   * Returns the proxy responsible for client observability (W3C trace
+   * context injection + OTLP/JSON payload reception for spans/logs
+   * returned from client-side execution).
+   *
+   * Returns `undefined` when no implementation is registered (e.g.
+   * `NoOpObservability`, or when `@mastra/observability` is not
+   * installed). Callers must treat `undefined` as "no cross-boundary
+   * client observability" and skip inject/receive accordingly.
+   */
+  getClientObservabilityProxy?(): ClientObservabilityProxy | undefined;
 
   // Registry management methods
   registerInstance(name: string, instance: ObservabilityInstance, isDefault?: boolean): void;
@@ -507,6 +549,7 @@ export type ConfigSelector = (
 export interface InitExporterOptions {
   mastra?: Mastra;
   config?: ObservabilityInstanceConfig;
+  emitDropEvent?: (event: ObservabilityDropEvent) => void;
 }
 
 export interface InitBridgeOptions {
@@ -532,6 +575,9 @@ export interface ObservabilityEvents {
 
   /** Handle feedback events */
   onFeedbackEvent?(event: FeedbackEvent): void | Promise<void>;
+
+  /** Handle exporter pipeline droppedEvent */
+  onDroppedEvent?(event: ObservabilityDropEvent): void | Promise<void>;
 
   /** Export tracing events */
   exportTracingEvent(event: TracingEvent): Promise<void>;
@@ -623,6 +669,22 @@ export interface ObservabilityBridge extends ObservabilityEvents {
    * @returns Span identifiers (spanId, traceId, parentSpanId) from bridge, or undefined if creation fails
    */
   createSpan(options: CreateSpanOptions<SpanType>): SpanIds | undefined;
+
+  /**
+   * Release any state the bridge holds for a span that ended but will not be
+   * exported. Bridges keep per-span state from `createSpan()` until the span
+   * ends; span-end events are only emitted for spans that survive export
+   * filtering, so without this the state for a span dropped by
+   * `excludeSpanTypes`, a `spanFilter`, or a span output processor is never
+   * freed.
+   *
+   * The bridge should only drop its bookkeeping here. It must not end/finish
+   * the underlying span, which would export data the user filtered out.
+   *
+   * @param spanId - The ID of the Mastra span whose bridge state can be dropped
+   * @param traceId - The trace the span belonged to, for per-trace bridge state
+   */
+  releaseSpan?(spanId: string, traceId: string): void;
 
   /**
    * Force flush any buffered/queued spans without shutting down the bridge.

@@ -1,5 +1,6 @@
 import { z } from 'zod/v4';
 import { createTool } from '../../tools';
+import { pMap } from '../../utils/p-map';
 import { WORKSPACE_TOOLS } from '../constants';
 import { isTextFile } from '../filesystem/fs-utils';
 import { loadGitignore } from '../gitignore';
@@ -8,6 +9,8 @@ import { createGlobMatcher, extractGlobBase, isGlobPattern } from '../glob';
 import { emitWorkspaceMetadata, requireFilesystem } from './helpers';
 import { applyTokenLimit } from './output-helpers';
 import { startWorkspaceSpan } from './tracing';
+
+const GREP_FILESYSTEM_CONCURRENCY = 8;
 
 export const grepTool = createTool({
   id: WORKSPACE_TOOLS.FILESYSTEM.GREP,
@@ -24,6 +27,7 @@ Usage:
 - Multiple file types: { pattern: "import", path: "**/*.{ts,tsx,js}" }
 - Multiple directories: { pattern: "TODO", path: "{src,lib}/**/*.ts" }
 - With context: { pattern: "function", contextLines: 2 }`,
+  outputSchema: z.string(),
   inputSchema: z.object({
     pattern: z.string().describe('Regex pattern to search for'),
     path: z
@@ -111,53 +115,93 @@ Usage:
       // Collect files to search
       let filePaths: string[];
 
-      // Check if searchPath is a file or directory
-      try {
-        const stat = await filesystem.stat(searchPath);
-        if (stat.type === 'file') {
-          // Single file — search it directly
-          filePaths = isTextFile(searchPath) ? [searchPath] : [];
-        } else {
-          // Directory — walk recursively
-          const collectFiles = async (dir: string): Promise<string[]> => {
-            const files: string[] = [];
-            let entries;
-            try {
-              entries = await filesystem.readdir(dir);
-            } catch {
-              return files;
-            }
-
-            for (const entry of entries) {
-              // Skip hidden files/dirs unless includeHidden is set
-              if (!includeHidden && entry.name.startsWith('.')) continue;
-
-              const fullPath = dir.endsWith('/') ? `${dir}${entry.name}` : `${dir}/${entry.name}`;
-
-              // Skip gitignored paths
-              if (ignoreFilter) {
-                const relativePath = fullPath.replace(/^\.\//, '');
-                const checkPath = entry.type === 'directory' ? `${relativePath}/` : relativePath;
-                if (ignoreFilter(checkPath)) continue;
-              }
-
-              if (entry.type === 'file') {
-                // Skip non-text files
-                if (!isTextFile(entry.name)) continue;
-                // Apply glob filter (createGlobMatcher normalizes leading slashes)
-                if (globMatcher && !globMatcher(fullPath)) continue;
-                files.push(fullPath);
-              } else if (entry.type === 'directory' && !entry.isSymlink) {
-                files.push(...(await collectFiles(fullPath)));
-              }
-            }
-            return files;
-          };
-          filePaths = await collectFiles(searchPath);
-        }
-      } catch {
-        // Path doesn't exist
+      // Never search inside .git even when explicitly targeted
+      const normalizedSearch = searchPath.replace(/\/$/, '');
+      if (normalizedSearch === '.git' || normalizedSearch.endsWith('/.git')) {
         filePaths = [];
+      } else {
+        // Check if searchPath is a file or directory
+        try {
+          const stat = await filesystem.stat(searchPath);
+          if (stat.type === 'file') {
+            // Single file — search it directly
+            filePaths = isTextFile(searchPath) ? [searchPath] : [];
+          } else {
+            // Directory — walk recursively with bounded concurrent listings
+            const entriesByDirectory = new Map<string, Awaited<ReturnType<typeof filesystem.readdir>>>();
+            let directoryFrontier = [searchPath];
+
+            while (directoryFrontier.length > 0) {
+              const directoryEntries = await pMap(
+                directoryFrontier,
+                async dir => {
+                  try {
+                    return await filesystem.readdir(dir);
+                  } catch {
+                    return [];
+                  }
+                },
+                { concurrency: GREP_FILESYSTEM_CONCURRENCY },
+              );
+              const nextDirectoryFrontier: string[] = [];
+
+              for (let directoryIndex = 0; directoryIndex < directoryFrontier.length; directoryIndex++) {
+                const dir = directoryFrontier[directoryIndex]!;
+                const entries = directoryEntries[directoryIndex]!;
+                entriesByDirectory.set(dir, entries);
+
+                for (const entry of entries) {
+                  if (entry.type !== 'directory' || entry.isSymlink || entry.name === '.git') continue;
+                  if (!includeHidden && entry.name.startsWith('.')) continue;
+
+                  const fullPath = dir.endsWith('/') ? `${dir}${entry.name}` : `${dir}/${entry.name}`;
+                  if (ignoreFilter) {
+                    const relativePath = fullPath.replace(/^\.\//, '');
+                    if (ignoreFilter(`${relativePath}/`)) continue;
+                  }
+                  nextDirectoryFrontier.push(fullPath);
+                }
+              }
+
+              directoryFrontier = nextDirectoryFrontier;
+            }
+
+            const collectFiles = (dir: string): string[] => {
+              const files: string[] = [];
+              for (const entry of entriesByDirectory.get(dir) ?? []) {
+                // Always skip .git directory — its internals are never useful and waste tokens
+                if (entry.type === 'directory' && entry.name === '.git') continue;
+
+                // Skip hidden files/dirs unless includeHidden is set
+                if (!includeHidden && entry.name.startsWith('.')) continue;
+
+                const fullPath = dir.endsWith('/') ? `${dir}${entry.name}` : `${dir}/${entry.name}`;
+
+                // Skip gitignored paths
+                if (ignoreFilter) {
+                  const relativePath = fullPath.replace(/^\.\//, '');
+                  const checkPath = entry.type === 'directory' ? `${relativePath}/` : relativePath;
+                  if (ignoreFilter(checkPath)) continue;
+                }
+
+                if (entry.type === 'file') {
+                  // Skip non-text files
+                  if (!isTextFile(entry.name)) continue;
+                  // Apply glob filter (createGlobMatcher normalizes leading slashes)
+                  if (globMatcher && !globMatcher(fullPath)) continue;
+                  files.push(fullPath);
+                } else if (entry.type === 'directory' && !entry.isSymlink) {
+                  files.push(...collectFiles(fullPath));
+                }
+              }
+              return files;
+            };
+            filePaths = collectFiles(searchPath);
+          }
+        } catch {
+          // Path doesn't exist
+          filePaths = [];
+        }
       }
 
       const outputLines: string[] = [];
@@ -166,67 +210,109 @@ Usage:
       let truncated = false;
       const MAX_LINE_LENGTH = 500;
       const GLOBAL_CAP = 1000;
+      const normalizedContextLines = Math.max(0, Math.floor(contextLines));
+      let emittedContextHunk = false;
 
-      for (const filePath of filePaths) {
-        if (truncated) break;
+      for (let batchStart = 0; batchStart < filePaths.length && !truncated; batchStart += GREP_FILESYSTEM_CONCURRENCY) {
+        const batchPaths = filePaths.slice(batchStart, batchStart + GREP_FILESYSTEM_CONCURRENCY);
+        const batchContents = await pMap(
+          batchPaths,
+          async filePath => {
+            try {
+              const raw = await filesystem.readFile(filePath, { encoding: 'utf-8' });
+              return typeof raw === 'string' ? raw : undefined;
+            } catch {
+              return undefined;
+            }
+          },
+          { concurrency: GREP_FILESYSTEM_CONCURRENCY },
+        );
 
-        let content: string;
-        try {
-          const raw = await filesystem.readFile(filePath, { encoding: 'utf-8' });
-          if (typeof raw !== 'string') continue;
-          content = raw;
-        } catch {
-          continue;
-        }
+        for (let fileIndex = 0; fileIndex < batchPaths.length && !truncated; fileIndex++) {
+          const filePath = batchPaths[fileIndex]!;
+          const content = batchContents[fileIndex];
+          if (content === undefined) continue;
 
-        const lines = content.split('\n');
-        let fileMatchCount = 0;
+          const lines = content.split('\n');
+          let fileMatchCount = 0;
+          const fileMatches: Array<{ lineIndex: number; columnIndex: number }> = [];
 
-        for (let i = 0; i < lines.length; i++) {
-          const currentLine = lines[i]!;
-          // Reset regex lastIndex for each line since we use 'g' flag
-          regex.lastIndex = 0;
-          const lineMatch = regex.exec(currentLine);
-          if (!lineMatch) continue;
+          for (let i = 0; i < lines.length; i++) {
+            const currentLine = lines[i]!;
+            // Reset regex lastIndex for each line since we use 'g' flag
+            regex.lastIndex = 0;
+            const lineMatch = regex.exec(currentLine);
+            if (!lineMatch) continue;
 
-          filesWithMatches.add(filePath);
+            filesWithMatches.add(filePath);
 
-          let lineContent = currentLine;
-          if (lineContent.length > MAX_LINE_LENGTH) {
-            lineContent = lineContent.slice(0, MAX_LINE_LENGTH) + '...';
-          }
+            fileMatches.push({ lineIndex: i, columnIndex: lineMatch.index });
 
-          // Add context lines before the match
-          if (contextLines > 0) {
-            const beforeStart = Math.max(0, i - contextLines);
-            for (let b = beforeStart; b < i; b++) {
-              outputLines.push(`${filePath}:${b + 1}- ${lines[b]}`);
+            totalMatchCount++;
+            fileMatchCount++;
+
+            // Per-file limit (like grep -m)
+            if (maxCount !== undefined && fileMatchCount >= maxCount) break;
+
+            // Global cap to protect context window
+            if (totalMatchCount >= GLOBAL_CAP) {
+              truncated = true;
+              break;
             }
           }
 
-          // Add the matching line
-          outputLines.push(`${filePath}:${i + 1}:${lineMatch.index + 1}: ${lineContent}`);
+          if (normalizedContextLines > 0) {
+            const hunks: Array<{
+              start: number;
+              end: number;
+              matchesByLine: Map<number, number>;
+            }> = [];
 
-          // Add context lines after the match
-          if (contextLines > 0) {
-            const afterEnd = Math.min(lines.length - 1, i + contextLines);
-            for (let a = i + 1; a <= afterEnd; a++) {
-              outputLines.push(`${filePath}:${a + 1}- ${lines[a]}`);
+            for (const match of fileMatches) {
+              const start = Math.max(0, match.lineIndex - normalizedContextLines);
+              const end = Math.min(lines.length - 1, match.lineIndex + normalizedContextLines);
+              const previousHunk = hunks[hunks.length - 1];
+
+              if (previousHunk && start <= previousHunk.end + 1) {
+                previousHunk.end = Math.max(previousHunk.end, end);
+                previousHunk.matchesByLine.set(match.lineIndex, match.columnIndex);
+              } else {
+                hunks.push({
+                  start,
+                  end,
+                  matchesByLine: new Map([[match.lineIndex, match.columnIndex]]),
+                });
+              }
             }
-            // Separator between context groups
-            outputLines.push('--');
-          }
 
-          totalMatchCount++;
-          fileMatchCount++;
+            for (const hunk of hunks) {
+              if (emittedContextHunk) {
+                outputLines.push('--');
+              }
+              emittedContextHunk = true;
 
-          // Per-file limit (like grep -m)
-          if (maxCount !== undefined && fileMatchCount >= maxCount) break;
+              for (let i = hunk.start; i <= hunk.end; i++) {
+                const columnIndex = hunk.matchesByLine.get(i);
 
-          // Global cap to protect context window
-          if (totalMatchCount >= GLOBAL_CAP) {
-            truncated = true;
-            break;
+                if (columnIndex !== undefined) {
+                  let lineContent = lines[i]!;
+                  if (lineContent.length > MAX_LINE_LENGTH) {
+                    lineContent = lineContent.slice(0, MAX_LINE_LENGTH) + '...';
+                  }
+                  outputLines.push(`${filePath}:${i + 1}:${columnIndex + 1}: ${lineContent}`);
+                } else {
+                  outputLines.push(`${filePath}:${i + 1}- ${lines[i]}`);
+                }
+              }
+            }
+          } else {
+            for (const match of fileMatches) {
+              let lineContent = lines[match.lineIndex]!;
+              if (lineContent.length > MAX_LINE_LENGTH) {
+                lineContent = lineContent.slice(0, MAX_LINE_LENGTH) + '...';
+              }
+              outputLines.push(`${filePath}:${match.lineIndex + 1}:${match.columnIndex + 1}: ${lineContent}`);
+            }
           }
         }
       }

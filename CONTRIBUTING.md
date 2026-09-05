@@ -28,14 +28,16 @@ Be sure to include a title and clear description, as much relevant information a
 
 Follow the [Development Guide](./DEVELOPMENT.md) to learn how to set up this repository and run its tests. After successfully testing things locally, open a pull request with your changes.
 
-Ensure that the PR description clearly describes the problem and solution. Include the relevant issue number if applicable.
+**Required:** Your PR description must include a link to the issue(s) it addresses (e.g. with `Fixes #1234`, `Closes #1234`). PRs without linked issues may be closed.
+
+Also ensure that the PR description clearly describes the problem and solution.
 
 **Important:** Coderabbit, our AI assistant, will automatically comment on your pull request with feedback and suggestions. Please address all comments to ensure a smooth review process. If you disagree with a suggestion, respond with your reasoning so maintainers can review. Afterward, a maintainer will review your PR and either provide feedback or merge it.
 
 ### Do you intend to add a new feature or change an existing one?
 
 - Open a [feature request](https://github.com/mastra-ai/mastra/issues/new?template=feature_request.yml) and wait for feedback from the Mastra maintainers
-- Assuming you get positive feedback, raise a pull request against your fork/branch to track the development of the feature and discuss the implementation.
+- A Pull Request can only be opened for feature requests when there is no "status: needs triage" or "status: needs approval" label. If an Issue still has those labels, the PR will automatically be closed.
 
 ### Want to improve documentation?
 

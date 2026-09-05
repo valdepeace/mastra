@@ -1,5 +1,8 @@
 import type { DatasetItem } from '@mastra/client-js';
-import { Button, ButtonsGroup, Checkbox, EmptyState, EntityList, Spinner, Txt } from '@mastra/playground-ui';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { ButtonsGroup } from '@mastra/playground-ui/components/ButtonsGroup';
+import { DataList, useDataListKeyboard } from '@mastra/playground-ui/components/DataList';
+import { EmptyState } from '@mastra/playground-ui/components/EmptyState';
 import { format, isThisYear, isToday } from 'date-fns';
 import { Plus, Upload, FileJson } from 'lucide-react';
 
@@ -8,6 +11,8 @@ export interface DatasetItemsListProps {
   isLoading: boolean;
   onItemClick?: (itemId: string) => void;
   featuredItemId?: string | null;
+  /** When false, arrow/page keyboard navigation only moves focus without opening the item. Defaults to true. */
+  selectOnNavigate?: boolean;
   setEndOfListElement?: (element: HTMLDivElement | null) => void;
   isFetchingNextPage?: boolean;
   hasNextPage?: boolean;
@@ -19,7 +24,6 @@ export interface DatasetItemsListProps {
   onToggleSelection: (id: string, shiftKey: boolean, allIds: string[]) => void;
   onSelectAll: (ids: string[]) => void;
   onClearSelection: () => void;
-  maxSelection?: number;
   // Empty state props
   onAddClick: () => void;
   onImportClick?: () => void;
@@ -48,6 +52,7 @@ export function DatasetItemsList({
   isLoading,
   onItemClick,
   featuredItemId,
+  selectOnNavigate = true,
   setEndOfListElement,
   isFetchingNextPage,
   hasNextPage,
@@ -58,12 +63,24 @@ export function DatasetItemsList({
   onToggleSelection,
   onSelectAll,
   onClearSelection,
-  maxSelection,
   onAddClick,
   onImportClick,
   onImportJsonClick,
 }: DatasetItemsListProps) {
+  const { containerRef, getRowProps } = useDataListKeyboard({
+    count: items.length,
+    // Arrow/page navigation opens the focused item, keeping the side panel in sync.
+    // Guard against the clamped boundary case (same id would toggle the panel closed).
+    onNavigate: selectOnNavigate
+      ? index => {
+          const item = items[index];
+          if (item && item.id !== featuredItemId) onItemClick?.(item.id);
+        }
+      : undefined,
+  });
+
   // Only show empty state if there are no items AND no search is active AND not loading
+
   if (items.length === 0 && !searchQuery && !isLoading) {
     return (
       <EmptyDatasetItemList
@@ -90,112 +107,105 @@ export function DatasetItemsList({
   };
 
   const handleToggleSelection = (id: string, shiftKey: boolean, allIds: string[]) => {
-    if (maxSelection && !selectedIds.has(id) && selectedIds.size >= maxSelection) {
-      // Drop most recent selection, keep oldest + add new one
-      const [first] = Array.from(selectedIds);
-      onSelectAll([first, id]);
-      return;
-    }
     onToggleSelection(id, shiftKey, allIds);
   };
 
-  const gridColumns = [isSelectionActive ? '2rem' : '', ...columns.map(c => c.size)].filter(Boolean).join(' ');
+  const gridColumns = [isSelectionActive ? 'auto' : '', ...columns.map(c => c.size)].filter(Boolean).join(' ');
 
   return (
-    <>
-      <EntityList columns={gridColumns}>
-        <EntityList.Top>
-          {isSelectionActive && !maxSelection && (
-            <EntityList.TopCell>
-              <Checkbox
-                checked={isIndeterminate ? 'indeterminate' : isAllSelected}
-                onCheckedChange={handleSelectAllToggle}
-                aria-label="Select all items"
-              />
-            </EntityList.TopCell>
-          )}
-          {isSelectionActive && maxSelection && <EntityList.TopCell>&nbsp;</EntityList.TopCell>}
-          {columns.map(col => (
-            <EntityList.TopCell key={col.name}>{col.label || col.name}</EntityList.TopCell>
-          ))}
-        </EntityList.Top>
-
-        {items.length === 0 && searchQuery ? (
-          <EntityList.NoMatch message="No items match your search" />
-        ) : (
-          <EntityList.Rows>
-            {items.map(item => {
-              const createdAtDate = new Date(item.createdAt);
-              const isSelected = featuredItemId === item.id;
-
-              return (
-                <EntityList.Row
-                  key={item.id}
-                  onClick={() => onItemClick?.(item.id)}
-                  selected={isSelected || selectedIds.has(item.id)}
-                >
-                  {isSelectionActive && (
-                    <EntityList.Cell>
-                      <Checkbox
-                        checked={selectedIds.has(item.id)}
-                        onCheckedChange={() => {}} // no-op: selection handled by onClick for shift-key multi-select
-                        onClick={e => {
-                          e.stopPropagation();
-                          handleToggleSelection(item.id, e.shiftKey, allIds);
-                        }}
-                        aria-label={`Select item ${item.id}`}
-                      />
-                    </EntityList.Cell>
-                  )}
-                  <EntityList.TextCell>
-                    <span className="truncate block font-mono">{item.id}</span>
-                  </EntityList.TextCell>
-                  <EntityList.TextCell>
-                    <span className="truncate block font-mono">{truncateValue(item.input, 60)}</span>
-                  </EntityList.TextCell>
-                  {columns.some(col => col.name === 'groundTruth') && (
-                    <EntityList.TextCell>
-                      <span className="truncate block font-mono">
-                        {item.groundTruth ? truncateValue(item.groundTruth, 40) : '-'}
-                      </span>
-                    </EntityList.TextCell>
-                  )}
-                  {columns.some(col => col.name === 'trajectory') && (
-                    <EntityList.TextCell>
-                      {item.expectedTrajectory ? (
-                        <span className="text-xs">
-                          {Array.isArray((item.expectedTrajectory as Record<string, unknown>)?.steps)
-                            ? `${((item.expectedTrajectory as Record<string, unknown>).steps as unknown[]).length} steps`
-                            : 'Yes'}
-                        </span>
-                      ) : (
-                        <span className="text-neutral4">—</span>
-                      )}
-                    </EntityList.TextCell>
-                  )}
-                  <EntityList.TextCell>
-                    <span className="truncate block text-neutral2">{formatDate(createdAtDate)}</span>
-                  </EntityList.TextCell>
-                </EntityList.Row>
-              );
-            })}
-
-            <div ref={setEndOfListElement} className="h-1 col-span-full">
-              {isFetchingNextPage && (
-                <div className="flex justify-center py-4">
-                  <Spinner />
-                </div>
-              )}
-            </div>
-          </EntityList.Rows>
+    <DataList columns={gridColumns} scrollRef={containerRef}>
+      <DataList.Top hasLeadingCell={isSelectionActive}>
+        {isSelectionActive && (
+          <DataList.TopSelectCell
+            checked={isIndeterminate ? 'indeterminate' : isAllSelected}
+            onToggle={handleSelectAllToggle}
+            aria-label="Select all items"
+          />
         )}
-      </EntityList>
-      {!hasNextPage && items.length > 0 && (
-        <Txt variant="ui-xs" className="text-icon3 text-center">
-          All items loaded
-        </Txt>
+        {isSelectionActive ? (
+          <DataList.TopCells colStart={2}>
+            {columns.map(col => (
+              <DataList.TopCell key={col.name}>{col.label || col.name}</DataList.TopCell>
+            ))}
+          </DataList.TopCells>
+        ) : (
+          columns.map(col => <DataList.TopCell key={col.name}>{col.label || col.name}</DataList.TopCell>)
+        )}
+      </DataList.Top>
+
+      {items.length === 0 && searchQuery ? (
+        <DataList.NoMatch message="No items match your search" />
+      ) : (
+        <>
+          {items.map((item, index) => {
+            const createdAtDate = new Date(item.createdAt);
+            const isFeatured = featuredItemId === item.id;
+
+            const rowCells = (
+              <>
+                <DataList.IdCell id={item.id} />
+                <DataList.TextCell font="mono">{truncateValue(item.input, 150)}</DataList.TextCell>
+                <DataList.TextCell font="mono">
+                  {item.groundTruth ? truncateValue(item.groundTruth, 150) : '-'}
+                </DataList.TextCell>
+                <DataList.Cell className="min-w-0">
+                  {item.expectedTrajectory ? (
+                    <span className="text-ui-smd text-neutral3">
+                      {Array.isArray((item.expectedTrajectory as Record<string, unknown>)?.steps)
+                        ? `${((item.expectedTrajectory as Record<string, unknown>).steps as unknown[]).length} steps`
+                        : 'Yes'}
+                    </span>
+                  ) : (
+                    <span className="text-neutral4">—</span>
+                  )}
+                </DataList.Cell>
+                <DataList.Cell className="min-w-0">
+                  <span className="text-ui-smd text-neutral2 block truncate">{formatDate(createdAtDate)}</span>
+                </DataList.Cell>
+              </>
+            );
+
+            if (!isSelectionActive) {
+              return (
+                <DataList.RowButton
+                  key={item.id}
+                  featured={isFeatured}
+                  data-selected={isFeatured || undefined}
+                  onClick={() => onItemClick?.(item.id)}
+                  {...getRowProps(index)}
+                >
+                  {rowCells}
+                </DataList.RowButton>
+              );
+            }
+
+            return (
+              <DataList.RowWrapper key={item.id}>
+                <DataList.SelectCell
+                  checked={selectedIds.has(item.id)}
+                  onToggle={shiftKey => handleToggleSelection(item.id, shiftKey, allIds)}
+                  aria-label={`Select item ${item.id}`}
+                />
+                <DataList.RowButton
+                  colStart={2}
+                  featured={isFeatured}
+                  data-selected={isFeatured || undefined}
+                  onClick={() => onItemClick?.(item.id)}
+                  {...getRowProps(index)}
+                >
+                  {rowCells}
+                </DataList.RowButton>
+              </DataList.RowWrapper>
+            );
+          })}
+          <DataList.NextPageLoading
+            isLoading={isFetchingNextPage}
+            hasMore={hasNextPage}
+            setEndOfListElement={setEndOfListElement}
+          />
+        </>
       )}
-    </>
+    </DataList>
   );
 }
 
@@ -209,7 +219,7 @@ function EmptyDatasetItemList({ onAddClick, onImportClick, onImportJsonClick }: 
   return (
     <div className="flex h-full items-center justify-center py-12">
       <EmptyState
-        iconSlot={<Plus className="w-8 h-8 text-neutral3" />}
+        iconSlot={<Plus className="text-neutral3 h-8 w-8" />}
         titleSlot="No items yet"
         descriptionSlot="Add items to this dataset to use them in experiment runs."
         actionSlot={

@@ -1,3 +1,4 @@
+import { usePageHeading } from '../PageLayout/page-heading-context';
 import { cn } from '@/lib/utils';
 
 export function MainContentLayout({
@@ -10,12 +11,14 @@ export function MainContentLayout({
   style?: React.CSSProperties;
 }) {
   const devStyleRequested = devUIStyleRequested('MainContentLayout');
+  const pageHeading = usePageHeading();
 
   return (
     <main
-      className={cn(`grid grid-rows-[auto_1fr] h-full items-start content-start`, className)}
+      className={cn(`grid h-full grid-rows-[auto_1fr] content-start items-start`, className)}
       style={{ ...style, ...(devStyleRequested ? { border: '3px dotted red' } : {}) }}
     >
+      {pageHeading && <h1 className="sr-only">{pageHeading}</h1>}
       {children}
     </main>
   );
@@ -68,8 +71,8 @@ export const getMainContentContentClassName = ({
   className,
 }: GetMainContentContentClassNameArgs) => {
   return cn(
-    `grid overflow-y-auto h-full `,
-    `overflow-x-auto min-w-min`,
+    `grid h-full overflow-y-auto `,
+    `min-w-min overflow-x-auto`,
     {
       'items-start content-start': !isCentered && !isDivided && !hasLeftServiceColumn,
       'grid place-items-center': isCentered,

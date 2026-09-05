@@ -28,7 +28,7 @@ const tick = (ms = 50) => new Promise(resolve => setTimeout(resolve, ms));
  */
 async function makeLocalManager(config: BackgroundTaskManagerConfig) {
   const localMastra = new Mastra({ logger: false, storage: testStorage });
-  await localMastra.startEventEngine();
+  await localMastra.startWorkers();
   const isolatedPubsub = new EventEmitterPubSub();
   const mgr = new BackgroundTaskManager(config);
   mgr.__registerMastra(localMastra);
@@ -40,7 +40,7 @@ async function makeLocalManager(config: BackgroundTaskManagerConfig) {
     cleanup: async () => {
       await mgr.shutdown();
       await isolatedPubsub.close();
-      await localMastra.stopEventEngine();
+      await localMastra.stopWorkers();
     },
   };
 }
@@ -57,7 +57,7 @@ describe('BackgroundTaskManager', () => {
       logger: false,
       storage: testStorage,
     });
-    await mastra.startEventEngine();
+    await mastra.startWorkers();
     pubsub = new EventEmitterPubSub();
     manager = new BackgroundTaskManager({
       globalConcurrency: 3,
@@ -72,7 +72,7 @@ describe('BackgroundTaskManager', () => {
   afterEach(async () => {
     await manager.shutdown();
     await pubsub.close();
-    await mastra.stopEventEngine();
+    await mastra.stopWorkers();
     const backgroundTasksStore = await testStorage.getStore('backgroundTasks');
     await backgroundTasksStore?.dangerouslyClearAll();
   });
@@ -430,6 +430,31 @@ describe('BackgroundTaskManager', () => {
 
       await cleanup();
     });
+
+    it('fails immediately without retrying on FGADeniedError', async () => {
+      const denial = new Error('access denied');
+      denial.name = 'FGADeniedError';
+      const executeFn = vi.fn().mockRejectedValue(denial);
+
+      const { mgr: retryManager, cleanup } = await makeLocalManager({
+        enabled: true,
+        defaultRetries: { retryDelayMs: 0 },
+      });
+
+      const { task } = await retryManager.enqueue(
+        { toolName: 'secure-tool', toolCallId: 'call-1', args: {}, agentId: 'agent-1', maxRetries: 3, runId: 'run-1' },
+        ctx(executeFn),
+      );
+
+      await retryManager.waitForNextTask([task.id], { timeoutMs: 5000 });
+
+      const result = await retryManager.getTask(task.id);
+      expect(result?.status).toBe('failed');
+      expect(result?.error?.message).toBe('access denied');
+      expect(executeFn).toHaveBeenCalledTimes(1); // no retries for authorization denials
+
+      await cleanup();
+    });
   });
 
   describe('cancel', () => {
@@ -747,13 +772,19 @@ describe('BackgroundTaskManager', () => {
       expect(suspendedChunk.payload.suspendPayload).toEqual({ ask: 'pause' });
     });
 
-    it('resumes a suspended task with resumeData and completes', async () => {
-      const executeFn = vi.fn(async (_args, opts: any) => {
+    it('resumes a suspended task with resumeData and the suspended tool run id', async () => {
+      const executeFn = vi.fn(async (args, opts: any) => {
         if (!opts.resumeData) {
-          await opts.suspend({ awaiting: 'approval' });
+          await opts.suspend(
+            { awaiting: 'approval', suspendedToolRunId: 'delegated-run-id' },
+            { runId: 'delegated-run-id' },
+          );
           return undefined;
         }
-        return { approvedBy: (opts.resumeData as { user: string }).user };
+        return {
+          approvedBy: (opts.resumeData as { user: string }).user,
+          suspendedToolRunId: args.suspendedToolRunId,
+        };
       });
 
       const { task } = await manager.enqueue(
@@ -762,13 +793,14 @@ describe('BackgroundTaskManager', () => {
       );
       await tick(200);
       expect((await manager.getTask(task.id))?.status).toBe('suspended');
+      expect(executeFn.mock.calls[0]?.[0]).not.toHaveProperty('suspendedToolRunId');
 
       await manager.resume(task.id, { user: 'alice' });
       await tick(200);
 
       const completed = await manager.getTask(task.id);
       expect(completed?.status).toBe('completed');
-      expect(completed?.result).toEqual({ approvedBy: 'alice' });
+      expect(completed?.result).toEqual({ approvedBy: 'alice', suspendedToolRunId: 'delegated-run-id' });
       expect(completed?.suspendPayload).toBeUndefined();
       expect(executeFn).toHaveBeenCalledTimes(2);
     });
@@ -910,7 +942,7 @@ describe('BackgroundTaskManager', () => {
         'stale-1',
         ctx(async () => 'recovered'),
       );
-      await local.startEventEngine();
+      await local.startWorkers();
 
       try {
         const mgr = local.backgroundTaskManager!;
@@ -923,7 +955,7 @@ describe('BackgroundTaskManager', () => {
         expect(completed?.result).toBe('recovered');
       } finally {
         await local.backgroundTaskManager?.shutdown();
-        await local.stopEventEngine();
+        await local.stopWorkers();
       }
     });
 
@@ -954,7 +986,7 @@ describe('BackgroundTaskManager', () => {
         'pending-1',
         ctx(async () => 'late-pickup'),
       );
-      await local.startEventEngine();
+      await local.startWorkers();
 
       try {
         const mgr = local.backgroundTaskManager!;
@@ -966,7 +998,7 @@ describe('BackgroundTaskManager', () => {
         expect(completed?.result).toBe('late-pickup');
       } finally {
         await local.backgroundTaskManager?.shutdown();
-        await local.stopEventEngine();
+        await local.stopWorkers();
       }
     });
 
@@ -978,7 +1010,7 @@ describe('BackgroundTaskManager', () => {
         storage: seedStorage,
         backgroundTasks: { enabled: true },
       });
-      await m1.startEventEngine();
+      await m1.startWorkers();
       await tick();
       const mgr1 = m1.backgroundTaskManager!;
       const executeFn = vi.fn(async (_args, opts: any) => {
@@ -991,7 +1023,7 @@ describe('BackgroundTaskManager', () => {
       await tick(200);
       expect((await mgr1.getTask(task.id))?.status).toBe('suspended');
       await mgr1.shutdown();
-      await m1.stopEventEngine();
+      await m1.stopWorkers();
 
       // Second mastra over the same storage — recovery should NOT touch
       // the suspended row.
@@ -1000,7 +1032,7 @@ describe('BackgroundTaskManager', () => {
         storage: seedStorage,
         backgroundTasks: { enabled: true },
       });
-      await m2.startEventEngine();
+      await m2.startWorkers();
       await tick(150);
       try {
         const mgr2 = m2.backgroundTaskManager!;
@@ -1009,7 +1041,7 @@ describe('BackgroundTaskManager', () => {
         expect(stillSuspended?.suspendPayload).toEqual({ checkpoint: 1 });
       } finally {
         await m2.backgroundTaskManager?.shutdown();
-        await m2.stopEventEngine();
+        await m2.stopWorkers();
       }
     });
   });

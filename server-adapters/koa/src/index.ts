@@ -9,12 +9,14 @@ import type { ParsedRequestParams, ServerRoute } from '@mastra/server/server-ada
 import {
   MastraServer as MastraServerBase,
   checkRouteFGA,
+  getCustomHTTPExceptionResponse,
+  isZodError,
   normalizeQueryParams,
   redactStreamChunk,
+  serializeStreamChunk,
 } from '@mastra/server/server-adapter';
 import type Koa from 'koa';
 import type { Context, Middleware, Next } from 'koa';
-import { ZodError } from 'zod';
 export { createAuthMiddleware } from './auth-middleware';
 export type { KoaAuthMiddlewareOptions } from './auth-middleware';
 
@@ -241,6 +243,10 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
       }
 
       const requestContext = server.mergeRequestContext({ paramsRequestContext, bodyRequestContext });
+      server.applyRequestMetadataToContext({
+        requestContext,
+        getHeader: name => ctx.get(name),
+      });
 
       // Set context in state object
       ctx.state.requestContext = requestContext;
@@ -266,9 +272,21 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
   }
 
   private getRouteDispatcherGroup(app: Koa): RouteDispatcherGroup {
-    const activeGroup = this.activeRouteDispatchers.get(app);
-    if (activeGroup && app.middleware.length === activeGroup.stackLengthAfterRegistration) {
-      return activeGroup;
+    // The dispatcher-reuse optimization needs to observe app.middleware.length
+    // to detect when other middleware was registered between our route
+    // registrations (in which case we must start a new dispatcher group to
+    // preserve middleware ordering). Subclasses may pass an app-like object
+    // (e.g., a koa-router or a mounted sub-app) that only exposes `use` and
+    // has no `middleware` array. In that case, skip reuse and register a fresh
+    // dispatcher per call — equivalent to the pre-1.5.0 per-route behavior.
+    const middlewareStack = (app as { middleware?: unknown }).middleware;
+    const supportsReuse = Array.isArray(middlewareStack);
+
+    if (supportsReuse) {
+      const activeGroup = this.activeRouteDispatchers.get(app);
+      if (activeGroup && middlewareStack.length === activeGroup.stackLengthAfterRegistration) {
+        return activeGroup;
+      }
     }
 
     const group: RouteDispatcherGroup = {
@@ -276,8 +294,12 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
       stackLengthAfterRegistration: 0,
     };
     app.use(this.createRouteDispatcherMiddleware(group));
-    group.stackLengthAfterRegistration = app.middleware.length;
-    this.activeRouteDispatchers.set(app, group);
+
+    if (supportsReuse) {
+      group.stackLengthAfterRegistration = (app as { middleware: unknown[] }).middleware.length;
+      this.activeRouteDispatchers.set(app, group);
+    }
+
     return group;
   }
 
@@ -371,7 +393,7 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
         this.mastra.getLogger()?.error('Error parsing query params', {
           error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
         });
-        if (error instanceof ZodError) {
+        if (isZodError(error)) {
           const resolved = this.resolveValidationError(route, error, 'query');
           ctx.status = resolved.status;
           ctx.body = resolved.body;
@@ -393,7 +415,7 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
         this.mastra.getLogger()?.error('Error parsing body', {
           error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
         });
-        if (error instanceof ZodError) {
+        if (isZodError(error)) {
           const resolved = this.resolveValidationError(route, error, 'body');
           ctx.status = resolved.status;
           ctx.body = resolved.body;
@@ -416,7 +438,7 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
         this.mastra.getLogger()?.error('Error parsing path params', {
           error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
         });
-        if (error instanceof ZodError) {
+        if (isZodError(error)) {
           const resolved = this.resolveValidationError(route, error, 'path');
           ctx.status = resolved.status;
           ctx.body = resolved.body;
@@ -441,17 +463,20 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
       taskStore: ctx.state.taskStore,
       abortSignal: ctx.state.abortSignal,
       routePrefix: prefix,
+      request: toWebRequest(ctx),
     };
 
     // Check route permission requirement (EE feature)
     // Uses convention-based permission derivation: permissions are auto-derived
     // from route path/method unless explicitly set or route is public
-    const authConfig = this.mastra.getServer()?.auth;
-    if (authConfig) {
+    const requestContext = ctx.state.requestContext;
+    // Check if any auth is configured (studio or server) for RBAC
+    const hasAuth = this.mastra.getStudio?.()?.auth || this.mastra.getServer()?.auth;
+    if (hasAuth) {
       const hasPermission = await loadHasPermission();
       if (hasPermission) {
-        const userPermissions = ctx.state.requestContext.get('userPermissions') as string[] | undefined;
-        const permissionError = this.checkRoutePermission(route, userPermissions, hasPermission);
+        const userPermissions = requestContext.get('mastra__userPermissions') as string[] | undefined;
+        const permissionError = this.checkRoutePermission(route, userPermissions, hasPermission, requestContext);
 
         if (permissionError) {
           ctx.status = permissionError.status;
@@ -465,7 +490,7 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
     }
 
     // Check FGA authorization (EE feature)
-    const fgaError = await checkRouteFGA(this.mastra, route, ctx.state.requestContext, {
+    const fgaError = await checkRouteFGA(this.mastra, route, requestContext, {
       ...params.urlParams,
       ...params.queryParams,
       ...(typeof params.body === 'object' ? params.body : {}),
@@ -480,11 +505,23 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
       const result = await route.handler(handlerParams);
       await this.sendResponse(route, ctx, result, prefix);
     } catch (error) {
-      this.mastra.getLogger()?.error('Error calling handler', {
-        error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
-        path: route.path,
-        method: route.method,
-      });
+      const httpStatus = error && typeof error === 'object' && 'status' in error ? (error as any).status : undefined;
+      const isClientError = typeof httpStatus === 'number' && httpStatus >= 400 && httpStatus < 500;
+      if (!isClientError) {
+        this.mastra.getLogger()?.error('Error calling handler', {
+          error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
+          path: route.path,
+          method: route.method,
+        });
+      }
+      const customResponse = getCustomHTTPExceptionResponse(error);
+      if (customResponse) {
+        ctx.status = customResponse.status;
+        customResponse.headers.forEach((value, name) => ctx.set(name, value));
+        ctx.body = Buffer.from(await customResponse.arrayBuffer());
+        return;
+      }
+
       // Attach status code to the error for upstream middleware
       if (error && typeof error === 'object') {
         if (!('status' in error)) {
@@ -529,11 +566,15 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
       'Transfer-Encoding': 'chunked',
     });
 
+    if (streamFormat === 'sse' && route.sseFlushOnConnect) {
+      ctx.res.write(': connected\n\n');
+    }
+
     const readableStream = result instanceof ReadableStream ? result : result.fullStream;
     const reader = readableStream.getReader();
 
     ctx.res.on('close', () => {
-      void reader.cancel('request aborted');
+      void reader.cancel('request aborted').catch(() => {});
     });
 
     try {
@@ -542,13 +583,28 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
         if (done) break;
 
         if (value) {
+          if (streamFormat === 'sse' && typeof value === 'string' && value.startsWith(':')) {
+            ctx.res.write(value);
+            continue;
+          }
+
           // Optionally redact sensitive data (system prompts, tool definitions, API keys) before sending to the client
           const shouldRedact = this.streamOptions?.redact ?? true;
           const outputValue = shouldRedact ? redactStreamChunk(value) : value;
+          // A chunk that can't be serialized must not kill the stream — skip it and keep streaming
+          const serialized = serializeStreamChunk(outputValue);
+          if (!serialized.ok) {
+            this.mastra.getLogger()?.error('Failed to serialize stream chunk, skipping', {
+              path: route.path,
+              chunkType: (outputValue as { type?: string })?.type,
+              error: serialized.error.message,
+            });
+            continue;
+          }
           if (streamFormat === 'sse') {
-            ctx.res.write(`data: ${JSON.stringify(outputValue)}\n\n`);
+            ctx.res.write(`data: ${serialized.json}\n\n`);
           } else {
-            ctx.res.write(JSON.stringify(outputValue) + '\x1E');
+            ctx.res.write(serialized.json + '\x1E');
           }
         }
       }
@@ -693,7 +749,7 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
           this.mastra.getLogger()?.error('Error writing datastream response', {
             error: err instanceof Error ? { message: err.message, stack: err.stack } : err,
           });
-          void reader.cancel('response write error');
+          void reader.cancel('response write error').catch(() => {});
         };
         ctx.res.once('error', onResError);
 
@@ -829,10 +885,10 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
   }
 
   async registerCustomApiRoutes(): Promise<void> {
-    if (!(await this.buildCustomRouteHandler())) return;
+    const routes = await this.registerSchemaApiRoutes();
+    if (!(await this.buildCustomRouteHandler(routes))) return;
 
     const server = this;
-
     this.app.use(async function mastraCustomRouteDispatcher(ctx: Context, next: Next) {
       // Check if this request matches a protected custom route and run auth
       const path = String(ctx.path || '/');
@@ -845,47 +901,70 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
       const shouldRunCustomRouteAuth = isProtectedCustomRoute(path, method, server.customRouteAuthConfig);
       const shouldRunCustomRouteFGA = !!matchedRoute?.route.fga;
 
-      if (shouldRunCustomRouteAuth || shouldRunCustomRouteFGA) {
-        const serverRoute: ServerRoute = {
-          method: (matchedRoute?.route.method ?? method) as any,
-          path: matchedRoute?.route.path ?? path,
-          responseType: 'json',
-          handler: async () => {},
-          requiresAuth: matchedRoute?.route.requiresAuth,
-          requiresPermission: matchedRoute?.route.requiresPermission,
-          fga: matchedRoute?.route.fga,
-        };
+      const customRouteAbortController = new AbortController();
+      const abortCustomRoute = () => {
+        customRouteAbortController.abort();
+      };
+      const abortCustomRouteIfOpen = () => {
+        if (!ctx.res.writableEnded) {
+          abortCustomRoute();
+        }
+      };
 
-        if (shouldRunCustomRouteAuth) {
-          const authError = await server.checkRouteAuth(serverRoute, {
-            path,
-            method,
-            getHeader: name => ctx.headers[name.toLowerCase()] as string | undefined,
-            getQuery: name => (ctx.query as Record<string, string>)[name],
-            requestContext: ctx.state.requestContext,
-            request: toWebRequest(ctx),
-            buildAuthorizeContext: () => toWebRequest(ctx),
-          });
+      ctx.res.once('close', abortCustomRouteIfOpen);
+      ctx.res.once('error', abortCustomRouteIfOpen);
 
-          if (authError) {
-            if (authError.headers) {
-              for (const [key, value] of Object.entries(authError.headers)) {
-                ctx.set(key, value);
+      try {
+        if (shouldRunCustomRouteAuth || shouldRunCustomRouteFGA) {
+          const serverRoute: ServerRoute = {
+            method: (matchedRoute?.route.method ?? method) as any,
+            path: matchedRoute?.route.path ?? path,
+            responseType: 'json',
+            handler: async () => {},
+            requiresAuth: matchedRoute?.route.requiresAuth,
+            requiresPermission: matchedRoute?.route.requiresPermission,
+            fga: matchedRoute?.route.fga,
+          };
+
+          if (shouldRunCustomRouteAuth) {
+            const authError = await server.checkRouteAuth(serverRoute, {
+              path,
+              method,
+              getHeader: name => ctx.headers[name.toLowerCase()] as string | undefined,
+              getQuery: name => (ctx.query as Record<string, string>)[name],
+              requestContext: ctx.state.requestContext,
+              request: toWebRequest(ctx),
+              buildAuthorizeContext: () => toWebRequest(ctx),
+            });
+
+            if (authError) {
+              if (authError.headers) {
+                for (const [key, value] of Object.entries(authError.headers)) {
+                  ctx.set(key, value);
+                }
               }
-            }
-            if (authError.error) {
-              ctx.status = authError.status;
-              ctx.body = { error: authError.error };
-              return;
+
+              if (authError.error) {
+                ctx.status = authError.status;
+                ctx.body = { error: authError.error };
+                return;
+              }
             }
           }
 
-          const authConfig = server.mastra.getServer()?.auth;
-          if (authConfig) {
+          const requestContext = ctx.state.requestContext;
+          // Check if any auth is configured (studio or server) for RBAC
+          const hasAuth = server.mastra.getStudio?.()?.auth || server.mastra.getServer()?.auth;
+          if (hasAuth) {
             const hasPermission = await loadHasPermission();
             if (hasPermission) {
-              const userPermissions = ctx.state.requestContext.get('userPermissions') as string[] | undefined;
-              const permissionError = server.checkRoutePermission(serverRoute, userPermissions, hasPermission);
+              const userPermissions = requestContext.get('mastra__userPermissions') as string[] | undefined;
+              const permissionError = server.checkRoutePermission(
+                serverRoute,
+                userPermissions,
+                hasPermission,
+                requestContext,
+              );
               if (permissionError) {
                 ctx.status = permissionError.status;
                 ctx.body = {
@@ -896,38 +975,50 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
               }
             }
           }
+
+          // Check FGA authorization (EE feature)
+          const fgaError = await checkRouteFGA(server.mastra, serverRoute, ctx.state.requestContext, {
+            ...(matchedRoute?.params ?? {}),
+            ...(ctx.query as Record<string, string>),
+            ...(typeof ctx.request.body === 'object' && ctx.request.body !== null
+              ? (ctx.request.body as Record<string, unknown>)
+              : {}),
+          });
+          if (fgaError) {
+            ctx.status = fgaError.status;
+            ctx.body = { error: fgaError.error, message: fgaError.message };
+            return;
+          }
         }
 
-        // Check FGA authorization (EE feature)
-        const fgaError = await checkRouteFGA(server.mastra, serverRoute, ctx.state.requestContext, {
-          ...(matchedRoute?.params ?? {}),
-          ...(ctx.query as Record<string, string>),
-          ...(typeof ctx.request.body === 'object' && ctx.request.body !== null
-            ? (ctx.request.body as Record<string, unknown>)
-            : {}),
-        });
-        if (fgaError) {
-          ctx.status = fgaError.status;
-          ctx.body = { error: fgaError.error, message: fgaError.message };
-          return;
-        }
+        const response = await server.handleCustomRouteRequest(
+          `${ctx.protocol}://${ctx.host}${ctx.originalUrl || ctx.url}`,
+          ctx.method,
+          ctx.headers as Record<string, string | string[] | undefined>,
+          ctx.request.body,
+          ctx.state.requestContext,
+          customRouteAbortController.signal,
+        );
+        if (!response) return next();
+        ctx.respond = false;
+        await server.writeCustomRouteResponse(response, ctx.res, customRouteAbortController.signal);
+      } finally {
+        ctx.res.off('close', abortCustomRouteIfOpen);
+        ctx.res.off('error', abortCustomRouteIfOpen);
       }
-
-      const response = await server.handleCustomRouteRequest(
-        `${ctx.protocol}://${ctx.host}${ctx.originalUrl || ctx.url}`,
-        ctx.method,
-        ctx.headers as Record<string, string | string[] | undefined>,
-        ctx.request.body,
-        ctx.state.requestContext,
-      );
-      if (!response) return next();
-      ctx.respond = false;
-      await server.writeCustomRouteResponse(response, ctx.res);
     });
   }
 
   registerContextMiddleware(): void {
     this.app.use(this.createContextMiddleware());
+    this.app.use(async (ctx: Context, next: Next) => {
+      const path = String(ctx.path || '/');
+      const method = String(ctx.method || 'GET');
+      ctx.res.once('finish', () => {
+        this.warnIfUnregisteredChannelWebhook(path, method, ctx.res.statusCode);
+      });
+      await next();
+    });
   }
 
   registerAuthMiddleware(): void {

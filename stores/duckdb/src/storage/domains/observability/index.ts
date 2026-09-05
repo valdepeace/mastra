@@ -14,6 +14,7 @@ import type {
   ListBranchesArgs,
   ListBranchesResponse,
   ListTracesArgs,
+  ListTracesLightResponse,
   ListTracesResponse,
   BatchCreateSpansArgs,
   BatchDeleteTracesArgs,
@@ -40,6 +41,8 @@ import type {
   BatchCreateFeedbackArgs,
   ListFeedbackArgs,
   ListFeedbackResponse,
+  FeedbackRecord,
+  UpdateFeedbackReviewStatusArgs,
   GetFeedbackAggregateArgs,
   GetFeedbackAggregateResponse,
   GetFeedbackBreakdownArgs,
@@ -73,6 +76,8 @@ import type {
   GetTagsArgs,
   GetTagsResponse,
   ObservabilityStorageStrategy,
+  TraceQueryResponse,
+  TrustedTraceQueryPlan,
 } from '@mastra/core/storage';
 import type { DuckDBConnection } from '../../db/index';
 import { ALL_DDL, ALL_MIGRATIONS } from './ddl';
@@ -80,8 +85,10 @@ import * as discoveryOps from './discovery';
 import * as feedbackOps from './feedback';
 import * as logOps from './logs';
 import * as metricOps from './metrics';
-import { checkSignalTablesMigrationStatus, migrateSignalTables } from './migration';
+import { checkSignalTablesMigrationStatus, dropLegacyCursorIdDefaults, migrateSignalTables } from './migration';
+import { deltaPollingFeatureEnabled } from './polling';
 import * as scoreOps from './scores';
+import * as traceQueryOps from './trace-query';
 import * as tracingOps from './tracing';
 
 function buildSignalMigrationRequiredMessage(args: { tables: Array<{ table: string }> }): string {
@@ -145,13 +152,8 @@ export class ObservabilityStorageDuckDB extends ObservabilityStorage {
       });
     }
 
-    for (const ddl of ALL_DDL) {
-      await this.db.execute(ddl);
-    }
-
-    for (const migration of ALL_MIGRATIONS) {
-      await this.db.execute(migration);
-    }
+    await this.db.executeBatch([...ALL_DDL, ...ALL_MIGRATIONS]);
+    await dropLegacyCursorIdDefaults(this.db);
   }
 
   /**
@@ -203,6 +205,14 @@ export class ObservabilityStorageDuckDB extends ObservabilityStorage {
     };
   }
 
+  override getFeatures() {
+    if (!deltaPollingFeatureEnabled()) {
+      return ['metrics', 'logs', 'trace-query'] as const;
+    }
+
+    return ['metrics', 'logs', 'delta-polling', 'trace-query'] as const;
+  }
+
   // Tracing
   async createSpan(args: CreateSpanArgs): Promise<void> {
     return tracingOps.createSpan(this.db, args);
@@ -230,6 +240,15 @@ export class ObservabilityStorageDuckDB extends ObservabilityStorage {
   }
   async listTraces(args: ListTracesArgs): Promise<ListTracesResponse> {
     return tracingOps.listTraces(this.db, args);
+  }
+  override async queryTraces(plan: TrustedTraceQueryPlan): Promise<TraceQueryResponse> {
+    return traceQueryOps.queryTraces(this.db, plan);
+  }
+  async listTracesLight(args: ListTracesArgs): Promise<ListTracesLightResponse> {
+    if (args.mode === 'delta') {
+      return super.listTracesLight(args);
+    }
+    return tracingOps.listTracesLight(this.db, args);
   }
   async listBranches(args: ListBranchesArgs): Promise<ListBranchesResponse> {
     return tracingOps.listBranches(this.db, args);
@@ -325,6 +344,9 @@ export class ObservabilityStorageDuckDB extends ObservabilityStorage {
   }
   async listFeedback(args: ListFeedbackArgs): Promise<ListFeedbackResponse> {
     return feedbackOps.listFeedback(this.db, args);
+  }
+  async updateFeedbackReviewStatus(args: UpdateFeedbackReviewStatusArgs): Promise<FeedbackRecord> {
+    return feedbackOps.updateFeedbackReviewStatus(this.db, args);
   }
   async getFeedbackAggregate(args: GetFeedbackAggregateArgs): Promise<GetFeedbackAggregateResponse> {
     return feedbackOps.getFeedbackAggregate(this.db, args);

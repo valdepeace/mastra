@@ -12,11 +12,27 @@ import type { TracingEvent, AnyExportedSpan, ToolCallAttributes } from '@mastra/
 import { SpanType, TracingEventType } from '@mastra/core/observability';
 import * as Sentry from '@sentry/node';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { SentryExporter } from './tracing';
+import { SentryExporter, buildSpanTypeConfig } from './tracing';
 import type { SentryExporterConfig } from './tracing';
 
 // Mock Sentry module
 vi.mock('@sentry/node');
+
+describe('buildSpanTypeConfig', () => {
+  // @mastra/sentry's peer range admits a @mastra/core older than the one that
+  // introduced a given SpanType member. There, `SpanType.X` is undefined, and a
+  // plain object literal would map it under a literal "undefined" key that then
+  // matches any span whose type is undefined.
+  it('drops entries whose span type is missing from the paired core', () => {
+    const config = buildSpanTypeConfig([
+      [SpanType.AGENT_RUN, { opType: 'gen_ai.invoke_agent', opName: 'invoke_agent' }],
+      [undefined, { opType: 'ai.skill', opName: 'skill' }],
+    ]);
+
+    expect(config).toEqual({ [SpanType.AGENT_RUN]: { opType: 'gen_ai.invoke_agent', opName: 'invoke_agent' } });
+    expect(Object.keys(config)).not.toContain('undefined');
+  });
+});
 
 describe('SentryExporter', () => {
   // Mock objects
@@ -105,8 +121,7 @@ describe('SentryExporter', () => {
       const originalEnv = process.env.SENTRY_DSN;
       delete process.env.SENTRY_DSN;
 
-      // ConsoleLogger uses console.info for warn level logging
-      const mockConsoleInfo = vi.spyOn(console, 'info').mockImplementation(() => {});
+      const mockConsoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
       // Clear mock to isolate this test from previous Sentry.init calls
       SentryMock.init.mockClear();
@@ -115,13 +130,13 @@ describe('SentryExporter', () => {
 
       expect(exporterWithoutDsn.name).toBe('sentry');
       // Verify warning was logged about missing DSN
-      expect(mockConsoleInfo).toHaveBeenCalledWith(expect.stringContaining('DSN'));
+      expect(mockConsoleWarn).toHaveBeenCalledWith(expect.stringContaining('DSN'));
       // Verify exporter is disabled
       expect(exporterWithoutDsn.isDisabled).toBe(true);
       // Should not have initialized Sentry without DSN
       expect(SentryMock.init).not.toHaveBeenCalled();
 
-      mockConsoleInfo.mockRestore();
+      mockConsoleWarn.mockRestore();
       process.env.SENTRY_DSN = originalEnv;
     });
 
@@ -581,6 +596,51 @@ describe('SentryExporter', () => {
           tags: 'production,experiment-v2,user-request',
         }),
       );
+    });
+
+    it('should set gen_ai.conversation.id from threadId', async () => {
+      const span = createMockSpan({
+        id: 'span-with-thread',
+        name: 'test',
+        type: SpanType.AGENT_RUN,
+        isRoot: true,
+        attributes: {},
+        metadata: {
+          threadId: 'thread-789',
+        },
+      });
+
+      await exporter.exportTracingEvent({
+        type: TracingEventType.SPAN_STARTED,
+        exportedSpan: span,
+      });
+
+      expect(mockSpan.setAttributes).toHaveBeenCalledWith(
+        expect.objectContaining({
+          'gen_ai.conversation.id': 'thread-789',
+        }),
+      );
+    });
+
+    it('should not set gen_ai.conversation.id when threadId is absent', async () => {
+      const span = createMockSpan({
+        id: 'span-no-thread',
+        name: 'test',
+        type: SpanType.AGENT_RUN,
+        isRoot: true,
+        attributes: {},
+        metadata: {
+          userId: 'user-123',
+        },
+      });
+
+      await exporter.exportTracingEvent({
+        type: TracingEventType.SPAN_STARTED,
+        exportedSpan: span,
+      });
+
+      const call = mockSpan.setAttributes.mock.calls[0][0];
+      expect(call).not.toHaveProperty('gen_ai.conversation.id');
     });
 
     it('should not include langfuse metadata', async () => {

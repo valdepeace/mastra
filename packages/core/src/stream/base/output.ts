@@ -1,15 +1,17 @@
 import { EventEmitter } from 'node:events';
 import { ReadableStream, TransformStream } from 'node:stream/web';
-import { TripWire } from '../../agent';
-import { coreContentToString } from '../../agent/message-list';
+import { convertMessages, coreContentToString } from '../../agent/message-list';
 import type { MessageList, MastraDBMessage } from '../../agent/message-list';
+import { TripWire } from '../../agent/trip-wire';
 import { MastraBase } from '../../base';
 import { ErrorCategory, ErrorDomain, MastraError } from '../../error';
 import { getErrorFromUnknown } from '../../error/utils.js';
 import type { ScorerRunInputForAgent, ScorerRunOutputForAgent } from '../../evals';
 import { getRootExportSpan, resolveObservabilityContext } from '../../observability';
 import type { OutputResult } from '../../processors';
-import { STRUCTURED_OUTPUT_PROCESSOR_NAME } from '../../processors/processors/structured-output';
+// Inlined to avoid importing structured-output.ts which pulls in the agent
+// barrel and creates an ESM init-time cycle.
+const STRUCTURED_OUTPUT_PROCESSOR_NAME = 'structured-output';
 import { ProcessorState, ProcessorRunner } from '../../processors/runner';
 import type { WorkflowRunStatus } from '../../workflows';
 import { DelayedPromise, consumeStream } from '../aisdk/v5/compat';
@@ -28,6 +30,8 @@ import type {
 import { safeClose, safeEnqueue } from './input';
 import { createJsonTextStreamTransformer, createObjectStreamTransformer } from './output-format-handlers';
 import { getTransformedSchema } from './schema';
+import { packStepMessageMirrors, unpackStepMessageMirrors } from './step-message-mirrors';
+import { dedupeStepRequests, rehydrateStepRequests } from './step-request-dedupe';
 
 /**
  * Helper function to create a destructurable version of MastraModelOutput.
@@ -50,6 +54,25 @@ export function createDestructurableOutput<OUTPUT = undefined>(
       return originalValue;
     },
   }) as MastraModelOutput<OUTPUT>;
+}
+
+function persistProcessorDataChunk(
+  messageList: MessageList,
+  messageId: string,
+  chunk: { type: string; data?: unknown; transient?: boolean },
+): void {
+  if (!chunk.type.startsWith('data-') || chunk.transient) return;
+
+  const message: MastraDBMessage = {
+    id: messageId,
+    role: 'assistant',
+    content: {
+      format: 2,
+      parts: [{ type: chunk.type as `data-${string}`, data: chunk.data }],
+    },
+    createdAt: new Date(),
+  };
+  messageList.add(message, 'response');
 }
 
 type PromiseResults<OUTPUT = undefined> = Pick<
@@ -141,15 +164,53 @@ export type FullOutput<OUTPUT = undefined> = {
   rememberedMessages: MastraDBMessage[];
 };
 
+/**
+ * Resolve the output text from the latest response message, skipping internal
+ * completion-check feedback so it can't become the final text.
+ * The completionResult metadata only exists on DB-format messages, and the
+ * message is converted alone so adjacent assistant messages aren't merged.
+ *
+ * Returns `undefined` only when there is no response message to read text from,
+ * so callers can distinguish "no processed output exists" from an output
+ * processor deliberately clearing the text to `''`. Never collapse the two with
+ * a truthiness check: a redacting processor must be able to produce empty text.
+ */
+function resolveOutputTextSkippingCompletionChecks(messageList: MessageList): string | undefined {
+  const responseDbMessages = messageList.get.response.db();
+  const hasCompletionCheckMessages = responseDbMessages.some(m => m.content?.metadata?.completionResult);
+  if (hasCompletionCheckMessages) {
+    const lastRealMessage = responseDbMessages.findLast(m => !m.content?.metadata?.completionResult);
+    const converted = lastRealMessage ? convertMessages([lastRealMessage]).to('AIV4.Core') : [];
+    const lastConverted = converted[converted.length - 1];
+    return lastConverted ? coreContentToString(lastConverted.content) : undefined;
+  }
+  const responseMessages = messageList.get.response.aiV4.core();
+  const lastResponseMessage = responseMessages[responseMessages.length - 1];
+  return lastResponseMessage ? coreContentToString(lastResponseMessage.content) : undefined;
+}
+
 export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   #status: WorkflowRunStatus = 'running';
   #error: Error | undefined;
   #baseStream: ReadableStream<ChunkType<OUTPUT>>;
   #bufferedChunks: ChunkType<OUTPUT>[] = [];
+  /**
+   * Set when a continuing goal evaluation arrives while a step is still in
+   * flight (in-process engines emit the goal chunk before the judged turn's
+   * step-finish): the next step-finish belongs to the judged turn and its
+   * buffers are dropped once its stepResult and usage are recorded.
+   */
+  #truncateAtNextStepFinish = false;
   #streamFinished = false;
+  #finishCallbackSent = false;
   #emitter = new EventEmitter();
   #bufferedSteps: LLMStepResult<OUTPUT>[] = [];
   #bufferedReasoningDetails: Record<string, LLMStepResult<OUTPUT>['reasoning'][number]> = {};
+  /**
+   * Per-step counterpart of `#bufferedReasoningDetails`. Reset on `step-finish`
+   * alongside `#bufferedByStep` so a step result reports only its own reasoning.
+   */
+  #bufferedByStepReasoningDetails: Record<string, LLMStepResult<OUTPUT>['reasoning'][number]> = {};
   #bufferedByStep: LLMStepResult<OUTPUT> = {
     text: '',
     reasoning: [],
@@ -186,12 +247,26 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   #toolCallDeltaIdNameMap: Record<string, string> = {};
   #toolCallStreamingMeta: Record<
     string,
-    { toolName: string; providerExecuted?: boolean; providerMetadata?: ProviderMetadata; dynamic?: boolean }
+    {
+      toolName: string;
+      providerExecuted?: boolean;
+      providerMetadata?: ProviderMetadata;
+      dynamic?: boolean;
+      observability?: ToolCallChunk['payload']['observability'];
+    }
   > = {};
   #toolCalls: LLMStepResult<OUTPUT>['toolCalls'] = [];
   #toolResults: LLMStepResult<OUTPUT>['toolResults'] = [];
   #warnings: LLMStepResult<OUTPUT>['warnings'] = [];
   #finishReason: LLMStepResult<OUTPUT>['finishReason'] = undefined;
+  /**
+   * Provider-specific metadata captured from the most recent step `finish`
+   * chunk (e.g. AWS Bedrock guardrail trace under
+   * `providerMetadata.bedrock.trace`). Exposed via {@link _getImmediateProviderMetadata}
+   * so output-step processors can attribute content-filter blocks, for which
+   * the completed-steps array is empty.
+   */
+  #stepProviderMetadata: ProviderMetadata | undefined = undefined;
   #request: LLMStepResult<OUTPUT>['request'] = {};
   #usageCount: LLMStepResult<OUTPUT>['usage'] = {
     inputTokens: undefined,
@@ -199,6 +274,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     totalTokens: undefined,
   };
   #tripwire: StepTripwireData | undefined = undefined;
+  #wasSuspended = false;
   #transportRef: MastraModelOutputOptions<OUTPUT>['transportRef'] | undefined;
   #transportClosed = false;
 
@@ -225,13 +301,16 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   };
 
   #consumptionStarted = false;
+  #consumeStreamPromise: Promise<void> | undefined;
+  #consumeStreamErrored = false;
+  #consumeStreamError: unknown;
   #returnScorerData = false;
   #structuredOutputMode: 'direct' | 'processor' | undefined = undefined;
 
   #model: {
     modelId: string | undefined;
     provider: string | undefined;
-    version: 'v2' | 'v3';
+    version: 'v2' | 'v3' | 'v4';
   };
 
   /**
@@ -268,7 +347,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     model: {
       modelId: string | undefined;
       provider: string | undefined;
-      version: 'v2' | 'v3';
+      version: 'v2' | 'v3' | 'v4';
     };
     stream: ReadableStream<ChunkType<OUTPUT>>;
     messageList: MessageList;
@@ -327,8 +406,20 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
           async transform(chunk, controller) {
             // Filter out intermediate finish chunks with 'tool-calls' reason
             // These are internal signals that shouldn't reach output processors
+            //
+            // Error-shaped chunks are filtered out the same way when the caller
+            // opted into `deferErrorChunks`: they describe one model call that
+            // may still be retried or served by a fallback model, so processors
+            // must not react to them here. The caller runs processors on the
+            // error once it has ruled out recovery.
+            const isDeferredErrorChunk =
+              options.deferErrorChunks &&
+              (chunk.type === 'error' || (chunk.type === 'finish' && chunk.payload?.stepResult?.reason === 'error'));
 
-            if (chunk.type === 'finish' && chunk.payload?.stepResult?.reason === 'tool-calls') {
+            if (
+              (chunk.type === 'finish' && chunk.payload?.stepResult?.reason === 'tool-calls') ||
+              isDeferredErrorChunk
+            ) {
               controller.enqueue(chunk);
               return;
             } else {
@@ -349,6 +440,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                     tracingContext: options.tracingContext,
                     processorIndex,
                     createSpan: true,
+                    processor: structuredOutputProcessor,
                   });
                   structuredOutputProcessorState.customState = { controller };
                   processorStates.set(STRUCTURED_OUTPUT_PROCESSOR_NAME, structuredOutputProcessorState);
@@ -363,7 +455,13 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
 
               // Create a ProcessorStreamWriter from the controller so processOutputStream can emit custom chunks
               const streamWriter = {
-                custom: async (data: { type: string }) => controller.enqueue(data as ChunkType<OUTPUT>),
+                custom: async (
+                  data: { type: string; data?: unknown; transient?: boolean },
+                  writerOptions?: { messageId?: string },
+                ) => {
+                  persistProcessorDataChunk(self.messageList, writerOptions?.messageId ?? self.messageId, data);
+                  controller.enqueue(data as ChunkType<OUTPUT>);
+                },
               };
 
               const {
@@ -381,23 +479,55 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 0,
                 streamWriter,
               );
-              if (blocked) {
-                // Emit a tripwire chunk so downstream knows about the abort
+              const enqueueTripwire = (r?: string, opts?: { retry?: boolean; metadata?: unknown }, pid?: string) => {
                 controller.enqueue({
                   type: 'tripwire',
                   payload: {
-                    reason: reason || 'Output processor blocked content',
-                    retry: tripwireOptions?.retry,
-                    metadata: tripwireOptions?.metadata,
-                    processorId,
+                    reason: r || 'Output processor blocked content',
+                    retry: opts?.retry,
+                    metadata: opts?.metadata,
+                    processorId: pid,
                   },
                 } as ChunkType<OUTPUT>);
+              };
+
+              if (blocked) {
+                // Emit a tripwire chunk so downstream knows about the abort
+                enqueueTripwire(reason, tripwireOptions, processorId);
                 return;
               }
               if (processed) {
                 controller.enqueue(processed as ChunkType<OUTPUT>);
               }
+
+              // Emit any parts a processor stashed for reprocessing (e.g. the
+              // non-text part that triggered a BatchPartsProcessor flush),
+              // pushing each back through the whole chain for downstream
+              // processing.
+              const reprocessed = await processorRunner.drainReprocessParts(
+                processorStates,
+                resolveObservabilityContext(options),
+                options.requestContext,
+                self.messageList,
+                0,
+                streamWriter,
+              );
+              for (const r of reprocessed) {
+                if (r.blocked) {
+                  enqueueTripwire(r.reason, r.tripwireOptions, r.processorId);
+                  return;
+                }
+                if (r.part != null) {
+                  controller.enqueue(r.part as ChunkType<OUTPUT>);
+                }
+              }
             }
+          },
+          flush() {
+            processorRunner.endStreamProcessorSpans(processorStates);
+          },
+          cancel() {
+            processorRunner.endStreamProcessorSpans(processorStates);
           },
         }),
       );
@@ -421,8 +551,21 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
             case 'tool-call-suspended':
             case 'tool-call-approval':
               self.#status = 'suspended';
+              self.#wasSuspended = true;
               self.#delayedPromises.suspendPayload.resolve(chunk.payload);
               self.#delayedPromises.resumeSchema.resolve(chunk.payload.resumeSchema);
+              if (!self.#finishCallbackSent) {
+                self.#finishCallbackSent = true;
+                await options?.onFinish?.(self.#createSuspendedOnFinishPayload(chunk));
+              }
+              break;
+            case 'abort':
+              self.#status = 'canceled';
+              if (!self.#finishCallbackSent) {
+                self.#finishCallbackSent = true;
+                await options?.onFinish?.(self.#createAbortedOnFinishPayload());
+              }
+              self.#closeTransportIfNeeded();
               break;
             case 'raw':
               if (!self.#options.includeRawChunks) {
@@ -431,8 +574,14 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               break;
             case 'object-result':
               self.#bufferedObject = chunk.object;
+              // An output processor can still reject this attempt and ask for a retry,
+              // which would make this object stale. A settled promise cannot be
+              // un-settled, so when processors are in play the object is only buffered
+              // here and settled once the attempt survives `step-finish` (or at
+              // stream end, whichever comes first). Without processors no retry is
+              // possible, so resolve immediately and keep the existing timing.
               // Only resolve if not already rejected by validation error
-              if (self.#delayedPromises.object.status.type === 'pending') {
+              if (!self.processorRunner && self.#delayedPromises.object.status.type === 'pending') {
                 self.#delayedPromises.object.resolve(chunk.object);
               }
               break;
@@ -456,6 +605,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 providerExecuted: chunk.payload.providerExecuted,
                 providerMetadata: chunk.payload.providerMetadata,
                 dynamic: chunk.payload.dynamic,
+                ...(chunk.payload.observability ? { observability: chunk.payload.observability } : {}),
               };
               break;
             case 'tool-call-input-streaming-end': {
@@ -486,6 +636,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                     providerExecuted: meta.providerExecuted,
                     providerMetadata: meta.providerMetadata,
                     dynamic: meta.dynamic,
+                    ...(meta.observability ? { observability: meta.observability } : {}),
                   },
                 };
                 self.#toolCalls.push(synthetic);
@@ -511,9 +662,9 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               self.#bufferedFiles.push(chunk);
               self.#bufferedByStep.files.push(chunk);
               break;
-            case 'reasoning-start':
-              self.#bufferedReasoningDetails[chunk.payload.id] = {
-                type: 'reasoning',
+            case 'reasoning-start': {
+              const makeReasoningDetail = () => ({
+                type: 'reasoning' as const,
                 runId: chunk.runId,
                 from: chunk.from,
                 payload: {
@@ -521,8 +672,13 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   providerMetadata: chunk.payload.providerMetadata,
                   text: '',
                 },
-              };
+              });
+              // Two independent objects: the run-level entry keeps accumulating
+              // across steps while the per-step entry is dropped at step-finish.
+              self.#bufferedReasoningDetails[chunk.payload.id] = makeReasoningDetail();
+              self.#bufferedByStepReasoningDetails[chunk.payload.id] = makeReasoningDetail();
               break;
+            }
             case 'reasoning-delta': {
               self.#bufferedReasoning.push({
                 type: 'reasoning',
@@ -537,8 +693,11 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 payload: chunk.payload,
               });
 
-              const bufferedReasoning = self.#bufferedReasoningDetails[chunk.payload.id];
-              if (bufferedReasoning) {
+              for (const bufferedReasoning of [
+                self.#bufferedReasoningDetails[chunk.payload.id],
+                self.#bufferedByStepReasoningDetails[chunk.payload.id],
+              ]) {
+                if (!bufferedReasoning) continue;
                 bufferedReasoning.payload.text += chunk.payload.text;
                 if (chunk.payload.providerMetadata) {
                   bufferedReasoning.payload.providerMetadata = chunk.payload.providerMetadata;
@@ -548,9 +707,14 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
             }
 
             case 'reasoning-end': {
-              const bufferedReasoning = self.#bufferedReasoningDetails[chunk.payload.id];
-              if (chunk.payload.providerMetadata && bufferedReasoning) {
-                bufferedReasoning.payload.providerMetadata = chunk.payload.providerMetadata;
+              if (chunk.payload.providerMetadata) {
+                for (const bufferedReasoning of [
+                  self.#bufferedReasoningDetails[chunk.payload.id],
+                  self.#bufferedByStepReasoningDetails[chunk.payload.id],
+                ]) {
+                  if (!bufferedReasoning) continue;
+                  bufferedReasoning.payload.providerMetadata = chunk.payload.providerMetadata;
+                }
               }
               break;
             }
@@ -573,7 +737,9 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 if (chunk.payload.dynamic != null && existingSynthetic.payload.dynamic == null) {
                   existingSynthetic.payload.dynamic = chunk.payload.dynamic;
                 }
-
+                if (chunk.payload.observability && !existingSynthetic.payload.observability) {
+                  existingSynthetic.payload.observability = chunk.payload.observability;
+                }
                 return;
               }
               self.#toolCalls.push(chunk);
@@ -620,12 +786,19 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 toolCalls: self.#bufferedByStep.toolCalls,
                 toolResults: self.#bufferedByStep.toolResults,
 
-                content: messageList.get.response.aiV5.modelContent(-1),
+                // Durable agents attach pre-computed step content on the
+                // step-finish chunk because the stream adapter's messageList
+                // may be a stale reference (each workflow step deserializes
+                // a fresh instance).  Fall back to the live messageList for
+                // non-durable agents.
+                content: (chunk.payload as any)?._durableStepContent ?? messageList.get.response.aiV5.modelContent(-1),
                 text: stepText,
                 // Include tripwire data if present
                 tripwire: stepTripwire,
-                reasoningText: self.#bufferedReasoning.map(reasoningPart => reasoningPart.payload.text).join(''),
-                reasoning: Object.values(self.#bufferedReasoningDetails),
+                // Scoped to this step (like `text` above); the run-level
+                // reasoning still spans every step.
+                reasoningText: self.#bufferedByStep.reasoning.map(reasoningPart => reasoningPart.payload.text).join(''),
+                reasoning: Object.values(self.#bufferedByStepReasoningDetails),
                 get staticToolCalls() {
                   return self.#bufferedByStep.toolCalls.filter(
                     part => part.type === 'tool-call' && part.payload?.dynamic === false,
@@ -653,9 +826,9 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 response: {
                   id: chunk.payload.id || '',
                   timestamp: (chunk.payload.metadata?.timestamp as Date) || new Date(),
+                  ...otherMetadata,
                   modelId:
                     (chunk.payload.metadata?.modelId as string) || (chunk.payload.metadata?.model as string) || '',
-                  ...otherMetadata,
                   messages: chunk.payload.messages?.nonUser || [],
                   dbMessages: self.messageList.get.response.db(),
                   // We have to cast this until messageList can take generics also and type metadata, it was too
@@ -671,6 +844,16 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               });
 
               self.#bufferedSteps.push(stepResult);
+
+              // `text` is excluded from a rejected attempt via the empty `stepText`
+              // above; the structured object needs the same treatment. Drop the
+              // buffered object when this attempt is being retried, otherwise settle
+              // the object promise now that the attempt has been accepted.
+              if (stepTripwire?.retry) {
+                self.#bufferedObject = undefined;
+              } else if (self.#bufferedObject !== undefined && self.#delayedPromises.object.status.type === 'pending') {
+                self.#delayedPromises.object.resolve(self.#bufferedObject);
+              }
 
               self.#bufferedByStep = {
                 text: '',
@@ -698,6 +881,16 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 providerMetadata: undefined,
                 finishReason: undefined,
               };
+              self.#bufferedByStepReasoningDetails = {};
+
+              // A continuing goal evaluation arrived while this step was still
+              // in flight (in-process chunk ordering): this step-finish belongs
+              // to the judged turn, so drop its buffers now that its stepResult
+              // and usage have been recorded.
+              if (self.#truncateAtNextStepFinish) {
+                self.#truncateAtNextStepFinish = false;
+                self.#truncateRunBuffers();
+              }
 
               break;
             }
@@ -750,7 +943,12 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               controller.terminate();
               return;
             case 'finish':
-              self.#status = 'success';
+              // 'suspended' is not terminal: a resume leg rehydrates the persisted 'suspended'
+              // status and must be able to finish as 'success'. Only 'failed' and 'canceled'
+              // block the success transition.
+              if (self.#status !== 'failed' && self.#status !== 'canceled') {
+                self.#status = 'success';
+              }
               if (chunk.payload.stepResult.reason) {
                 self.#finishReason = chunk.payload.stepResult.reason;
               }
@@ -758,6 +956,14 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               // We can preserve finish metadata from whichever shape the upstream SDK emitted,
               // but we cannot reconstruct providerMetadata if the provider omitted it entirely.
               const finalProviderMetadata = chunk.payload.metadata?.providerMetadata ?? chunk.payload.providerMetadata;
+
+              // Retain the step providerMetadata so output-step processors can
+              // read it (e.g. to attribute a Bedrock guardrail content-filter
+              // block to the responsible policy). The completed-steps array is
+              // empty on such blocks, so this is the only carrier of the trace.
+              if (finalProviderMetadata) {
+                self.#stepProviderMetadata = finalProviderMetadata;
+              }
 
               // Check if this is a tripwire case - set tripwire data
               // This can happen when max retries is exceeded or a processor triggers a tripwire
@@ -830,7 +1036,11 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   // Must use both #emitChunk (for fullStream/EventEmitter consumers) and
                   // controller.enqueue (for raw stream consumers) to ensure visibility.
                   const outputResultWriter = {
-                    custom: async (data: { type: string }) => {
+                    custom: async (
+                      data: { type: string; data?: unknown; transient?: boolean },
+                      writerOptions?: { messageId?: string },
+                    ) => {
+                      persistProcessorDataChunk(self.messageList, writerOptions?.messageId ?? self.messageId, data);
                       self.#emitChunk(data as ChunkType<OUTPUT>);
                       controller.enqueue(data as ChunkType<OUTPUT>);
                     },
@@ -839,9 +1049,23 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   const outputResult: OutputResult = {
                     text: self.#bufferedText.join(''),
                     usage: chunk.payload.output.usage as LanguageModelUsage,
-                    finishReason: self.#finishReason || 'unknown',
+                    finishReason: self.#status === 'failed' ? 'error' : self.#finishReason || 'unknown',
                     steps: [...self.#bufferedSteps] as LLMStepResult[],
                   };
+
+                  // Canceled output bypasses the normal LLM-step response assembly. Add its
+                  // nonblank in-flight text to MessageList so every output processor receives
+                  // the same terminal transcript shape; persistence remains processor-owned.
+                  if (self.#status === 'canceled' && self.#bufferedByStep.text.trim().length > 0) {
+                    self.messageList.add(
+                      {
+                        role: 'assistant',
+                        content: [{ type: 'text', text: self.#bufferedByStep.text }],
+                      },
+                      'response',
+                      { merge: false },
+                    );
+                  }
 
                   self.messageList = await self.processorRunner.runOutputProcessors(
                     self.messageList,
@@ -853,19 +1077,26 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   );
 
                   // Get text from the latest response message (the last assistant message)
-                  const responseMessages = self.messageList.get.response.aiV4.core();
-                  const lastResponseMessage = responseMessages[responseMessages.length - 1];
-                  const outputText = lastResponseMessage ? coreContentToString(lastResponseMessage.content) : '';
+                  const outputText = resolveOutputTextSkippingCompletionChecks(self.messageList);
 
                   // Only update the last step's text if output processors actually modified it
-                  // This preserves text from retry scenarios where step.text is already correct
-                  if (lastStep && outputText && outputText !== originalText) {
+                  // This preserves text from retry scenarios where step.text is already correct.
+                  // Compare against undefined, not truthiness, so a processor clearing the text
+                  // to '' still overwrites the step text instead of leaking the original.
+                  if (
+                    self.#status !== 'canceled' &&
+                    lastStep &&
+                    outputText !== undefined &&
+                    outputText !== originalText
+                  ) {
                     lastStep.text = outputText;
                   }
 
-                  // Use the processed text if available, otherwise keep original
+                  // Use the processed text when a response message exists, even if the
+                  // processor intentionally emptied it. Only fall back to the raw model
+                  // text when there is no processed message at all.
                   this.resolvePromises({
-                    text: outputText || originalText,
+                    text: outputText ?? originalText,
                     finishReason: self.#finishReason,
                   });
 
@@ -881,14 +1112,24 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
 
                   // Cast needed because chunk.payload.response is typed with default OUTPUT=undefined
                   (chunk.payload as { response?: LLMStepResult<OUTPUT>['response'] }).response = response;
-                } else if (!self.#options.isLLMExecutionStep) {
-                  // No processor runner, not in LLM execution step - resolve with buffered text
+                } else if (!self.#options.isLLMExecutionStep || self.#options.resolveFinalPromises) {
+                  // No processor runner, not in LLM execution step - resolve ordinary
+                  // tool-driven multi-step runs with the last step's text so narration before
+                  // tool calls is excluded. Suspended/resumed tool approval flows keep the
+                  // aggregate stream text because pre-approval text is part of the resumed run.
+                  // Durable agents set resolveFinalPromises to force resolution even when
+                  // isLLMExecutionStep is true (single MastraModelOutput for the entire run).
+                  const lastStep = self.#bufferedSteps[self.#bufferedSteps.length - 1];
+                  const hasToolStep = self.#bufferedSteps.some(
+                    step => step.toolCalls.length > 0 || step.toolResults.length > 0,
+                  );
                   this.resolvePromises({
-                    text: self.#bufferedText.join(''),
+                    text: hasToolStep && !self.#wasSuspended && lastStep ? lastStep.text : self.#bufferedText.join(''),
                     finishReason: self.#finishReason,
                   });
                 }
-                // If isLLMExecutionStep is true, don't resolve text here - let the outer MastraModelOutput handle it
+                // If isLLMExecutionStep is true (without resolveFinalPromises), don't resolve
+                // text here - let the outer MastraModelOutput handle it
               } catch (error) {
                 if (error instanceof TripWire) {
                   self.#tripwire = {
@@ -911,7 +1152,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   });
                 }
                 if (self.#delayedPromises.object.status.type !== 'resolved') {
-                  self.#delayedPromises.object.resolve(undefined as OUTPUT);
+                  self.#delayedPromises.object.resolve(self.#bufferedObject as OUTPUT);
                 }
               }
 
@@ -989,21 +1230,57 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                       ? undefined
                       : self.#delayedPromises.object.status.type === 'resolved'
                         ? self.#delayedPromises.object.status.value
-                        : self.#structuredOutputMode === 'direct' && baseFinishStep.text
-                          ? (() => {
-                              try {
-                                return JSON.parse(baseFinishStep.text);
-                              } catch {
-                                return undefined;
-                              }
-                            })()
-                          : undefined,
+                        : self.#bufferedObject !== undefined
+                          ? self.#bufferedObject
+                          : self.#structuredOutputMode === 'direct' && baseFinishStep.text
+                            ? (() => {
+                                try {
+                                  return JSON.parse(baseFinishStep.text);
+                                } catch {
+                                  return undefined;
+                                }
+                              })()
+                            : undefined,
                 };
 
-                await options?.onFinish?.(onFinishPayload);
+                if (!self.#finishCallbackSent) {
+                  self.#finishCallbackSent = true;
+                  await options?.onFinish?.(onFinishPayload);
+                }
               }
 
               self.#closeTransportIfNeeded();
+              break;
+
+            case 'goal':
+              // A continuing goal evaluation marks a safe truncation point for
+              // run-lifetime buffers: the turn's messages are already persisted
+              // to the MessageList by this point, and goal runs chain many agent
+              // turns inside one stream — retaining every chunk, step, and tool
+              // result grows memory unboundedly over long goal runs (and bloats
+              // suspend snapshots via `serializeState`). `shouldContinue` is the
+              // goal gate's explicit continuation decision: only truncate when
+              // another judged iteration follows, so terminal evaluations
+              // (completion, waiting, judge failure, budget exhaustion) keep the
+              // final turn intact for run-end results like `getFullOutput()`.
+              if (chunk.payload.shouldContinue === true) {
+                self.#truncateRunBuffers();
+                // In-process engines emit the goal chunk BEFORE the judged
+                // turn's step-finish (the gate decides `isContinued` first);
+                // durable engines emit it after. If the judged step is still in
+                // flight, its step-finish lands after this boundary — drop that
+                // step's buffers too when it arrives.
+                const byStep = self.#bufferedByStep;
+                if (
+                  byStep.text.length > 0 ||
+                  byStep.toolCalls.length > 0 ||
+                  byStep.reasoning.length > 0 ||
+                  byStep.sources.length > 0 ||
+                  byStep.files.length > 0
+                ) {
+                  self.#truncateAtNextStepFinish = true;
+                }
+              }
               break;
 
             case 'error':
@@ -1021,15 +1298,27 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               });
 
               self.#closeTransportIfNeeded();
-              break;
+              // Deliver the error chunk downstream first, then settle waiters.
+              // An errored stream never reaches flush(), so without this,
+              // _waitUntilFinished() callers that subscribed before the error
+              // hang forever while later callers resolve immediately via the
+              // #streamFinished flag. Deliberately NOT 'finish': observer
+              // streams close on 'finish', and durable fallback/error-processor
+              // recovery keeps consuming chunks after an error chunk.
+              self.#emitChunk(chunk);
+              controller.enqueue(chunk);
+              self.#emitter.emit('settled');
+              return;
           }
           self.#emitChunk(chunk);
           controller.enqueue(chunk);
         },
         flush: () => {
           if (self.#delayedPromises.object.status.type === 'pending') {
-            // always resolve pending object promise as undefined if still hanging in flush and hasn't been rejected by validation error
-            self.#delayedPromises.object.resolve(undefined as OUTPUT);
+            // always resolve a pending object promise in flush (with the buffered object
+            // if the stream produced one, otherwise undefined) if it hasn't been rejected
+            // by a validation error
+            self.#delayedPromises.object.resolve(self.#bufferedObject as OUTPUT);
           }
 
           // If stream ends in suspended state (e.g., tool-call-approval), resolve promises with partial results
@@ -1172,7 +1461,17 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
    * Stream of all chunks. Provides complete control over stream processing.
    */
   get fullStream() {
-    return this.#createEventedStream();
+    const configuredTransforms = this.#options.experimentalTransform;
+    if (!configuredTransforms) {
+      return this.#createEventedStream();
+    }
+
+    const transforms = typeof configuredTransforms === 'function' ? [configuredTransforms] : configuredTransforms;
+    let stream = this.#createEventedStream();
+    for (const transform of transforms) {
+      stream = stream.pipeThrough(transform());
+    }
+    return stream;
   }
 
   /**
@@ -1270,6 +1569,14 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       this.#usageCount.cacheCreationInputTokens =
         (this.#usageCount.cacheCreationInputTokens ?? 0) + usage.cacheCreationInputTokens;
     }
+    if (usage.cacheCreationInputTokens5m !== undefined) {
+      this.#usageCount.cacheCreationInputTokens5m =
+        (this.#usageCount.cacheCreationInputTokens5m ?? 0) + usage.cacheCreationInputTokens5m;
+    }
+    if (usage.cacheCreationInputTokens1h !== undefined) {
+      this.#usageCount.cacheCreationInputTokens1h =
+        (this.#usageCount.cacheCreationInputTokens1h ?? 0) + usage.cacheCreationInputTokens1h;
+    }
     // raw is provider-specific and not summable; keep the latest step's raw
     if (usage.raw !== undefined) {
       this.#usageCount.raw = usage.raw;
@@ -1300,26 +1607,38 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     if (usage.cacheCreationInputTokens !== undefined && this.#usageCount.cacheCreationInputTokens === undefined) {
       this.#usageCount.cacheCreationInputTokens = usage.cacheCreationInputTokens;
     }
+    if (usage.cacheCreationInputTokens5m !== undefined && this.#usageCount.cacheCreationInputTokens5m === undefined) {
+      this.#usageCount.cacheCreationInputTokens5m = usage.cacheCreationInputTokens5m;
+    }
+    if (usage.cacheCreationInputTokens1h !== undefined && this.#usageCount.cacheCreationInputTokens1h === undefined) {
+      this.#usageCount.cacheCreationInputTokens1h = usage.cacheCreationInputTokens1h;
+    }
     if (usage.raw !== undefined && this.#usageCount.raw === undefined) {
       this.#usageCount.raw = usage.raw;
     }
   }
 
   async consumeStream(options?: ConsumeStreamOptions): Promise<void> {
-    if (this.#consumptionStarted) {
-      return;
-    }
-
-    this.#consumptionStarted = true;
-
-    try {
-      await consumeStream({
+    // Drain #baseStream exactly once but let every caller await full consumption,
+    // so `await consumeStream()` holds regardless of who started it. Capture any
+    // drain error once (don't bind a caller's onError to the drain), then fire each
+    // caller's own onError after the shared promise settles.
+    if (!this.#consumeStreamPromise) {
+      this.#consumptionStarted = true;
+      this.#consumeStreamPromise = consumeStream({
         stream: this.#baseStream as globalThis.ReadableStream<any>,
-        onError: options?.onError,
+        onError: error => {
+          this.#consumeStreamErrored = true;
+          this.#consumeStreamError = error;
+        },
         logger: this.logger,
       });
-    } catch (error) {
-      options?.onError?.(error);
+    }
+
+    await this.#consumeStreamPromise;
+
+    if (this.#consumeStreamErrored) {
+      options?.onError?.(this.#consumeStreamError);
     }
   }
 
@@ -1545,9 +1864,34 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   _getImmediateFinishReason() {
     return this.#finishReason;
   }
+  /** @internal */
+  _getImmediateProviderMetadata() {
+    return this.#stepProviderMetadata;
+  }
   /** @internal  */
   _getBaseStream() {
     return this.#baseStream;
+  }
+
+  /** @internal */
+  _waitUntilFinished() {
+    if (this.#streamFinished) {
+      return Promise.resolve();
+    }
+
+    return new Promise<void>(resolve => {
+      const done = () => {
+        this.#emitter.off('finish', done);
+        this.#emitter.off('settled', done);
+        resolve();
+      };
+      // 'finish' fires when the stream flushes cleanly; 'settled' fires when an
+      // error chunk marks the stream finished without closing it (observer
+      // streams must survive an error chunk for fallback recovery, so the
+      // error path cannot emit 'finish').
+      this.#emitter.once('finish', done);
+      this.#emitter.once('settled', done);
+    });
   }
 
   #getTotalUsage(): LanguageModelUsage {
@@ -1567,7 +1911,77 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       reasoningTokens: this.#usageCount.reasoningTokens,
       cachedInputTokens: this.#usageCount.cachedInputTokens,
       cacheCreationInputTokens: this.#usageCount.cacheCreationInputTokens,
+      cacheCreationInputTokens5m: this.#usageCount.cacheCreationInputTokens5m,
+      cacheCreationInputTokens1h: this.#usageCount.cacheCreationInputTokens1h,
       ...(this.#usageCount.raw !== undefined && { raw: this.#usageCount.raw }),
+    };
+  }
+
+  #createAbortedOnFinishPayload(): MastraOnFinishCallbackArgs<OUTPUT> {
+    // Capture only text buffered before the abort event. Providers may continue producing
+    // chunks after cancellation, but those chunks cannot extend this terminal snapshot.
+    return {
+      finishReason: 'aborted',
+      text: this.#bufferedText.join(''),
+      reasoning: [],
+      reasoningText: undefined,
+      sources: [],
+      files: [],
+      toolCalls: [],
+      toolResults: [],
+      staticToolCalls: [],
+      staticToolResults: [],
+      dynamicToolCalls: [],
+      dynamicToolResults: [],
+      content: [],
+      usage: { inputTokens: undefined, outputTokens: undefined, totalTokens: undefined },
+      warnings: [],
+      providerMetadata: undefined,
+      request: {},
+      response: {},
+      steps: [],
+      totalUsage: { inputTokens: undefined, outputTokens: undefined, totalTokens: undefined },
+      object: undefined as OUTPUT,
+    };
+  }
+
+  #createSuspendedOnFinishPayload(
+    chunk: Extract<ChunkType<OUTPUT>, { type: 'tool-call-approval' | 'tool-call-suspended' }>,
+  ): MastraOnFinishCallbackArgs<OUTPUT> & {
+    suspendReason: 'tool-call-approval' | 'tool-call-suspended';
+    toolName: string;
+    toolCallId: string;
+  } {
+    // Suspend flow invokes options?.onFinish so map-results-step.ts can close the AGENT_RUN span.
+    // That span path only reads finishReason + suspendReason/toolName/toolCallId. The remaining
+    // LLMStepResult fields are empty defaults to satisfy the MastraOnFinishCallback shape without
+    // reconstructing partial buffered text/tool/message state from a half-finished stream.
+    return {
+      finishReason: 'suspended',
+      suspendReason: chunk.type,
+      toolName: chunk.payload.toolName,
+      toolCallId: chunk.payload.toolCallId,
+      // Empty defaults for the LLMStepResult/MastraOnFinishCallback shape.
+      text: '',
+      reasoning: [],
+      reasoningText: undefined,
+      sources: [],
+      files: [],
+      toolCalls: [],
+      toolResults: [],
+      staticToolCalls: [],
+      staticToolResults: [],
+      dynamicToolCalls: [],
+      dynamicToolResults: [],
+      content: [],
+      usage: { inputTokens: undefined, outputTokens: undefined, totalTokens: undefined },
+      warnings: [],
+      providerMetadata: undefined,
+      request: {},
+      response: {},
+      steps: [],
+      totalUsage: { inputTokens: undefined, outputTokens: undefined, totalTokens: undefined },
+      object: undefined as OUTPUT,
     };
   }
 
@@ -1576,8 +1990,39 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     this.#emitter.emit('chunk', chunk); // emit chunk for existing listener streams
   }
 
+  /**
+   * Drops all run-lifetime accumulators. Called at goal-evaluation boundaries,
+   * where every completed step has already been persisted to the MessageList.
+   * After truncation, run-end results (`text`, `steps`, `toolCalls`, …,
+   * `getFullOutput()`) cover only the segment after the last evaluation —
+   * for goal runs that segment is the completion answer. Token usage
+   * (`#usageCount`), in-flight per-step state (`#bufferedByStep`), structured
+   * output, and the MessageList are intentionally untouched.
+   */
+  #truncateRunBuffers() {
+    this.#bufferedChunks.length = 0;
+    this.#bufferedSteps.length = 0;
+    this.#bufferedText.length = 0;
+    this.#bufferedTextChunks = {};
+    this.#bufferedSources.length = 0;
+    this.#bufferedReasoning.length = 0;
+    this.#bufferedReasoningDetails = {};
+    this.#bufferedFiles.length = 0;
+    this.#toolCalls.length = 0;
+    this.#toolResults.length = 0;
+    this.#toolCallArgsDeltas = {};
+    this.#toolCallDeltaIdNameMap = {};
+    this.#toolCallStreamingMeta = {};
+  }
+
   #createEventedStream() {
     const self = this;
+    // Holds this subscriber's own detach function once start() registers its
+    // listeners. cancel() must only remove this subscriber's handlers — the
+    // emitter is shared across every concurrent consumer of this output, so
+    // removeAllListeners() here would silently kill every other subscriber
+    // (see #19743).
+    let detach: (() => void) | undefined;
 
     return new ReadableStream<ChunkType<OUTPUT>>({
       start(controller) {
@@ -1605,6 +2050,11 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
 
         self.#emitter.on('chunk', chunkHandler);
         self.#emitter.on('finish', finishHandler);
+
+        detach = () => {
+          self.#emitter.off('chunk', chunkHandler);
+          self.#emitter.off('finish', finishHandler);
+        };
       },
 
       pull(_controller) {
@@ -1615,8 +2065,8 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       },
 
       cancel() {
-        // Stream was cancelled, clean up
-        self.#emitter.removeAllListeners();
+        // Only detach this subscriber's own listeners — never the whole emitter.
+        detach?.();
       },
     });
   }
@@ -1626,10 +2076,13 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   }
 
   serializeState() {
+    const { steps, requests } = dedupeStepRequests(packStepMessageMirrors(this.#bufferedSteps));
     return {
       status: this.#status,
-      bufferedSteps: this.#bufferedSteps,
+      bufferedSteps: steps,
+      bufferedStepRequests: requests,
       bufferedReasoningDetails: this.#bufferedReasoningDetails,
+      bufferedByStepReasoningDetails: this.#bufferedByStepReasoningDetails,
       bufferedByStep: this.#bufferedByStep,
       bufferedText: this.#bufferedText,
       bufferedTextChunks: this.#bufferedTextChunks,
@@ -1646,14 +2099,15 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       request: this.#request,
       usageCount: this.#usageCount,
       tripwire: this.#tripwire,
+      wasSuspended: this.#wasSuspended,
       messageList: this.messageList.serialize(),
     };
   }
 
   deserializeState(state: any) {
     this.#status = state.status;
-    this.#bufferedSteps = state.bufferedSteps;
     this.#bufferedReasoningDetails = state.bufferedReasoningDetails;
+    this.#bufferedByStepReasoningDetails = state.bufferedByStepReasoningDetails ?? {};
     this.#bufferedByStep = state.bufferedByStep;
     this.#bufferedText = state.bufferedText;
     this.#bufferedTextChunks = state.bufferedTextChunks;
@@ -1670,6 +2124,14 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     this.#request = state.request;
     this.#usageCount = state.usageCount;
     this.#tripwire = state.tripwire;
+    this.#wasSuspended = state.wasSuspended ?? state.status === 'suspended';
     this.messageList = this.messageList.deserialize(state.messageList);
+    // Buffered steps hold only the IDs of the response messages they had seen;
+    // rebuilding their lazy mirrors needs the restored message list, so this has
+    // to come last.
+    this.#bufferedSteps = unpackStepMessageMirrors(
+      rehydrateStepRequests(state.bufferedSteps, state.bufferedStepRequests),
+      this.messageList,
+    );
   }
 }

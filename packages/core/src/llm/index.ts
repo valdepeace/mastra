@@ -21,6 +21,7 @@ import type { RequestContext } from '../request-context';
 import type { Run } from '../run/types';
 import type { StandardSchemaWithJSON } from '../schema';
 import type { CoreTool } from '../tools/types';
+import type { ProviderModelsMap as GeneratedProviderModelsMap } from './model/provider-types.generated.js';
 import type { MastraLanguageModel } from './model/shared.types';
 
 export type LanguageModel = MastraLanguageModel;
@@ -77,8 +78,57 @@ export type {
 } from './model/base.types';
 export type { TripwireProperties, MastraModelConfig, OpenAICompatibleConfig } from './model/shared.types';
 export { ModelRouterLanguageModel, defaultGateways } from './model/router';
-export { GatewayRegistry, PROVIDER_REGISTRY, parseModelString, getProviderConfig } from './model/provider-registry.js';
-export type { ModelRouterModelId, Provider, ModelForProvider } from './model/provider-registry.js';
+export {
+  GatewayRegistry,
+  PROVIDER_REGISTRY,
+  parseModelString,
+  getProviderConfig,
+  modelSupportsAttachments,
+  modelSupportsStructuredOutput,
+  modelSupportsTemperature,
+} from './model/provider-registry.js';
+export type { AttachmentCapabilities } from './model/provider-registry.js';
+
+/**
+ * Map of provider ID to the models that provider serves.
+ *
+ * Declared as an interface so it can be extended through declaration merging.
+ * Custom gateways register their providers and models by augmenting this module,
+ * which flows through to {@link Provider}, {@link ModelForProvider} and
+ * {@link ModelRouterModelId}:
+ *
+ * ```ts
+ * import '@mastra/core/llm';
+ *
+ * declare module '@mastra/core/llm' {
+ *   interface ProviderModelsMap {
+ *     'my-provider': readonly ['model-1', 'model-2'];
+ *   }
+ * }
+ * ```
+ */
+export interface ProviderModelsMap extends GeneratedProviderModelsMap {}
+
+/**
+ * Union type of all registered provider IDs, including augmented ones.
+ */
+export type Provider = keyof ProviderModelsMap;
+
+/**
+ * Model IDs served by a specific provider.
+ * Example: `ModelForProvider<'openai'>` = `'gpt-4o' | 'gpt-4-turbo' | ...`
+ */
+export type ModelForProvider<P extends Provider> = ProviderModelsMap[P][number];
+
+/**
+ * Full `provider/model` paths, e.g. `"openai/gpt-4o"`.
+ */
+export type ModelRouterModelId =
+  | {
+      [P in Provider]: `${P}/${ProviderModelsMap[P][number]}`;
+    }[Provider]
+  | `mastra/${ProviderModelsMap['openrouter'][number]}`
+  | (string & {});
 export { resolveModelConfig } from './model/resolve-model';
 
 export type OutputType = StructuredOutput | StandardSchemaWithJSON | undefined;
@@ -147,7 +197,13 @@ export type LLMStreamObjectOptions<Z extends StandardSchemaWithJSON | undefined 
 } & LLMInnerStreamOptions<Z> &
   DefaultLLMStreamObjectOptions;
 
-export type { ProviderConfig, GatewayLanguageModel } from './model/gateways/base';
+export type {
+  ProviderConfig,
+  GatewayLanguageModel,
+  MastraModelGatewayInterface,
+  GatewayAuthRequest,
+  GatewayAuthResult,
+} from './model/gateways/base';
 export {
   MastraModelGateway,
   NetlifyGateway,
@@ -162,5 +218,6 @@ export type {
   MastraGatewayConfig,
 } from './model/gateways';
 export { GATEWAY_AUTH_HEADER } from './model/gateways/constants';
+export { resolveModelAuth, type ResolveModelAuthArgs } from './model/model-auth-resolver';
 
 export { ModelRouterEmbeddingModel, type EmbeddingModelId, EMBEDDING_MODELS, type EmbeddingModelInfo } from './model';

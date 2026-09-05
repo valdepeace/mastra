@@ -41,7 +41,29 @@ export class EditorSkillNamespace extends CrudEditorNamespace<
 
     return {
       create: input => store.create({ skill: input }),
-      getByIdResolved: id => store.getByIdResolved(id),
+      getByIdResolved: async (id, options) => {
+        if (options?.versionId || options?.versionNumber !== undefined) {
+          const skill = await store.getById(id);
+          if (!skill) return null;
+
+          const version = options.versionId
+            ? await store.getVersion(options.versionId)
+            : await store.getVersionByNumber(id, options.versionNumber!);
+          if (!version || version.skillId !== id) return null;
+
+          const {
+            id: versionId,
+            skillId: _skillId,
+            versionNumber: _versionNumber,
+            changedFields: _changedFields,
+            changeMessage: _changeMessage,
+            createdAt: _createdAt,
+            ...snapshot
+          } = version;
+          return { ...skill, ...snapshot, resolvedVersionId: versionId } as StorageResolvedSkillType;
+        }
+        return store.getByIdResolved(id, options?.status ? { status: options.status } : undefined);
+      },
       update: input => store.update(input),
       delete: id => store.delete(id),
       list: args => store.list(args),
@@ -68,13 +90,23 @@ export class EditorSkillNamespace extends CrudEditorNamespace<
       throw new Error('No blob store is configured. Register one via new MastraEditor({ blobStores: [...] })');
 
     // Collect and store blobs
-    const { snapshot, tree } = await publishSkillFromSource(source, skillPath, blobStore);
+    const { snapshot, tree, files } = await publishSkillFromSource(source, skillPath, blobStore);
 
-    // Update the skill with new version data + tree (creates a new version)
+    // Strip undefined keys before passing to update(); see the matching
+    // comment in the HTTP publish handler. Adapters that bind args raw
+    // (libsql, pg) reject undefined as an argument.
+    const snapshotUpdate: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(snapshot)) {
+      if (value !== undefined) snapshotUpdate[key] = value;
+    }
+
+    // Update the skill with new version data + tree + UI-facing file tree
+    // (creates a new version)
     await skillStore.update({
       id: skillId,
-      ...snapshot,
+      ...snapshotUpdate,
       tree,
+      files,
       status: 'published',
     });
 

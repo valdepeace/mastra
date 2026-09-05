@@ -9,9 +9,17 @@ import type { LanguageModelUsage, ProviderMetadata } from '@mastra/core/stream';
  * Provider-specific metadata shapes for type-safe access.
  * These match the actual shapes from AI SDK providers.
  */
+interface AnthropicCacheCreation {
+  ephemeral_5m_input_tokens?: number;
+  ephemeral_1h_input_tokens?: number;
+  ephemeral5mInputTokens?: number;
+  ephemeral1hInputTokens?: number;
+}
+
 interface AnthropicMetadata {
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
+  cacheCreation?: AnthropicCacheCreation;
 }
 
 interface GoogleUsageMetadata {
@@ -102,8 +110,20 @@ export function extractUsageMetrics(usage?: LanguageModelUsage, providerMetadata
   if (!isDefined(inputDetails.cacheRead) && isDefined(usage.cachedInputTokens)) {
     inputDetails.cacheRead = usage.cachedInputTokens;
   }
+  if (isDefined(usage.cacheCreationInputTokens5m)) {
+    inputDetails.cacheWrite5m = usage.cacheCreationInputTokens5m;
+  }
+  if (isDefined(usage.cacheCreationInputTokens1h)) {
+    inputDetails.cacheWrite1h = usage.cacheCreationInputTokens1h;
+  }
   if (!isDefined(inputDetails.cacheWrite) && isDefined(usage.cacheCreationInputTokens)) {
     inputDetails.cacheWrite = usage.cacheCreationInputTokens;
+  }
+  if (
+    !isDefined(inputDetails.cacheWrite) &&
+    (isDefined(inputDetails.cacheWrite5m) || isDefined(inputDetails.cacheWrite1h))
+  ) {
+    inputDetails.cacheWrite = (inputDetails.cacheWrite5m ?? 0) + (inputDetails.cacheWrite1h ?? 0);
   }
 
   // reasoningTokens from usage (OpenAI o1 models)
@@ -125,8 +145,22 @@ export function extractUsageMetrics(usage?: LanguageModelUsage, providerMetadata
     if (!isDefined(inputDetails.cacheRead) && isDefined(anthropic.cacheReadInputTokens)) {
       inputDetails.cacheRead = anthropic.cacheReadInputTokens;
     }
-    if (!isDefined(inputDetails.cacheWrite) && isDefined(anthropic.cacheCreationInputTokens)) {
-      inputDetails.cacheWrite = anthropic.cacheCreationInputTokens;
+    const cacheWrite5m =
+      anthropic.cacheCreation?.ephemeral_5m_input_tokens ?? anthropic.cacheCreation?.ephemeral5mInputTokens;
+    const cacheWrite1h =
+      anthropic.cacheCreation?.ephemeral_1h_input_tokens ?? anthropic.cacheCreation?.ephemeral1hInputTokens;
+    if (!isDefined(inputDetails.cacheWrite5m) && isDefined(cacheWrite5m)) {
+      inputDetails.cacheWrite5m = cacheWrite5m;
+    }
+    if (!isDefined(inputDetails.cacheWrite1h) && isDefined(cacheWrite1h)) {
+      inputDetails.cacheWrite1h = cacheWrite1h;
+    }
+    if (!isDefined(inputDetails.cacheWrite)) {
+      if (isDefined(anthropic.cacheCreationInputTokens)) {
+        inputDetails.cacheWrite = anthropic.cacheCreationInputTokens;
+      } else if (isDefined(cacheWrite5m) || isDefined(cacheWrite1h)) {
+        inputDetails.cacheWrite = (cacheWrite5m ?? 0) + (cacheWrite1h ?? 0);
+      }
     }
 
     // Skip adjustment when inputTokens already includes cache tokens (V3 raw or any positive Mastra-aggregated cache field).
@@ -184,4 +218,62 @@ export function extractUsageMetrics(usage?: LanguageModelUsage, providerMetadata
 
 function sumDefinedValues<T extends object, K extends keyof T>(obj: T, keys: K[]): number {
   return keys.reduce((sum, key) => sum + ((obj[key] as number | undefined) ?? 0), 0);
+}
+
+function addOptional(a: number | undefined, b: number | undefined): number | undefined {
+  if (a === undefined && b === undefined) return undefined;
+  return (a ?? 0) + (b ?? 0);
+}
+
+function mergeInputDetails(
+  a: InputTokenDetails | undefined,
+  b: InputTokenDetails | undefined,
+): InputTokenDetails | undefined {
+  if (!a) return b ? { ...b } : undefined;
+  if (!b) return { ...a };
+  return {
+    text: addOptional(a.text, b.text),
+    cacheRead: addOptional(a.cacheRead, b.cacheRead),
+    cacheWrite: addOptional(a.cacheWrite, b.cacheWrite),
+    cacheWrite5m: addOptional(a.cacheWrite5m, b.cacheWrite5m),
+    cacheWrite1h: addOptional(a.cacheWrite1h, b.cacheWrite1h),
+    audio: addOptional(a.audio, b.audio),
+    image: addOptional(a.image, b.image),
+  };
+}
+
+function mergeOutputDetails(
+  a: OutputTokenDetails | undefined,
+  b: OutputTokenDetails | undefined,
+): OutputTokenDetails | undefined {
+  if (!a) return b ? { ...b } : undefined;
+  if (!b) return { ...a };
+  return {
+    text: addOptional(a.text, b.text),
+    reasoning: addOptional(a.reasoning, b.reasoning),
+    audio: addOptional(a.audio, b.audio),
+    image: addOptional(a.image, b.image),
+  };
+}
+
+/**
+ * Sum two UsageStats into a new one. Treats undefined fields as zero when
+ * the other side has a value, and preserves undefined when both are absent.
+ * Used to roll up internal model-generation usage onto a visible ancestor
+ * span so cost / token attribution survives internal-span filtering.
+ */
+export function addUsageStats(a: UsageStats | undefined, b: UsageStats): UsageStats {
+  if (!a) {
+    return {
+      ...b,
+      inputDetails: b.inputDetails ? { ...b.inputDetails } : undefined,
+      outputDetails: b.outputDetails ? { ...b.outputDetails } : undefined,
+    };
+  }
+  return {
+    inputTokens: addOptional(a.inputTokens, b.inputTokens),
+    outputTokens: addOptional(a.outputTokens, b.outputTokens),
+    inputDetails: mergeInputDetails(a.inputDetails, b.inputDetails),
+    outputDetails: mergeOutputDetails(a.outputDetails, b.outputDetails),
+  };
 }

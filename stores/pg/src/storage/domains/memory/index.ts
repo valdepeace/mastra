@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { createRequire } from 'node:module';
 import { MessageList } from '@mastra/core/agent';
 import type { MastraMessageContentV2 } from '@mastra/core/agent';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
@@ -8,11 +7,14 @@ import {
   MemoryStorage,
   normalizePerPage,
   calculatePagination,
+  OBSERVATIONAL_MEMORY_TABLE_SCHEMA,
   TABLE_MESSAGES,
   TABLE_RESOURCES,
   TABLE_THREADS,
   TABLE_SCHEMAS,
   createStorageErrorId,
+  storageMessageMatchesMetadataFilter,
+  validateStorageMetadataFilter,
 } from '@mastra/core/storage';
 
 /**
@@ -21,6 +23,10 @@ import {
  * versions that don't export TABLE_OBSERVATIONAL_MEMORY.
  */
 const OM_TABLE = 'mastra_observational_memory' as const;
+const POSTGRES_MAX_BIND_PARAMETERS = 65535;
+// Keep in sync with the message INSERT column list in saveMessages.
+const MESSAGE_INSERT_BIND_PARAMETERS = 8;
+const MAX_MESSAGES_PER_INSERT = Math.floor(POSTGRES_MAX_BIND_PARAMETERS / MESSAGE_INSERT_BIND_PARAMETERS);
 
 /**
  * Columns added to the OM table after its initial release.
@@ -50,18 +56,14 @@ export const OM_MIGRATION_COLUMNS: string[] = [
 ];
 
 /**
- * Try to import the OM schema statically. On older @mastra/core versions that
- * don't export OBSERVATIONAL_MEMORY_TABLE_SCHEMA this will be undefined,
- * and getExportDDL / init() will simply skip the OM table.
+ * The OM schema is imported statically above: the peer dependency range
+ * (`@mastra/core >= 1.49.0`) guarantees the export exists. This used to be a
+ * dynamic `require` guarded by `typeof require === 'function'` for older core
+ * versions, but esbuild rewrites the bare `require` identifier in the ESM
+ * bundle to a shim that always throws, and the silent catch meant the
+ * published ESM build skipped creating the OM table entirely (#18954).
  */
-let _omTableSchema: Record<string, Record<string, any>> | undefined;
-try {
-  const __require = typeof require === 'function' ? require : createRequire(import.meta.url);
-  const storage = __require('@mastra/core/storage');
-  _omTableSchema = storage.OBSERVATIONAL_MEMORY_TABLE_SCHEMA;
-} catch {
-  // OM not available in this version of core
-}
+const _omTableSchema: Record<string, Record<string, any>> = OBSERVATIONAL_MEMORY_TABLE_SCHEMA;
 import type {
   StorageResourceType,
   StorageListMessagesInput,
@@ -85,6 +87,11 @@ import type {
   SwapBufferedReflectionToActiveInput,
   CreateReflectionGenerationInput,
   UpdateObservationalMemoryConfigInput,
+  PruneOptions,
+  PruneResult,
+  RetentionTablesDescriptor,
+  TableRetentionPolicy,
+  TABLE_NAMES,
 } from '@mastra/core/storage';
 import { parseSqlIdentifier } from '@mastra/core/utils';
 import {
@@ -96,6 +103,7 @@ import {
   getTableName as dbGetTableName,
 } from '../../db';
 import type { PgDomainConfig } from '../../db';
+import { runPrune, runBatchedDelete, resolveTargets } from '../../retention';
 
 // Database row type that includes timezone-aware columns
 type MessageRowFromDB = {
@@ -128,8 +136,49 @@ function inPlaceholders(count: number, startIndex = 1): string {
   return Array.from({ length: count }, (_, i) => `$${i + startIndex}`).join(', ');
 }
 
+/**
+ * Bind dates as UTC strings because node-postgres serializes Date parameters
+ * for TIMESTAMP columns using the process's local timezone.
+ */
+function toUtcISOString(date: Date): string {
+  return date.toISOString();
+}
+
+function dedupeMessagesForSave(messages: MastraDBMessage[]): MastraDBMessage[] {
+  const deduped = new Map<string, MastraDBMessage>();
+  for (const message of messages) {
+    const existing = deduped.get(message.id);
+    if (existing) {
+      deduped.set(message.id, {
+        ...message,
+        createdAt: existing.createdAt,
+      });
+    } else {
+      deduped.set(message.id, {
+        ...message,
+        createdAt: message.createdAt || new Date(),
+      });
+    }
+  }
+  return Array.from(deduped.values());
+}
+
 export class MemoryPG extends MemoryStorage {
+  override readonly supportsPartialThreadUpdate = true;
   readonly supportsObservationalMemory = true;
+
+  /**
+   * Retention-eligible tables. `threads`, `messages`, and `resources` all anchor
+   * on the timezone-aware `createdAtZ` mirror column (kept in sync by triggers),
+   * and are indexed for fast batched deletes. Cascade order is enforced in
+   * `prune()` (children before threads), not here. Observational memory has no
+   * timestamp anchor and is deliberately excluded.
+   */
+  static override readonly retentionTables: RetentionTablesDescriptor = {
+    messages: { table: TABLE_MESSAGES, column: 'createdAtZ', indexed: true },
+    resources: { table: TABLE_RESOURCES, column: 'createdAtZ', indexed: true },
+    threads: { table: TABLE_THREADS, column: 'createdAtZ', indexed: true },
+  };
 
   #db: PgDB;
   #schema: string;
@@ -154,14 +203,13 @@ export class MemoryPG extends MemoryStorage {
     await this.#db.createTable({ tableName: TABLE_MESSAGES, schema: TABLE_SCHEMAS[TABLE_MESSAGES] });
     await this.#db.createTable({ tableName: TABLE_RESOURCES, schema: TABLE_SCHEMAS[TABLE_RESOURCES] });
 
-    // Dynamically import OM schema to avoid breaking older @mastra/core versions
-    let omSchema: Record<string, any> | undefined;
-    try {
-      const { OBSERVATIONAL_MEMORY_TABLE_SCHEMA } = await import('@mastra/core/storage');
-      omSchema = OBSERVATIONAL_MEMORY_TABLE_SCHEMA?.[OM_TABLE];
-    } catch {
-      // OM not available in this version of core
-    }
+    // Reuse the module-level `_omTableSchema` (static import). Don't switch
+    // this to `await import('@mastra/core/storage')`: that used to deadlock
+    // `mastra build` output, because bundlers rewrite the dynamic import to
+    // point at the entry chunk that statically depends on this file, so the
+    // cycle never resolves when storage initializes during module
+    // evaluation (#18298).
+    const omSchema = _omTableSchema?.[OM_TABLE];
 
     if (omSchema) {
       await this.#db.createTable({
@@ -186,10 +234,38 @@ export class MemoryPG extends MemoryStorage {
         indexName: OM_TABLE,
         schemaName: getSchemaName(this.#schema),
       });
-      await this.#db.client.none(`CREATE INDEX IF NOT EXISTS idx_om_lookup_key ON ${omTableName} ("lookupKey")`);
+      await this.#db.createIndexFromStatement(
+        'idx_om_lookup_key',
+        `CREATE INDEX IF NOT EXISTS idx_om_lookup_key ON ${omTableName} ("lookupKey")`,
+      );
     }
     await this.createDefaultIndexes();
     await this.createCustomIndexes();
+  }
+
+  /**
+   * Lazily ensures a btree index exists on each configured policy's retention
+   * anchor column so age-based `prune()` deletes stay fast on large tables.
+   * Called from the prune path (not init) so only deployments that configure
+   * retention pay the index's write/disk overhead. Best-effort: failures are
+   * logged and pruning proceeds (correct, just slower).
+   * Created even with `skipDefaultIndexes` — retention is an explicit opt-in,
+   * so its supporting index is not part of the default index set.
+   */
+  private async ensureRetentionIndexes(policies: Record<string, TableRetentionPolicy>): Promise<void> {
+    const prefix = this.#schema && this.#schema !== 'public' ? `${this.#schema}_` : '';
+    for (const [key, entry] of Object.entries(MemoryPG.retentionTables)) {
+      if (!entry.indexed || !policies[key]) continue;
+      try {
+        await this.#db.ensureIndex({
+          indexName: `${prefix}mastra_${key}_retention_idx`,
+          tableName: entry.table as TABLE_NAMES,
+          column: entry.column,
+        });
+      } catch (error) {
+        this.logger?.warn?.(`Failed to create retention index for ${entry.table}:`, error);
+      }
+    }
   }
 
   /**
@@ -311,6 +387,79 @@ export class MemoryPG extends MemoryStorage {
   }
 
   /**
+   * Deletes rows older than the configured `maxAge` per table, in bounded,
+   * batched, cancellable chunks. Tables are pruned children-first (messages and
+   * resources before threads) since PostgreSQL has no FK cascade in this schema.
+   * Unset tables are kept forever.
+   *
+   * When a `messages` policy is set, semantic-recall embeddings for pruned
+   * messages are also swept from same-schema `memory_messages*` vector tables
+   * (best-effort, mirroring `deleteThread`). Embeddings held in an external
+   * vector store are out of reach and must be pruned by the operator.
+   */
+  async prune(policies: Record<string, TableRetentionPolicy>, options?: PruneOptions): Promise<PruneResult[]> {
+    await this.ensureRetentionIndexes(policies);
+    const targets = resolveTargets({
+      policies,
+      descriptor: MemoryPG.retentionTables,
+      order: ['messages', 'resources', 'threads'],
+    });
+    const results = await runPrune({ db: this.#db, domain: 'memory', targets, options });
+    if (policies['messages']) {
+      await this.pruneOrphanedVectorRows(policies['messages'], options);
+    }
+    return results;
+  }
+
+  /**
+   * Best-effort sweep of semantic-recall vector rows whose source message no
+   * longer exists (e.g. it was just pruned), so recall doesn't keep returning
+   * embeddings that resolve to nothing. Only same-schema default vector tables
+   * (`memory_messages*`) are covered — the same set `deleteThread` cleans up.
+   * Failures are logged, never thrown: vector cleanup must not fail the prune.
+   */
+  private async pruneOrphanedVectorRows(policy: TableRetentionPolicy, options?: PruneOptions): Promise<void> {
+    try {
+      const schemaName = this.#schema || 'public';
+      const vectorTables = await this.#db.client.manyOrNone<{ tablename: string }>(
+        `
+        SELECT tablename
+        FROM pg_tables
+        WHERE schemaname = $1
+        AND (tablename = 'memory_messages' OR tablename LIKE 'memory_messages_%')
+      `,
+        [schemaName],
+      );
+
+      const messagesTable = getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) });
+      for (const { tablename } of vectorTables) {
+        const vectorTableName = getTableName({ indexName: tablename, schemaName: getSchemaName(this.#schema) });
+        await runBatchedDelete({
+          deleteBatch: async limit => {
+            const result = await this.#db.client.query(
+              `
+              DELETE FROM ${vectorTableName}
+              WHERE ctid IN (
+                SELECT v.ctid FROM ${vectorTableName} v
+                WHERE v.metadata->>'message_id' IS NOT NULL
+                AND NOT EXISTS (SELECT 1 FROM ${messagesTable} m WHERE m.id = v.metadata->>'message_id')
+                LIMIT $1
+              )
+            `,
+              [limit],
+            );
+            return result.rowCount ?? 0;
+          },
+          batchSize: policy.batchSize ?? 1000,
+          options,
+        });
+      }
+    } catch (error) {
+      this.logger?.warn?.('Failed to sweep orphaned semantic-recall vector rows after prune:', error);
+    }
+  }
+
+  /**
    * Normalizes message row from database by applying createdAtZ fallback
    */
   private normalizeMessageRow(row: MessageRowFromDB): Omit<MessageRowFromDB, 'createdAtZ'> {
@@ -325,13 +474,27 @@ export class MemoryPG extends MemoryStorage {
     };
   }
 
-  async getThreadById({ threadId }: { threadId: string }): Promise<StorageThreadType | null> {
+  async getThreadById({
+    threadId,
+    resourceId,
+  }: {
+    threadId: string;
+    resourceId?: string;
+  }): Promise<StorageThreadType | null> {
     try {
       const tableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
 
+      let query = `SELECT * FROM ${tableName} WHERE id = $1`;
+      let params: any[] = [threadId];
+
+      if (resourceId !== undefined) {
+        query += ` AND "resourceId" = $2`;
+        params.push(resourceId);
+      }
+
       const thread = await this.#db.client.oneOrNone<StorageThreadType & { createdAtZ: Date; updatedAtZ: Date }>(
-        `SELECT * FROM ${tableName} WHERE id = $1`,
-        [threadId],
+        query,
+        params,
       );
 
       if (!thread) {
@@ -465,6 +628,10 @@ export class MemoryPG extends MemoryStorage {
         hasMore: perPageInput === false ? false : offset + perPage < total,
       };
     } catch (error) {
+      // Re-throw USER errors (validation errors) directly so callers get proper 400 responses
+      if (error instanceof MastraError && error.category === ErrorCategory.USER) {
+        throw error;
+      }
       const mastraError = new MastraError(
         {
           id: createStorageErrorId('PG', 'LIST_THREADS', 'FAILED'),
@@ -480,19 +647,15 @@ export class MemoryPG extends MemoryStorage {
       );
       this.logger?.error?.(mastraError.toString());
       this.logger?.trackException(mastraError);
-      return {
-        threads: [],
-        total: 0,
-        page,
-        perPage: perPageForResponse,
-        hasMore: false,
-      };
+      throw mastraError;
     }
   }
 
   async saveThread({ thread }: { thread: StorageThreadType }): Promise<StorageThreadType> {
     try {
       const tableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
+      const createdAt = toUtcISOString(thread.createdAt);
+      const updatedAt = toUtcISOString(thread.updatedAt);
       await this.#db.client.none(
         `INSERT INTO ${tableName} (
           id,
@@ -517,10 +680,10 @@ export class MemoryPG extends MemoryStorage {
           thread.resourceId,
           thread.title,
           thread.metadata ? JSON.stringify(thread.metadata) : null,
-          thread.createdAt,
-          thread.createdAt,
-          thread.updatedAt,
-          thread.updatedAt,
+          createdAt,
+          createdAt,
+          updatedAt,
+          updatedAt,
         ],
       );
 
@@ -546,8 +709,8 @@ export class MemoryPG extends MemoryStorage {
     metadata,
   }: {
     id: string;
-    title: string;
-    metadata: Record<string, unknown>;
+    title?: string;
+    metadata?: Record<string, unknown>;
   }): Promise<StorageThreadType> {
     const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
     const existingThread = await this.getThreadById({ threadId: id });
@@ -559,7 +722,7 @@ export class MemoryPG extends MemoryStorage {
         text: `Thread ${id} not found`,
         details: {
           threadId: id,
-          title,
+          title: title ?? null,
         },
       });
     }
@@ -571,17 +734,18 @@ export class MemoryPG extends MemoryStorage {
 
     try {
       const now = new Date();
+      const nowStr = toUtcISOString(now);
       const thread = await this.#db.client.one<StorageThreadType & { createdAtZ: Date; updatedAtZ: Date }>(
         `UPDATE ${threadTableName}
                     SET
-                        title = $1,
+                        title = COALESCE($1, title),
                         metadata = $2,
                         "updatedAt" = $3,
                         "updatedAtZ" = $4
                     WHERE id = $5
                     RETURNING *
                 `,
-        [title, mergedMetadata, now, now, id],
+        [title ?? null, mergedMetadata, nowStr, nowStr, id],
       );
 
       return {
@@ -600,7 +764,7 @@ export class MemoryPG extends MemoryStorage {
           category: ErrorCategory.THIRD_PARTY,
           details: {
             threadId: id,
-            title,
+            title: title ?? null,
           },
         },
         error,
@@ -684,7 +848,19 @@ export class MemoryPG extends MemoryStorage {
     });
   }
 
-  private async _getIncludedMessages({ include }: { include: StorageListMessagesInput['include'] }) {
+  /**
+   * Fetches included messages by ID, discovering their thread automatically.
+   * This handles cross-thread includes where the include item doesn't specify a threadId.
+   * When a resourceId is given, both the target lookup and the surrounding window stay
+   * inside that resource, so an include never leaks another resource's messages.
+   */
+  private async _getIncludedMessages({
+    include,
+    resourceId,
+  }: {
+    include: StorageListMessagesInput['include'];
+    resourceId?: string;
+  }) {
     if (!include || include.length === 0) return null;
 
     const tableName = getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) });
@@ -696,11 +872,15 @@ export class MemoryPG extends MemoryStorage {
     if (targetIds.length === 0) return null;
 
     const idPlaceholders = targetIds.map((_, i) => '$' + (i + 1)).join(', ');
+    const targetResourceCondition = resourceId ? ` AND "resourceId" = $${targetIds.length + 1}` : '';
     const targetRows = await this.#db.client.manyOrNone<{
       id: string;
       thread_id: string;
       createdAt: Date | string;
-    }>(`SELECT id, thread_id, "createdAt" FROM ${tableName} WHERE id IN (${idPlaceholders})`, targetIds);
+    }>(
+      `SELECT id, thread_id, "createdAt" FROM ${tableName} WHERE id IN (${idPlaceholders})${targetResourceCondition}`,
+      resourceId ? [...targetIds, resourceId] : targetIds,
+    );
 
     if (targetRows.length === 0) return null;
 
@@ -713,7 +893,14 @@ export class MemoryPG extends MemoryStorage {
     // copy for timezone-correctness), so using createdAt for ordering is safe.
     const unionQueries: string[] = [];
     const params: any[] = [];
-    let paramIdx = 1;
+    // resourceId is the same for every subquery, so bind it once as $1 and reference
+    // that placeholder from each subquery instead of re-binding it per include item.
+    let resourceCondition = '';
+    if (resourceId) {
+      params.push(resourceId);
+      resourceCondition = ` AND m."resourceId" = $1`;
+    }
+    let paramIdx = params.length + 1;
 
     for (const inc of include) {
       const { id, withPreviousMessages = 0, withNextMessages = 0 } = inc;
@@ -729,7 +916,7 @@ export class MemoryPG extends MemoryStorage {
         SELECT ${selectColumns}
         FROM ${tableName} m
         WHERE m.thread_id = ${p1}
-          AND m."createdAt" <= ${p2}
+          AND m."createdAt" <= ${p2}${resourceCondition}
         ORDER BY m."createdAt" DESC, m.id DESC
         LIMIT ${p3}
       )`);
@@ -745,7 +932,7 @@ export class MemoryPG extends MemoryStorage {
           SELECT ${selectColumns}
           FROM ${tableName} m
           WHERE m.thread_id = ${p4}
-            AND m."createdAt" > ${p5}
+            AND m."createdAt" > ${p5}${resourceCondition}
           ORDER BY m."createdAt" ASC, m.id ASC
           LIMIT ${p6}
         )`);
@@ -830,8 +1017,57 @@ export class MemoryPG extends MemoryStorage {
       );
       this.logger?.error?.(mastraError.toString());
       this.logger?.trackException(mastraError);
-      return { messages: [] };
+      throw mastraError;
     }
+  }
+
+  /**
+   * Reads one page of messages together with the total row count.
+   *
+   * `COUNT(*) OVER ()` reports the count over the whole WHERE result on the same
+   * statement as the page, so the page costs one database round-trip instead of
+   * two. The page and the count also come from one snapshot, so the count always
+   * describes the returned rows. A separate `COUNT(*)` runs only when the page is
+   * empty and the caller asked for a page after the last row, because a window
+   * function has no row to carry the count on.
+   */
+  async #fetchMessagePage({
+    selectStatement,
+    tableName,
+    whereClause,
+    orderByStatement,
+    queryParams,
+    perPageInput,
+    perPage,
+    offset,
+  }: {
+    selectStatement: string;
+    tableName: string;
+    whereClause: string;
+    orderByStatement: string;
+    queryParams: any[];
+    perPageInput: number | false | undefined;
+    perPage: number;
+    offset: number;
+  }): Promise<{ total: number; messages: MessageRowFromDB[] }> {
+    // `perPageInput === false` means "every row", so no LIMIT is applied.
+    const limitClause =
+      perPageInput === false ? '' : ` LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2}`;
+    const dataParams = perPageInput === false ? queryParams : [...queryParams, perPage, offset];
+    const rows =
+      (await this.#db.client.manyOrNone<MessageRowFromDB & { __total?: string | number }>(
+        `${selectStatement}, COUNT(*) OVER () AS "__total" FROM ${tableName} ${whereClause} ${orderByStatement}${limitClause}`,
+        dataParams,
+      )) || [];
+
+    if (rows.length > 0) {
+      return { total: Number(rows[0]!.__total), messages: rows };
+    }
+    if (offset === 0) {
+      return { total: 0, messages: [] };
+    }
+    const countResult = await this.#db.client.one(`SELECT COUNT(*) FROM ${tableName} ${whereClause}`, queryParams);
+    return { total: parseInt(countResult.count, 10), messages: [] };
   }
 
   public async listMessages(args: StorageListMessagesInput): Promise<StorageListMessagesOutput> {
@@ -868,6 +1104,7 @@ export class MemoryPG extends MemoryStorage {
 
     const perPage = normalizePerPage(perPageInput, 40);
     const { offset, perPage: perPageForResponse } = calculatePagination(page, perPageInput, perPage);
+    const metadataFilter = validateStorageMetadataFilter(filter?.metadata);
 
     try {
       const { field, direction } = this.parseOrderBy(orderBy, 'ASC');
@@ -907,7 +1144,7 @@ export class MemoryPG extends MemoryStorage {
       // When perPage is 0 and we have include targets, skip COUNT(*) and data queries.
       // This is the semantic recall path where we only need the included messages.
       if (perPage === 0 && include && include.length > 0) {
-        const includeMessages = await this._getIncludedMessages({ include });
+        const includeMessages = await this._getIncludedMessages({ include, resourceId });
         if (!includeMessages || includeMessages.length === 0) {
           return { messages: [], total: 0, page, perPage: perPageForResponse, hasMore: false };
         }
@@ -922,14 +1159,43 @@ export class MemoryPG extends MemoryStorage {
         };
       }
 
-      const countQuery = `SELECT COUNT(*) FROM ${tableName} ${whereClause}`;
-      const countResult = await this.#db.client.one(countQuery, queryParams);
-      const total = parseInt(countResult.count, 10);
+      // The included messages do not depend on the page, so start that read now and
+      // let it overlap the page read. The rejection is captured here so a failure of
+      // the page read cannot leave this promise unhandled.
+      let includeFailure: unknown;
+      const includePromise =
+        include && include.length > 0
+          ? this._getIncludedMessages({ include, resourceId }).catch((error: unknown) => {
+              includeFailure = error;
+              return null;
+            })
+          : null;
 
-      const limitValue = perPageInput === false ? total : perPage;
-      const dataQuery = `${selectStatement} FROM ${tableName} ${whereClause} ${orderByStatement} LIMIT $${paramIndex++} OFFSET $${paramIndex++}`;
-      const rows = await this.#db.client.manyOrNone(dataQuery, [...queryParams, limitValue, offset]);
-      const messages: MessageRowFromDB[] = [...(rows || [])];
+      let total: number;
+      let messages: MessageRowFromDB[];
+      if (metadataFilter) {
+        const rows = await this.#db.client.manyOrNone(
+          `${selectStatement} FROM ${tableName} ${whereClause} ${orderByStatement}`,
+          queryParams,
+        );
+        const filteredRows = (rows || []).filter(row =>
+          storageMessageMatchesMetadataFilter(row.content, metadataFilter),
+        );
+        total = filteredRows.length;
+        messages = perPageInput === false ? filteredRows : filteredRows.slice(offset, offset + perPage);
+      } else {
+        ({ total, messages } = await this.#fetchMessagePage({
+          selectStatement,
+          tableName,
+          whereClause,
+          orderByStatement,
+          queryParams,
+          perPageInput,
+          perPage,
+          offset,
+        }));
+      }
+      const primaryPageCount = messages.length;
 
       if (total === 0 && messages.length === 0 && (!include || include.length === 0)) {
         return {
@@ -943,7 +1209,8 @@ export class MemoryPG extends MemoryStorage {
 
       const messageIds = new Set(messages.map(m => m.id));
       if (include && include.length > 0) {
-        const includeMessages = await this._getIncludedMessages({ include });
+        const includeMessages = await includePromise;
+        if (includeFailure) throw includeFailure;
         if (includeMessages) {
           for (const includeMsg of includeMessages) {
             if (!messageIds.has(includeMsg.id)) {
@@ -964,7 +1231,9 @@ export class MemoryPG extends MemoryStorage {
         finalMessages.filter(m => m.threadId && threadIdSet.has(m.threadId)).map(m => m.id),
       );
       const allThreadMessagesReturned = returnedThreadMessageIds.size >= total;
-      const hasMore = perPageInput !== false && !allThreadMessagesReturned && offset + perPage < total;
+      const hasMore = metadataFilter
+        ? perPageInput !== false && offset + primaryPageCount < total
+        : perPageInput !== false && !allThreadMessagesReturned && offset + perPage < total;
 
       return {
         messages: finalMessages,
@@ -974,6 +1243,10 @@ export class MemoryPG extends MemoryStorage {
         hasMore,
       };
     } catch (error) {
+      // Re-throw USER errors (validation errors) directly so callers get proper 400 responses
+      if (error instanceof MastraError && error.category === ErrorCategory.USER) {
+        throw error;
+      }
       const mastraError = new MastraError(
         {
           id: createStorageErrorId('PG', 'LIST_MESSAGES', 'FAILED'),
@@ -988,13 +1261,7 @@ export class MemoryPG extends MemoryStorage {
       );
       this.logger?.error?.(mastraError.toString());
       this.logger?.trackException(mastraError);
-      return {
-        messages: [],
-        total: 0,
-        page,
-        perPage: perPageForResponse,
-        hasMore: false,
-      };
+      throw mastraError;
     }
   }
 
@@ -1035,6 +1302,7 @@ export class MemoryPG extends MemoryStorage {
 
     const perPage = normalizePerPage(perPageInput, 40);
     const { offset, perPage: perPageForResponse } = calculatePagination(page, perPageInput, perPage);
+    const metadataFilter = validateStorageMetadataFilter(filter?.metadata);
 
     try {
       const { field, direction } = this.parseOrderBy(orderBy, 'ASC');
@@ -1076,7 +1344,7 @@ export class MemoryPG extends MemoryStorage {
       // (vector-matched) messages are needed. Skipping the COUNT(*) avoids scanning
       // the entire thread which was a major source of latency for large threads.
       if (perPage === 0 && include && include.length > 0) {
-        const includeMessages = await this._getIncludedMessages({ include });
+        const includeMessages = await this._getIncludedMessages({ include, resourceId });
         if (!includeMessages || includeMessages.length === 0) {
           return {
             messages: [],
@@ -1099,14 +1367,42 @@ export class MemoryPG extends MemoryStorage {
         };
       }
 
-      const countQuery = `SELECT COUNT(*) FROM ${tableName} ${whereClause}`;
-      const countResult = await this.#db.client.one(countQuery, queryParams);
-      const total = parseInt(countResult.count, 10);
+      // The included messages do not depend on the page, so start that read now and
+      // let it overlap the page read. The rejection is captured here so a failure of
+      // the page read cannot leave this promise unhandled.
+      let includeFailure: unknown;
+      const includePromise =
+        include && include.length > 0
+          ? this._getIncludedMessages({ include, resourceId }).catch((error: unknown) => {
+              includeFailure = error;
+              return null;
+            })
+          : null;
 
-      const limitValue = perPageInput === false ? total : perPage;
-      const dataQuery = `${selectStatement} FROM ${tableName} ${whereClause} ${orderByStatement} LIMIT $${paramIndex++} OFFSET $${paramIndex++}`;
-      const rows = await this.#db.client.manyOrNone(dataQuery, [...queryParams, limitValue, offset]);
-      const messages: MessageRowFromDB[] = [...(rows || [])];
+      let total: number;
+      let messages: MessageRowFromDB[];
+      if (metadataFilter) {
+        const rows = await this.#db.client.manyOrNone(
+          `${selectStatement} FROM ${tableName} ${whereClause} ${orderByStatement}`,
+          queryParams,
+        );
+        const filteredRows = (rows || []).filter(row =>
+          storageMessageMatchesMetadataFilter(row.content, metadataFilter),
+        );
+        total = filteredRows.length;
+        messages = perPageInput === false ? filteredRows : filteredRows.slice(offset, offset + perPage);
+      } else {
+        ({ total, messages } = await this.#fetchMessagePage({
+          selectStatement,
+          tableName,
+          whereClause,
+          orderByStatement,
+          queryParams,
+          perPageInput,
+          perPage,
+          offset,
+        }));
+      }
 
       if (total === 0 && messages.length === 0 && (!include || include.length === 0)) {
         return {
@@ -1120,7 +1416,8 @@ export class MemoryPG extends MemoryStorage {
 
       const messageIds = new Set(messages.map(m => m.id));
       if (include && include.length > 0) {
-        const includeMessages = await this._getIncludedMessages({ include });
+        const includeMessages = await includePromise;
+        if (includeFailure) throw includeFailure;
         if (includeMessages) {
           for (const includeMsg of includeMessages) {
             if (!messageIds.has(includeMsg.id)) {
@@ -1146,6 +1443,10 @@ export class MemoryPG extends MemoryStorage {
         hasMore,
       };
     } catch (error) {
+      // Re-throw USER errors (validation errors) directly so callers get proper 400 responses
+      if (error instanceof MastraError && error.category === ErrorCategory.USER) {
+        throw error;
+      }
       const mastraError = new MastraError(
         {
           id: createStorageErrorId('PG', 'LIST_MESSAGES_BY_RESOURCE_ID', 'FAILED'),
@@ -1159,13 +1460,7 @@ export class MemoryPG extends MemoryStorage {
       );
       this.logger?.error?.(mastraError.toString());
       this.logger?.trackException(mastraError);
-      return {
-        messages: [],
-        total: 0,
-        page,
-        perPage: perPageForResponse,
-        hasMore: false,
-      };
+      throw mastraError;
     }
   }
 
@@ -1182,67 +1477,90 @@ export class MemoryPG extends MemoryStorage {
       });
     }
 
-    const thread = await this.getThreadById({ threadId });
-    if (!thread) {
-      throw new MastraError({
-        id: createStorageErrorId('PG', 'SAVE_MESSAGES', 'FAILED'),
-        domain: ErrorDomain.STORAGE,
-        category: ErrorCategory.THIRD_PARTY,
-        text: `Thread ${threadId} not found`,
-        details: {
-          threadId,
-        },
-      });
-    }
-
     try {
       const tableName = getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) });
+      const threadIds = new Set<string>();
+      for (const message of messages) {
+        if (!message.threadId) {
+          throw new Error(
+            `Expected to find a threadId for message, but couldn't find one. An unexpected error has occurred.`,
+          );
+        }
+        if (!message.resourceId) {
+          throw new Error(
+            `Expected to find a resourceId for message, but couldn't find one. An unexpected error has occurred.`,
+          );
+        }
+        threadIds.add(message.threadId);
+      }
+
+      for (const threadIdToCheck of threadIds) {
+        const thread = await this.getThreadById({ threadId: threadIdToCheck });
+        if (!thread) {
+          throw new MastraError({
+            id: createStorageErrorId('PG', 'SAVE_MESSAGES', 'FAILED'),
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.THIRD_PARTY,
+            text: `Thread ${threadIdToCheck} not found`,
+            details: {
+              threadId: threadIdToCheck,
+            },
+          });
+        }
+      }
+
+      const messagesToSave = dedupeMessagesForSave(messages);
       await this.#db.client.tx(async t => {
-        // Insert messages sequentially to avoid concurrent queries on the same pg client
-        for (const message of messages) {
-          if (!message.threadId) {
-            throw new Error(
-              `Expected to find a threadId for message, but couldn't find one. An unexpected error has occurred.`,
-            );
-          }
-          if (!message.resourceId) {
-            throw new Error(
-              `Expected to find a resourceId for message, but couldn't find one. An unexpected error has occurred.`,
-            );
-          }
+        for (let offset = 0; offset < messagesToSave.length; offset += MAX_MESSAGES_PER_INSERT) {
+          const batch = messagesToSave.slice(offset, offset + MAX_MESSAGES_PER_INSERT);
+          const values: unknown[] = [];
+          const valuePlaceholders = batch
+            .map((message, messageIndex) => {
+              const createdAt = toUtcISOString(message.createdAt || new Date());
+              values.push(
+                message.id,
+                message.threadId,
+                typeof message.content === 'string' ? message.content : JSON.stringify(message.content),
+                createdAt,
+                createdAt,
+                message.role,
+                message.type || 'v2',
+                message.resourceId,
+              );
+
+              const paramOffset = messageIndex * MESSAGE_INSERT_BIND_PARAMETERS;
+              return `(${Array.from(
+                { length: MESSAGE_INSERT_BIND_PARAMETERS },
+                (_, paramIndex) => `$${paramOffset + paramIndex + 1}`,
+              ).join(', ')})`;
+            })
+            .join(', ');
+
           await t.none(
             `INSERT INTO ${tableName} (id, thread_id, content, "createdAt", "createdAtZ", role, type, "resourceId")
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             VALUES ${valuePlaceholders}
              ON CONFLICT (id) DO UPDATE SET
               thread_id = EXCLUDED.thread_id,
               content = EXCLUDED.content,
               role = EXCLUDED.role,
               type = EXCLUDED.type,
               "resourceId" = EXCLUDED."resourceId"`,
-            [
-              message.id,
-              message.threadId,
-              typeof message.content === 'string' ? message.content : JSON.stringify(message.content),
-              message.createdAt || new Date(),
-              message.createdAt || new Date(),
-              message.role,
-              message.type || 'v2',
-              message.resourceId,
-            ],
+            values,
           );
         }
 
-        // Update thread timestamp
         const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
-        const now = new Date();
-        await t.none(
-          `UPDATE ${threadTableName}
-            SET
-              "updatedAt" = $1,
-              "updatedAtZ" = $2
-            WHERE id = $3`,
-          [now, now, threadId],
-        );
+        const now = toUtcISOString(new Date());
+        for (const threadIdToUpdate of threadIds) {
+          await t.none(
+            `UPDATE ${threadTableName}
+              SET
+                "updatedAt" = $1,
+                "updatedAtZ" = $2
+              WHERE id = $3`,
+            [now, now, threadIdToUpdate],
+          );
+        }
       });
 
       const messagesWithParsedContent = messages.map(message => {
@@ -1259,6 +1577,9 @@ export class MemoryPG extends MemoryStorage {
       const list = new MessageList().add(messagesWithParsedContent as (MastraMessageV1 | MastraDBMessage)[], 'memory');
       return { messages: list.get.all.db() };
     } catch (error) {
+      if (error instanceof MastraError) {
+        throw error;
+      }
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'SAVE_MESSAGES', 'FAILED'),
@@ -1459,11 +1780,15 @@ export class MemoryPG extends MemoryStorage {
   }
 
   async saveResource({ resource }: { resource: StorageResourceType }): Promise<StorageResourceType> {
+    const createdAt = toUtcISOString(resource.createdAt);
+    const updatedAt = toUtcISOString(resource.updatedAt);
     await this.#db.insert({
       tableName: TABLE_RESOURCES,
       record: {
         ...resource,
         metadata: JSON.stringify(resource.metadata),
+        createdAt,
+        updatedAt,
       },
     });
 
@@ -1603,6 +1928,7 @@ export class MemoryPG extends MemoryStorage {
         const sourceMessages = await t.manyOrNone<MessageRowFromDB>(messageQuery, messageParams);
 
         const now = new Date();
+        const nowStr = toUtcISOString(now);
 
         // Determine the last message ID for clone metadata
         const lastMessageId = sourceMessages.length > 0 ? sourceMessages[sourceMessages.length - 1]!.id : undefined;
@@ -1644,10 +1970,10 @@ export class MemoryPG extends MemoryStorage {
             newThread.resourceId,
             newThread.title,
             newThread.metadata ? JSON.stringify(newThread.metadata) : null,
-            now,
-            now,
-            now,
-            now,
+            nowStr,
+            nowStr,
+            nowStr,
+            nowStr,
           ],
         );
 
@@ -1666,6 +1992,7 @@ export class MemoryPG extends MemoryStorage {
           } catch {
             // use content as is
           }
+          const createdAt = toUtcISOString(new Date(normalizedMsg.createdAt));
 
           await t.none(
             `INSERT INTO ${messageTableName} (id, thread_id, content, "createdAt", "createdAtZ", role, type, "resourceId")
@@ -1674,8 +2001,8 @@ export class MemoryPG extends MemoryStorage {
               newMessageId,
               newThreadId,
               typeof normalizedMsg.content === 'string' ? normalizedMsg.content : JSON.stringify(normalizedMsg.content),
-              normalizedMsg.createdAt,
-              normalizedMsg.createdAt,
+              createdAt,
+              createdAt,
               normalizedMsg.role,
               normalizedMsg.type || 'v2',
               targetResourceId,
@@ -2466,6 +2793,8 @@ export class MemoryPG extends MemoryStorage {
         suggestedContinuation: input.chunk.suggestedContinuation,
         currentTask: input.chunk.currentTask,
         threadTitle: input.chunk.threadTitle,
+        extractedValues: input.chunk.extractedValues,
+        extractionFailures: input.chunk.extractionFailures,
       };
 
       // Append chunk to existing array using JSONB concatenation

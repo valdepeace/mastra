@@ -1,4 +1,4 @@
-import { MastraA2AError } from '@mastra/core/a2a';
+import { MastraA2AError } from '@mastra/core/a2a/client';
 import type {
   AgentCard,
   DeleteTaskPushNotificationConfigParams,
@@ -21,14 +21,52 @@ import type {
   TaskPushNotificationConfig,
   TaskQueryParams,
   TaskStatusUpdateEvent,
-} from '@mastra/core/a2a';
+} from '@mastra/core/a2a/client';
+import {
+  AgentCard as AgentCardV1Codec,
+  CancelTaskRequest as CancelTaskRequestV1Codec,
+  GetTaskRequest as GetTaskRequestV1Codec,
+  ListTasksRequest as ListTasksRequestV1Codec,
+  ListTasksResponse as ListTasksResponseV1Codec,
+  SendMessageRequest as SendMessageRequestV1Codec,
+  SendMessageResponse as SendMessageResponseV1Codec,
+  StreamResponse as StreamResponseV1Codec,
+  SubscribeToTaskRequest as SubscribeToTaskRequestV1Codec,
+  Task as TaskV1Codec,
+} from '@mastra/core/a2a/v1';
+import type {
+  AgentCard as AgentCardV1,
+  CancelTaskRequest as CancelTaskRequestV1,
+  GetTaskRequest as GetTaskRequestV1,
+  ListTasksRequest as ListTasksRequestV1,
+  ListTasksResponse as ListTasksResponseV1,
+  SendMessageRequest as SendMessageRequestV1,
+  SendMessageResponse as SendMessageResponseV1,
+  StreamResponse as StreamResponseV1,
+  SubscribeToTaskRequest as SubscribeToTaskRequestV1,
+  Task as TaskV1,
+} from '@mastra/core/a2a/v1';
 import type { ClientOptions } from '../types';
 import { MastraClientError as MastraClientErrorClass } from '../types';
 import { processA2AStream } from '../utils/process-a2a-stream';
+import { verifyAgentCardSignatureIfPresent } from '../utils/verify-agent-card-signature';
+import type {
+  AgentCardSignatureKeyProviderInput,
+  AgentCardVerificationKey,
+  VerifyAgentCardSignatureOptions,
+} from '../utils/verify-agent-card-signature';
 import { BaseResource } from './base';
 
 export type A2AStreamEventData = Message | Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent;
 export type SendMessageResult = Message | Task;
+export type { AgentCardSignatureKeyProviderInput, AgentCardVerificationKey, VerifyAgentCardSignatureOptions };
+
+/**
+ * @experimental Agent Card verification may evolve as A2A JS signing support settles.
+ */
+export type GetAgentCardOptions = {
+  verifySignature?: VerifyAgentCardSignatureOptions;
+};
 
 function createA2AJsonRpcError(response: JSONRPCErrorResponse): Error {
   const error = response.error;
@@ -91,17 +129,24 @@ export class A2A extends BaseResource {
 
   /**
    * Get the agent card with metadata about the agent.
+   * @param options - Optional Agent Card verification settings
    * @returns Promise containing the agent card information
    */
-  async getAgentCard(): Promise<AgentCard> {
-    return this.request(`/.well-known/${this.agentId}/agent-card.json`);
+  async getAgentCard(options?: GetAgentCardOptions): Promise<AgentCard> {
+    const agentCard = await this.request<AgentCard>(`/.well-known/${this.agentId}/agent-card.json`);
+
+    if (!options?.verifySignature) {
+      return agentCard;
+    }
+
+    return verifyAgentCardSignatureIfPresent(agentCard, options.verifySignature);
   }
 
   /**
    * @deprecated Use getAgentCard() instead.
    */
-  async getCard(): Promise<AgentCard> {
-    return this.getAgentCard();
+  async getCard(options?: GetAgentCardOptions): Promise<AgentCard> {
+    return this.getAgentCard(options);
   }
 
   /**
@@ -308,5 +353,93 @@ export class A2A extends BaseResource {
     });
 
     unwrapA2AResult<unknown>(response);
+  }
+}
+
+/** Client for the A2A Protocol v1.0 wire format. */
+export class A2AV1 extends BaseResource {
+  constructor(
+    options: ClientOptions,
+    private agentId: string,
+  ) {
+    super(options);
+  }
+
+  private async rpc<TResult>(method: string, params?: unknown): Promise<TResult> {
+    const response = await this.request<JSONRPCResponse>(`/a2a/${this.agentId}`, {
+      method: 'POST',
+      headers: { 'A2A-Version': '1.0' },
+      body: {
+        jsonrpc: '2.0',
+        id: crypto.randomUUID(),
+        method,
+        params,
+      },
+    });
+
+    return unwrapA2AResult<TResult>(response);
+  }
+
+  async getAgentCard(): Promise<AgentCardV1> {
+    const card = await this.request<unknown>(`/.well-known/${this.agentId}/agent-card.json`, {
+      headers: { 'A2A-Version': '1.0' },
+    });
+    return AgentCardV1Codec.fromJSON(card);
+  }
+
+  async sendMessage(params: SendMessageRequestV1): Promise<SendMessageResponseV1> {
+    const result = await this.rpc<unknown>('message/send', SendMessageRequestV1Codec.toJSON(params));
+    return SendMessageResponseV1Codec.fromJSON(result);
+  }
+
+  async *sendMessageStream(params: SendMessageRequestV1): AsyncGenerator<StreamResponseV1, void, undefined> {
+    const response = await this.request<Response>(`/a2a/${this.agentId}`, {
+      method: 'POST',
+      headers: { 'A2A-Version': '1.0' },
+      body: {
+        jsonrpc: '2.0',
+        id: crypto.randomUUID(),
+        method: 'message/stream',
+        params: SendMessageRequestV1Codec.toJSON(params),
+      },
+      stream: true,
+    });
+
+    for await (const event of processA2AStream<unknown>(await requireResponseBody(response, 'message/stream'))) {
+      yield StreamResponseV1Codec.fromJSON(event);
+    }
+  }
+
+  async getTask(params: GetTaskRequestV1): Promise<TaskV1> {
+    const result = await this.rpc<unknown>('tasks/get', GetTaskRequestV1Codec.toJSON(params));
+    return TaskV1Codec.fromJSON(result);
+  }
+
+  async listTasks(params: ListTasksRequestV1): Promise<ListTasksResponseV1> {
+    const result = await this.rpc<unknown>('tasks/list', ListTasksRequestV1Codec.toJSON(params));
+    return ListTasksResponseV1Codec.fromJSON(result);
+  }
+
+  async cancelTask(params: CancelTaskRequestV1): Promise<TaskV1> {
+    const result = await this.rpc<unknown>('tasks/cancel', CancelTaskRequestV1Codec.toJSON(params));
+    return TaskV1Codec.fromJSON(result);
+  }
+
+  async *resubscribeTask(params: SubscribeToTaskRequestV1): AsyncGenerator<StreamResponseV1, void, undefined> {
+    const response = await this.request<Response>(`/a2a/${this.agentId}`, {
+      method: 'POST',
+      headers: { 'A2A-Version': '1.0' },
+      body: {
+        jsonrpc: '2.0',
+        id: crypto.randomUUID(),
+        method: 'tasks/resubscribe',
+        params: SubscribeToTaskRequestV1Codec.toJSON(params),
+      },
+      stream: true,
+    });
+
+    for await (const event of processA2AStream<unknown>(await requireResponseBody(response, 'tasks/resubscribe'))) {
+      yield StreamResponseV1Codec.fromJSON(event);
+    }
   }
 }

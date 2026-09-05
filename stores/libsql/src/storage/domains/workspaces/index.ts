@@ -1,4 +1,3 @@
-import type { Client, InValue } from '@libsql/client';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import {
   WorkspacesStorage,
@@ -25,6 +24,7 @@ import type {
 } from '@mastra/core/storage/domains/workspaces';
 import { LibSQLDB, resolveClient } from '../../db';
 import type { LibSQLDomainConfig } from '../../db';
+import type { SqliteClient as Client, SqliteInValue as InValue } from '../../db/client';
 import { buildSelectColumns } from '../../db/utils';
 
 /**
@@ -170,7 +170,13 @@ export class WorkspacesLibSQL extends WorkspacesStorage {
         });
       }
 
-      const { authorId, activeVersionId, metadata, status, ...configFields } = updates;
+      const { authorId, activeVersionId, metadata, status, ...rawConfigFields } = updates;
+
+      // Strip undefined keys so omitted PATCH fields don't overwrite persisted values
+      const configFields: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(rawConfigFields)) {
+        if (value !== undefined) configFields[key] = value;
+      }
 
       const configFieldNames = SNAPSHOT_FIELDS as readonly string[];
       const hasConfigUpdate = configFieldNames.some(field => field in configFields);

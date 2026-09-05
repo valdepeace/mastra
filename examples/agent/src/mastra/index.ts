@@ -4,15 +4,28 @@ import { MastraEditor } from '@mastra/editor';
 import { ComposioToolProvider } from '@mastra/editor/composio';
 import { LibSQLStore } from '@mastra/libsql';
 import { DuckDBStore } from '@mastra/duckdb';
-import { Observability, DefaultExporter, SensitiveDataFilter } from '@mastra/observability';
+import { Observability, MastraStorageExporter, SensitiveDataFilter } from '@mastra/observability';
 import { SlackProvider } from '@mastra/slack';
 
-import { mastraAuth, rbacProvider, fgaProvider } from './auth';
+import {
+  mastraAuth,
+  rbacProvider,
+  fgaProvider,
+  studioAuth,
+  studioRbac,
+  studioFga,
+  serverAuth,
+  serverRbac,
+  serverFga,
+} from './auth';
 
 import {
   agentThatHarassesYou,
   chefAgent,
   chefAgentResponses,
+  codeOverrideEditableAgent,
+  codeOverrideLockedAgent,
+  codeOverrideDescriptionsOnlyAgent,
   dynamicAgent,
   evalAgent,
   dynamicToolsAgent,
@@ -20,6 +33,9 @@ import {
   requestContextDemoAgent,
   mcpAppsAgent,
   slackDemoAgent,
+  billingAgent,
+  balanceAgent,
+  computerUseAgent,
 } from './agents/index';
 import { MCPClient } from '@mastra/mcp';
 import { myMcpServer, myMcpServerTwo, mcpAppsServer } from './mcp/server';
@@ -55,7 +71,8 @@ const externalMcpClient = new MCPClient({
   },
 });
 import { lessComplexWorkflow, myWorkflow } from './workflows';
-import { heartbeatWorkflow, multiCadenceWorkflow } from './workflows/scheduled';
+import { refundWorkflow } from './workflows/refund-workflow';
+import { tickWorkflow, multiCadenceWorkflow } from './workflows/scheduled';
 import {
   chefModelV2Agent,
   networkAgent,
@@ -63,14 +80,18 @@ import {
   agentWithBranchingModeration,
   agentWithSequentialModeration,
   supervisorAgent,
+  durableSupervisorAgent,
   subscriptionOrchestratorAgent,
   cryptoResearchAgent,
+  durableCryptoResearchAgent,
 } from './agents/model-v2-agent';
 import { myWorkflowX, nestedWorkflow, findUserWorkflow } from './workflows/other';
+import { alternatingScorer, alwaysPassScorer } from './scorers/chef-model-v2-scorers';
 import { moderationProcessor } from './agents/model-v2-agent';
 import {
   moderatedAssistantAgent,
   agentWithProcessorWorkflow,
+  durableAgentWithProcessorWorkflow,
   contentModerationWorkflow,
   simpleAssistantAgent,
   agentWithBranchingWorkflow,
@@ -84,6 +105,24 @@ import {
   stepLoggerProcessor,
 } from './processors/index';
 import { gatewayAgent } from './agents/gateway';
+import { askUserAgent } from './agents/ask-user-agent';
+import { codeModeAgent } from './agents/code-mode-agent';
+import { clinicDirectAgent, clinicSpecialistAgent, clinicSupervisorAgent } from './agents/clinic-context-agents';
+import { approvalDemoAgent } from './agents/approval-demo-agent';
+import {
+  standupNoteNormalizerAgent,
+  standupDigestAgent,
+  standupEscalationAgent,
+} from './dynamic-workflows/daily-standup-agents';
+import {
+  buildNormalizerPromptsTool,
+  detectBlockersTool,
+  formatDigestTool,
+  formatDigestWithEscalationTool,
+} from './dynamic-workflows/daily-standup-tools';
+import dailyStandupDigestGraph from './dynamic-workflows/daily-standup-digest.json' with { type: 'json' };
+import dailyStandupPlainGraph from './dynamic-workflows/daily-standup-plain.json' with { type: 'json' };
+import dailyStandupWithEscalationGraph from './dynamic-workflows/daily-standup-with-escalation.json' with { type: 'json' };
 
 const libsqlStore = new LibSQLStore({
   id: 'mastra-storage',
@@ -102,10 +141,17 @@ const storage = new MastraCompositeStore({
 export const mastra = new Mastra({
   agents: {
     gatewayAgent,
+    askUserAgent,
+    approvalDemoAgent,
     chefAgent,
     chefAgentResponses,
+    codeOverrideEditableAgent,
+    codeOverrideLockedAgent,
+    codeOverrideDescriptionsOnlyAgent,
     dynamicAgent,
     dynamicToolsAgent,
+    billingAgent,
+    balanceAgent,
     agentThatHarassesYou,
     evalAgent,
     schemaValidatedAgent,
@@ -115,15 +161,36 @@ export const mastra = new Mastra({
     networkAgent,
     moderatedAssistantAgent,
     agentWithProcessorWorkflow,
+    durableAgentWithProcessorWorkflow,
     simpleAssistantAgent,
     agentWithBranchingWorkflow,
     agentWithAdvancedModeration,
     agentWithBranchingModeration,
     agentWithSequentialModeration,
     supervisorAgent,
+    durableSupervisorAgent,
     subscriptionOrchestratorAgent,
     cryptoResearchAgent,
+    durableCryptoResearchAgent,
     slackDemoAgent,
+    codeModeAgent,
+    clinicDirectAgent,
+    clinicSpecialistAgent,
+    clinicSupervisorAgent,
+    computerUseAgent,
+    'standup-note-normalizer': standupNoteNormalizerAgent,
+    'standup-digest': standupDigestAgent,
+    'standup-escalation': standupEscalationAgent,
+  },
+  tools: {
+    'build-normalizer-prompts': buildNormalizerPromptsTool,
+    'detect-blockers': detectBlockersTool,
+    'format-standup-digest': formatDigestTool,
+    'format-standup-digest-with-escalation': formatDigestWithEscalationTool,
+  },
+  scorers: {
+    alwaysPassScorer,
+    alternatingScorer,
   },
   processors: {
     moderationProcessor,
@@ -148,13 +215,15 @@ export const mastra = new Mastra({
     contentModerationWorkflow,
     advancedModerationWorkflow,
     findUserWorkflow,
-    heartbeatWorkflow,
+    tickWorkflow,
     multiCadenceWorkflow,
+    refundWorkflow,
   },
   bundler: {
     sourcemap: true,
   },
   editor: new MastraEditor({
+    source: 'code',
     toolProviders: {
       composio: new ComposioToolProvider({ apiKey: '' }),
     },
@@ -165,10 +234,18 @@ export const mastra = new Mastra({
     }),
   },
   server: {
-    auth: mastraAuth,
-    rbac: rbacProvider,
-    fga: fgaProvider,
+    // Use dual auth providers if available, otherwise fall back to single auth
+    auth: serverAuth ?? mastraAuth,
+    rbac: serverRbac ?? rbacProvider,
+    fga: serverFga ?? fgaProvider,
   },
+  studio: studioAuth
+    ? {
+        auth: studioAuth,
+        rbac: studioRbac,
+        fga: studioFga,
+      }
+    : undefined,
   backgroundTasks: {
     enabled: true,
     globalConcurrency: 10,
@@ -178,9 +255,34 @@ export const mastra = new Mastra({
     configs: {
       default: {
         serviceName: 'mastra',
-        exporters: [new DefaultExporter()],
+        exporters: [new MastraStorageExporter()],
         spanOutputProcessors: [new SensitiveDataFilter()],
       },
     },
   }),
+});
+
+/**
+ * Seed the `daily-standup-digest` dynamic workflow (and its two sub-workflows) on boot.
+ *
+ * This is the point of the demo: on `pnpm mastra dev`, JSON WorkflowDefinitions
+ * are upserted into `WorkflowDefinitionsStorage` and live-registered via
+ * `mastra.addDynamicWorkflow()`. Studio then shows them as runnable workflows,
+ * even though none were authored with `createWorkflow(...)`.
+ *
+ * Ordering matters: the parent workflow's `type: 'workflow'` entries reference
+ * the two sub-workflows by id, and `addDynamicWorkflow`'s pre-flight `collectRefs`
+ * check rejects unknown workflow ids. Seed sub-workflows first, then the parent.
+ *
+ * `addDynamicWorkflow` is idempotent — re-running replaces any existing row and
+ * live registration with the same id, so this is safe to call on every boot.
+ */
+type DynamicWorkflowInput = Parameters<typeof mastra.addDynamicWorkflow>[0];
+async function seedDailyStandupDynamicWorkflows() {
+  await mastra.addDynamicWorkflow(dailyStandupPlainGraph as DynamicWorkflowInput);
+  await mastra.addDynamicWorkflow(dailyStandupWithEscalationGraph as DynamicWorkflowInput);
+  await mastra.addDynamicWorkflow(dailyStandupDigestGraph as DynamicWorkflowInput);
+}
+void seedDailyStandupDynamicWorkflows().catch((err: unknown) => {
+  mastra.getLogger().error('Failed to seed daily-standup dynamic workflows', { err });
 });

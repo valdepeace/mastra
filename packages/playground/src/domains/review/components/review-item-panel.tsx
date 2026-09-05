@@ -1,15 +1,13 @@
-import {
-  AlertDialog,
-  Badge,
-  Button,
-  ButtonsGroup,
-  Column,
-  PrevNextNav,
-  Textarea,
-  Txt,
-  Icon,
-} from '@mastra/playground-ui';
-import { ThumbsUp, ThumbsDown, Trash2, CheckCircle, XIcon, GaugeIcon } from 'lucide-react';
+import { AlertDialog } from '@mastra/playground-ui/components/AlertDialog';
+import { Badge } from '@mastra/playground-ui/components/Badge';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { ButtonsGroup } from '@mastra/playground-ui/components/ButtonsGroup';
+import { DataKeysAndValues } from '@mastra/playground-ui/components/DataKeysAndValues';
+import { DataPanel } from '@mastra/playground-ui/components/DataPanel';
+import { Textarea } from '@mastra/playground-ui/components/Textarea';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { Icon } from '@mastra/playground-ui/icons/Icon';
+import { CheckCircle, FileInputIcon, FileOutputIcon, GaugeIcon, ThumbsDown, ThumbsUp, Trash2 } from 'lucide-react';
 import { useState, useEffect, useRef } from 'react';
 import type { ReviewItem } from './review-item-card';
 import { TagPicker } from './tag-picker';
@@ -24,6 +22,7 @@ function formatUnknown(value: unknown): string {
 
 export interface ReviewItemPanelProps {
   item: ReviewItem;
+  className?: string;
   isCompleted?: boolean;
   tagVocabulary: string[];
   onRate: (rating: 'positive' | 'negative' | undefined) => void;
@@ -38,6 +37,7 @@ export interface ReviewItemPanelProps {
 
 export function ReviewItemPanel({
   item,
+  className,
   isCompleted,
   tagVocabulary,
   onRate,
@@ -57,6 +57,9 @@ export function ReviewItemPanel({
     setLocalComment(item.comment || '');
     setCommentSaved(false);
     setShowRemoveConfirm(false);
+    // Intentionally depends on item.id only — re-running on every new `item` object
+    // reference would clobber the user's in-progress comment edit on every parent re-render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [item.id]);
 
   const commentTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
@@ -73,171 +76,153 @@ export function ReviewItemPanel({
 
   return (
     <>
-      <Column withLeftSeparator>
-        <Column.Toolbar>
-          <PrevNextNav
-            onPrevious={onPrevious}
-            onNext={onNext}
-            previousAriaLabel="Previous item"
-            nextAriaLabel="Next item"
-          />
-          <ButtonsGroup>
+      <DataPanel className={className}>
+        <DataPanel.Header>
+          <DataPanel.Heading>Review</DataPanel.Heading>
+          <ButtonsGroup className="ml-auto shrink-0">
+            <DataPanel.NextPrevNav
+              onPrevious={onPrevious}
+              onNext={onNext}
+              previousLabel="Previous item"
+              nextLabel="Next item"
+            />
             {!isCompleted && onComplete && (
-              <Button onClick={onComplete} aria-label="Mark as complete">
+              <Button size="md" onClick={onComplete} aria-label="Mark as complete">
                 <CheckCircle />
                 Complete
               </Button>
             )}
-            <Button onClick={onClose} aria-label="Close detail panel">
-              <XIcon />
-            </Button>
+            <DataPanel.CloseButton onClick={onClose} tooltip="Close detail panel" />
           </ButtonsGroup>
-        </Column.Toolbar>
+        </DataPanel.Header>
 
-        <Column.Content>
-          {/* Rating */}
-          {!isCompleted && (
-            <div className="flex items-center gap-2">
-              <Txt variant="ui-xs" className="text-neutral3">
-                Rating
-              </Txt>
-              <div className="flex items-center gap-1">
-                <Button
-                  variant={item.rating === 'positive' ? 'default' : 'ghost'}
-                  size="sm"
-                  onClick={() => onRate(item.rating === 'positive' ? undefined : 'positive')}
-                  aria-label="Rate positive"
-                >
-                  <Icon size="sm" className={item.rating === 'positive' ? 'text-positive1' : ''}>
-                    <ThumbsUp />
-                  </Icon>
-                </Button>
-                <Button
-                  variant={item.rating === 'negative' ? 'default' : 'ghost'}
-                  size="sm"
-                  onClick={() => onRate(item.rating === 'negative' ? undefined : 'negative')}
-                  aria-label="Rate negative"
-                >
-                  <Icon size="sm" className={item.rating === 'negative' ? 'text-negative1' : ''}>
-                    <ThumbsDown />
-                  </Icon>
-                </Button>
-              </div>
-              {item.rating && (
-                <Badge variant={item.rating === 'positive' ? 'success' : 'error'}>
-                  {item.rating === 'positive' ? 'Good' : 'Bad'}
-                </Badge>
-              )}
-            </div>
-          )}
-
-          {isCompleted && item.rating && (
-            <div className="flex items-center gap-2">
-              <Txt variant="ui-xs" className="text-neutral3">
-                Rating
-              </Txt>
-              <Badge variant={item.rating === 'positive' ? 'success' : 'error'}>
-                {item.rating === 'positive' ? 'Good' : 'Bad'}
-              </Badge>
-            </div>
-          )}
-
-          {/* Tags */}
-          <div>
-            <Txt variant="ui-xs" className="text-neutral3 block mb-2">
-              Tags
-            </Txt>
-            {isCompleted ? (
-              <div className="flex gap-1 flex-wrap">
-                {item.tags.length > 0 ? (
-                  item.tags.map(tag => (
-                    <Badge key={tag} variant="default">
-                      {tag}
-                    </Badge>
-                  ))
-                ) : (
-                  <Txt variant="ui-xs" className="text-neutral2">
-                    No tags
-                  </Txt>
+        <DataPanel.Content>
+          <div className="mb-6 grid gap-4">
+            {/* Rating */}
+            {!isCompleted && (
+              <div className="flex items-center gap-2">
+                <Txt variant="ui-sm" className="text-neutral3">
+                  Rating
+                </Txt>
+                <ButtonsGroup spacing="close">
+                  <Button
+                    size="md"
+                    onClick={() => onRate(item.rating === 'positive' ? undefined : 'positive')}
+                    aria-label="Rate positive"
+                  >
+                    <Icon size="sm" className={item.rating === 'positive' ? 'text-positive1' : ''}>
+                      <ThumbsUp />
+                    </Icon>
+                  </Button>
+                  <Button
+                    size="md"
+                    onClick={() => onRate(item.rating === 'negative' ? undefined : 'negative')}
+                    aria-label="Rate negative"
+                  >
+                    <Icon size="sm" className={item.rating === 'negative' ? 'text-negative1' : ''}>
+                      <ThumbsDown />
+                    </Icon>
+                  </Button>
+                </ButtonsGroup>
+                {item.rating && (
+                  <Badge variant={item.rating === 'positive' ? 'green' : 'red'}>
+                    {item.rating === 'positive' ? 'Good' : 'Bad'}
+                  </Badge>
                 )}
               </div>
-            ) : (
-              <TagPicker tags={item.tags} vocabulary={tagVocabulary} onSetTags={onSetTags} />
+            )}
+
+            {isCompleted && item.rating && (
+              <div className="flex items-center gap-2">
+                <Txt variant="ui-sm" className="text-neutral3">
+                  Rating
+                </Txt>
+                <Badge variant={item.rating === 'positive' ? 'green' : 'red'}>
+                  {item.rating === 'positive' ? 'Good' : 'Bad'}
+                </Badge>
+              </div>
+            )}
+
+            {/* Tags */}
+            <div className="flex flex-wrap gap-2">
+              <Txt variant="ui-sm" className="text-neutral3 mt-0 block">
+                Tags
+              </Txt>
+              {isCompleted ? (
+                <div className="flex flex-wrap gap-1">
+                  {item.tags.length > 0 ? (
+                    item.tags.map(tag => <Badge key={tag}>{tag}</Badge>)
+                  ) : (
+                    <Txt variant="ui-sm" className="text-neutral2">
+                      No tags
+                    </Txt>
+                  )}
+                </div>
+              ) : (
+                <TagPicker tags={item.tags} vocabulary={tagVocabulary} onSetTags={onSetTags} />
+              )}
+            </div>
+
+            {/* Scores */}
+            {item.scores && Object.keys(item.scores).length > 0 && (
+              <div>
+                <Txt variant="ui-xs" className="text-neutral3 mb-2 block">
+                  Scores
+                </Txt>
+                <div className="flex flex-wrap gap-2">
+                  {Object.entries(item.scores).map(([name, score]) => (
+                    <div key={name} className="flex items-center gap-1">
+                      <Icon size="sm" className="text-neutral3">
+                        <GaugeIcon />
+                      </Icon>
+                      <Txt variant="ui-xs" className="text-neutral4">
+                        {name}:
+                      </Txt>
+                      <Badge variant={score >= 0.5 ? 'green' : 'red'}>{score.toFixed(3)}</Badge>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {item.experimentId && (
+              <DataKeysAndValues>
+                <DataKeysAndValues.Key>Experiment Id</DataKeysAndValues.Key>
+                <DataKeysAndValues.ValueWithCopyBtn
+                  copyTooltip="Copy Experiment Id to clipboard"
+                  copyValue={item.experimentId}
+                >
+                  {item.experimentId}
+                </DataKeysAndValues.ValueWithCopyBtn>
+              </DataKeysAndValues>
             )}
           </div>
 
-          {/* Scores */}
-          {item.scores && Object.keys(item.scores).length > 0 && (
-            <div>
-              <Txt variant="ui-xs" className="text-neutral3 block mb-2">
-                Scores
-              </Txt>
-              <div className="flex flex-wrap gap-2">
-                {Object.entries(item.scores).map(([name, score]) => (
-                  <div key={name} className="flex items-center gap-1">
-                    <Icon size="sm" className="text-neutral3">
-                      <GaugeIcon />
-                    </Icon>
-                    <Txt variant="ui-xs" className="text-neutral4">
-                      {name}:
-                    </Txt>
-                    <Badge variant={score >= 0.5 ? 'success' : 'error'}>{score.toFixed(3)}</Badge>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Experiment ID */}
-          {item.experimentId && (
-            <div>
-              <Txt variant="ui-xs" className="text-neutral3 block mb-1">
-                Experiment
-              </Txt>
-              <Txt variant="ui-xs" className="text-neutral4 font-mono">
-                {item.experimentId}
-              </Txt>
-            </div>
-          )}
-
-          {/* Input */}
-          <div>
-            <Txt variant="ui-xs" className="text-neutral3 block mb-1">
-              Input
-            </Txt>
-            <pre className="text-ui-xs text-neutral4 whitespace-pre-wrap break-words bg-surface2 rounded-md p-3 max-h-48 overflow-auto">
-              {formatUnknown(item.input)}
-            </pre>
+          <div className="grid gap-3">
+            <DataPanel.CodeSection title="Input" icon={<FileInputIcon />} codeStr={formatUnknown(item.input ?? null)} />
+            <DataPanel.CodeSection
+              title="Output"
+              icon={<FileOutputIcon />}
+              codeStr={formatUnknown(item.output ?? null)}
+            />
           </div>
-
-          {/* Output */}
-          {item.output != null && (
-            <div>
-              <Txt variant="ui-xs" className="text-neutral3 block mb-1">
-                Output
-              </Txt>
-              <pre className="text-ui-xs text-neutral4 whitespace-pre-wrap break-words bg-surface2 rounded-md p-3 max-h-48 overflow-auto">
-                {formatUnknown(item.output)}
-              </pre>
-            </div>
-          )}
 
           {/* Error */}
           {item.error != null && (
             <div>
-              <Txt variant="ui-xs" className="text-neutral3 block mb-1">
+              <Txt variant="ui-xs" className="text-neutral3 mb-1 block">
                 Error
               </Txt>
-              <pre className="text-ui-xs text-negative1 whitespace-pre-wrap break-words bg-surface2 rounded-md p-3 max-h-48 overflow-auto">
+              <pre className="text-ui-xs text-negative1 bg-surface2 max-h-48 overflow-auto rounded-md p-3 wrap-break-word whitespace-pre-wrap">
                 {formatUnknown(item.error)}
               </pre>
             </div>
           )}
 
           {/* Comment */}
-          <div>
-            <div className="flex items-center gap-2 mb-1">
-              <Txt variant="ui-xs" className="text-neutral3">
+          <div className="mt-4">
+            <div className="mb-2 flex items-center gap-2">
+              <Txt variant="ui-sm" className="text-neutral2 tracking-widest uppercase">
                 Comment
               </Txt>
               {commentSaved && (
@@ -264,25 +249,21 @@ export function ReviewItemPanel({
 
           {/* Actions */}
           {!isCompleted && (
-            <div className="flex items-center gap-2 pt-2 border-t border-border1">
+            <div className="border-border1 mt-4 flex items-center gap-2 border-t pt-4">
               {onComplete && (
-                <Button size="sm" onClick={onComplete}>
-                  <Icon size="sm">
-                    <CheckCircle />
-                  </Icon>
+                <Button size="md" onClick={onComplete}>
+                  <CheckCircle />
                   Mark as complete
                 </Button>
               )}
-              <Button variant="outline" size="sm" onClick={() => setShowRemoveConfirm(true)}>
-                <Icon size="sm">
-                  <Trash2 />
-                </Icon>
+              <Button variant="outline" size="md" onClick={() => setShowRemoveConfirm(true)}>
+                <Trash2 />
                 Remove
               </Button>
             </div>
           )}
-        </Column.Content>
-      </Column>
+        </DataPanel.Content>
+      </DataPanel>
 
       <AlertDialog open={showRemoveConfirm} onOpenChange={setShowRemoveConfirm}>
         <AlertDialog.Content>

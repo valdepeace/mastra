@@ -1,6 +1,6 @@
 ---
 title: "Reference: Configuration | Observability"
-description: Tracing configuration types and registry functions
+description: "Configure Mastra observability instances, tracing exporters, sampling, propagation, span filters, and the global observability registry."
 packages:
   - "@mastra/core"
 ---
@@ -16,6 +16,7 @@ interface ObservabilityRegistryConfig {
   default?: { enabled?: boolean }
   configs?: Record<string, Omit<ObservabilityInstanceConfig, 'name'> | ObservabilityInstance>
   configSelector?: ConfigSelector
+  sensitiveDataFilter?: boolean | SensitiveDataFilterOptions
 }
 ```
 
@@ -24,7 +25,7 @@ interface ObservabilityRegistryConfig {
   {
     name: 'default',
     type: '{ enabled?: boolean }',
-    description: 'Enable default configuration with DefaultExporter and CloudExporter',
+    description: 'Enable default configuration with MastraStorageExporter and MastraPlatformExporter',
     required: false,
   },
   {
@@ -37,6 +38,13 @@ interface ObservabilityRegistryConfig {
     name: 'configSelector',
     type: 'ConfigSelector',
     description: 'Runtime configuration selector function',
+    required: false,
+  },
+  {
+    name: 'sensitiveDataFilter',
+    type: 'boolean | SensitiveDataFilterOptions',
+    description:
+      'Controls whether a [SensitiveDataFilter](/reference/observability/tracing/processors/sensitive-data-filter) is auto-applied to every configured instance. Defaults to `true`. Pass `false` to opt out, or pass a `SensitiveDataFilterOptions` object to customize fields, redaction token, or redaction style. If a config already includes a `SensitiveDataFilter` in `spanOutputProcessors`, it is not duplicated. Pre-instantiated instances are not modified.',
     required: false,
   },
 ]}
@@ -130,13 +138,13 @@ interface ObservabilityInstanceConfig {
           {
             name: 'maxStringLength',
             type: 'number',
-            description: 'Maximum length for string values (default: 1024)',
+            description: 'Maximum length for string values (default: 131072)',
             isOptional: true,
           },
           {
             name: 'maxDepth',
             type: 'number',
-            description: 'Maximum depth for nested objects (default: 6)',
+            description: 'Maximum depth for nested objects (default: 8)',
             isOptional: true,
           },
           {
@@ -218,7 +226,7 @@ The Observability class provides methods for managing observability instances:
 
 ### `registerInstance`
 
-```typescript prettier:false
+```typescript oxfmt:false
 registerInstance(
   name: string,
   instance: ObservabilityInstance,
@@ -230,7 +238,7 @@ Registers an observability instance in the registry.
 
 ### `getInstance`
 
-```typescript prettier:false
+```typescript oxfmt:false
 getInstance(name: string): ObservabilityInstance | undefined;
 ```
 
@@ -238,7 +246,7 @@ Retrieves an observability instance by name.
 
 ### `getDefaultInstance`
 
-```typescript prettier:false
+```typescript oxfmt:false
 getDefaultInstance(): ObservabilityInstance | undefined;
 ```
 
@@ -246,7 +254,7 @@ Returns the default observability instance.
 
 ### `getSelectedInstance`
 
-```typescript prettier:false
+```typescript oxfmt:false
 getSelectedInstance(
   options: ConfigSelectorOptions
 ): ObservabilityInstance | undefined;
@@ -256,7 +264,7 @@ Returns the observability instance selected by the config selector or default.
 
 ### `listInstances`
 
-```typescript prettier:false
+```typescript oxfmt:false
 listInstances(): ReadonlyMap<string, ObservabilityInstance>;
 ```
 
@@ -264,7 +272,7 @@ Returns all registered observability instances.
 
 ### `hasInstance`
 
-```typescript prettier:false
+```typescript oxfmt:false
 hasInstance(name: string): boolean;
 ```
 
@@ -272,7 +280,7 @@ Checks if an observability instance exists.
 
 ### `setConfigSelector`
 
-```typescript prettier:false
+```typescript oxfmt:false
 setConfigSelector(selector: ConfigSelector): void;
 ```
 
@@ -280,7 +288,7 @@ Sets the config selector function.
 
 ### `unregisterInstance`
 
-```typescript prettier:false
+```typescript oxfmt:false
 unregisterInstance(name: string): boolean;
 ```
 
@@ -288,7 +296,7 @@ Removes an observability instance from the registry.
 
 ### clear
 
-```typescript prettier:false
+```typescript oxfmt:false
 clear(): void;
 ```
 
@@ -296,7 +304,7 @@ Clears all instances without shutdown.
 
 ### shutdown
 
-```typescript prettier:false
+```typescript oxfmt:false
 async shutdown(): Promise<void>;
 ```
 
@@ -308,7 +316,7 @@ Shuts down all observability instances and clears the registry.
 
 - [Tracing Overview](/docs/observability/tracing/overview): Concepts and usage guide
 - [Sampling Strategies](/docs/observability/tracing/overview#sampling-strategies): Sampling configuration details
-- [Multi-Config Setup](/docs/observability/tracing/overview#multi-config-setup): Using multiple configurations
+- [Multi-Config Setup](/docs/observability/overview#multi-config-setup): Using multiple configurations
 
 ### Reference
 
@@ -318,8 +326,8 @@ Shuts down all observability instances and clears the registry.
 
 ### Exporters
 
-- [DefaultExporter](/reference/observability/tracing/exporters/default-exporter): Storage configuration
-- [CloudExporter](/reference/observability/tracing/exporters/cloud-exporter): Cloud setup
+- [MastraStorageExporter](/reference/observability/tracing/exporters/mastra-storage-exporter): Persists observability events to Mastra Storage
+- [MastraPlatformExporter](/reference/observability/tracing/exporters/mastra-platform-exporter): Sends observability events to Mastra platform
 - [Braintrust](/reference/observability/tracing/exporters/braintrust): Braintrust integration
 - [Langfuse](/reference/observability/tracing/exporters/langfuse): Langfuse integration
 - [LangSmith](/reference/observability/tracing/exporters/langsmith): LangSmith integration

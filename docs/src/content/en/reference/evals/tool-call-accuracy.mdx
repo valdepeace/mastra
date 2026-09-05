@@ -1,6 +1,6 @@
 ---
 title: "Reference: Tool call accuracy scorers | Evals"
-description: Documentation for the Tool Call Accuracy Scorers in Mastra, which evaluate whether LLM outputs call the correct tools from available options.
+description: "Use tool-call accuracy scorers to evaluate whether an LLM selected the expected tools, either from recorded calls or against available tool definitions."
 packages:
   - "@mastra/evals"
 ---
@@ -114,7 +114,7 @@ const strictOrderScorer = createCodeScorer({
 
 ### Code-Based Scorer Results
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   runId: string,
   preprocessStepResult: {
@@ -301,7 +301,7 @@ console.log(result.score) // 1 - auth-tool comes before fetch-tool
 
 ## LLM-based tool call accuracy scorer
 
-The `createToolCallAccuracyScorerLLM()` function from `@mastra/evals/scorers/prebuilt` uses an LLM to evaluate whether the tools called by an agent are appropriate for the given user request, providing semantic evaluation rather than exact matching.
+The `createToolCallAccuracyScorerLLM()` function from `@mastra/evals/scorers/prebuilt` uses an LLM to evaluate whether the tools called by an agent are appropriate for the user request, providing semantic evaluation rather than exact matching.
 
 ### Parameters
 
@@ -347,10 +347,10 @@ The LLM-based scorer provides:
 
 ### LLM-Based Scorer Options
 
-```typescript prettier:false
+```typescript oxfmt:false
 // Basic configuration
 const basicLLMScorer = createLLMScorer({
-  model: 'openai/gpt-5.4',
+  model: '__GATEWAY_OPENAI_MODEL__',
   availableTools: [
     { name: 'tool1', description: 'Description 1' },
     { name: 'tool2', description: 'Description 2' }
@@ -359,14 +359,14 @@ const basicLLMScorer = createLLMScorer({
 
 // With different model
 const customModelScorer = createLLMScorer({
-  model: 'openai/gpt-5', // More powerful model for complex evaluations
+  model: '__GATEWAY_OPENAI_MODEL_BASE__', // More powerful model for complex evaluations
   availableTools: [...]
 });
 ```
 
 ### LLM-Based Scorer Results
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   runId: string,
   score: number,  // 0.0 to 1.0
@@ -390,7 +390,7 @@ The LLM-based scorer uses AI to evaluate whether tool selections are appropriate
 
 ```typescript title="src/example-llm-basic.ts"
 const llmScorer = createToolCallAccuracyScorerLLM({
-  model: 'openai/gpt-5.4',
+  model: '__GATEWAY_OPENAI_MODEL__',
   availableTools: [
     {
       name: 'weather-tool',
@@ -478,7 +478,7 @@ console.log(result.reason) // "The agent used search-tool when weather-tool woul
 
 The LLM scorer recognizes when agents appropriately ask for clarification:
 
-```typescript prettier:false title="src/example-llm-clarification.ts"
+```typescript oxfmt:false title="src/example-llm-clarification.ts"
 const vagueInput = [
   createTestMessage({
     content: 'I need help with something',
@@ -523,7 +523,7 @@ const codeScorer = createCodeScorer({
 })
 
 const llmScorer = createLLMScorer({
-  model: 'openai/gpt-5.4',
+  model: '__GATEWAY_OPENAI_MODEL__',
   availableTools: [
     { name: 'weather-tool', description: 'Get weather information' },
     { name: 'search-tool', description: 'Search the web' },

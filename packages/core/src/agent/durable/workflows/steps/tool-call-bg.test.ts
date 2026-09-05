@@ -11,9 +11,13 @@ vi.mock('../../../../background-tasks/resolve-config', () => ({
   resolveBackgroundConfig: vi.fn(),
 }));
 
-vi.mock('../../utils/resolve-runtime', () => ({
+vi.mock('../../utils/resolve-runtime', async () => ({
+  restoreRequestContext: (
+    await vi.importActual<typeof import('../../utils/resolve-runtime')>('../../utils/resolve-runtime')
+  ).restoreRequestContext,
   resolveTool: vi.fn(),
   toolRequiresApproval: vi.fn().mockResolvedValue(false),
+  rebuildRunToolsFromMastra: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../../stream-adapter', () => ({
@@ -61,6 +65,7 @@ function makeInitData(overrides: Record<string, any> = {}) {
 function makeMessageList() {
   return {
     updateToolInvocation: vi.fn().mockReturnValue(true),
+    updateMessageMetadataByToolCallId: vi.fn().mockReturnValue(true),
     add: vi.fn(),
   };
 }
@@ -107,7 +112,9 @@ function executeStep(pubsub: any, initData: any, input?: any) {
 }
 
 afterEach(() => {
-  globalRunRegistry.delete(RUN_ID);
+  if (globalRunRegistry.has(RUN_ID)) {
+    globalRunRegistry.delete(RUN_ID);
+  }
   vi.clearAllMocks();
 });
 
@@ -126,6 +133,8 @@ describe('durable tool-call background task dispatch', () => {
     const mockTask = { id: 'task-abc' };
     vi.mocked(createBackgroundTask).mockReturnValue({
       dispatch: vi.fn().mockResolvedValue({ task: mockTask, fallbackToSync: false }),
+      checkIfRunning: vi.fn().mockResolvedValue(false),
+      restart: vi.fn(),
       task: mockTask,
       cancel: vi.fn(),
       waitForCompletion: vi.fn(),
@@ -151,6 +160,8 @@ describe('durable tool-call background task dispatch', () => {
 
     vi.mocked(createBackgroundTask).mockReturnValue({
       dispatch: vi.fn().mockResolvedValue({ task: { id: 't1' }, fallbackToSync: true }),
+      checkIfRunning: vi.fn().mockResolvedValue(false),
+      restart: vi.fn(),
       task: { id: 't1' },
       cancel: vi.fn(),
       waitForCompletion: vi.fn(),
@@ -175,6 +186,8 @@ describe('durable tool-call background task dispatch', () => {
 
     vi.mocked(createBackgroundTask).mockReturnValue({
       dispatch: vi.fn().mockRejectedValue(new Error('dispatch boom')),
+      checkIfRunning: vi.fn().mockResolvedValue(false),
+      restart: vi.fn(),
       task: { id: 't1' } as any,
       cancel: vi.fn(),
       waitForCompletion: vi.fn(),
@@ -199,6 +212,8 @@ describe('durable tool-call background task dispatch', () => {
 
     vi.mocked(createBackgroundTask).mockReturnValue({
       dispatch: vi.fn().mockResolvedValue({ task: { id: 'task-x' }, fallbackToSync: false }),
+      checkIfRunning: vi.fn().mockResolvedValue(false),
+      restart: vi.fn(),
       task: { id: 'task-x' },
       cancel: vi.fn(),
       waitForCompletion: vi.fn(),
@@ -236,6 +251,8 @@ describe('durable tool-call background task dispatch', () => {
       capturedOnResult = opts.context.onResult;
       return {
         dispatch: vi.fn().mockResolvedValue({ task: { id: 't-r' }, fallbackToSync: false }),
+        checkIfRunning: vi.fn().mockResolvedValue(false),
+        restart: vi.fn(),
         task: { id: 't-r' },
         cancel: vi.fn(),
         waitForCompletion: vi.fn(),
@@ -276,7 +293,7 @@ describe('durable tool-call background task dispatch', () => {
     expect(saveQueueManager.flushMessages).toHaveBeenCalledWith(messageList, 'thread-1', undefined);
   });
 
-  it('onExecution hook updates tool invocation metadata with startedAt/taskId', async () => {
+  it('onExecution hook updates message metadata with startedAt/taskId', async () => {
     const pubsub = mockPubsub();
     const { messageList } = setupRegistry();
     const initData = makeInitData();
@@ -292,6 +309,8 @@ describe('durable tool-call background task dispatch', () => {
       capturedOnExecution = opts.context.onExecution;
       return {
         dispatch: vi.fn().mockResolvedValue({ task: { id: 't-e' }, fallbackToSync: false }),
+        checkIfRunning: vi.fn().mockResolvedValue(false),
+        restart: vi.fn(),
         task: { id: 't-e' },
         cancel: vi.fn(),
         waitForCompletion: vi.fn(),
@@ -310,14 +329,8 @@ describe('durable tool-call background task dispatch', () => {
       startedAt,
     });
 
-    expect(messageList.updateToolInvocation).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: 'tool-invocation',
-        toolInvocation: expect.objectContaining({
-          state: 'call',
-          toolCallId: TOOL_CALL_ID,
-        }),
-      }),
+    expect(messageList.updateMessageMetadataByToolCallId).toHaveBeenCalledWith(
+      TOOL_CALL_ID,
       expect.objectContaining({
         backgroundTasks: expect.objectContaining({
           [TOOL_CALL_ID]: expect.objectContaining({
@@ -327,6 +340,7 @@ describe('durable tool-call background task dispatch', () => {
         }),
       }),
     );
+    expect(messageList.updateToolInvocation).not.toHaveBeenCalled();
   });
 
   it('onChunk emits tool-call + tool-result chunks via PubSub on completion', async () => {
@@ -345,6 +359,8 @@ describe('durable tool-call background task dispatch', () => {
       capturedOnChunk = opts.context.onChunk;
       return {
         dispatch: vi.fn().mockResolvedValue({ task: { id: 't-c' }, fallbackToSync: false }),
+        checkIfRunning: vi.fn().mockResolvedValue(false),
+        restart: vi.fn(),
         task: { id: 't-c' },
         cancel: vi.fn(),
         waitForCompletion: vi.fn(),
@@ -387,6 +403,8 @@ describe('durable tool-call background task dispatch', () => {
       capturedOnChunk = opts.context.onChunk;
       return {
         dispatch: vi.fn().mockResolvedValue({ task: { id: 't-f' }, fallbackToSync: false }),
+        checkIfRunning: vi.fn().mockResolvedValue(false),
+        restart: vi.fn(),
         task: { id: 't-f' },
         cancel: vi.fn(),
         waitForCompletion: vi.fn(),
@@ -425,6 +443,8 @@ describe('durable tool-call background task dispatch', () => {
 
     vi.mocked(createBackgroundTask).mockReturnValue({
       dispatch: vi.fn().mockResolvedValue({ task: { id: 't-p' }, fallbackToSync: false }),
+      checkIfRunning: vi.fn().mockResolvedValue(false),
+      restart: vi.fn(),
       task: { id: 't-p' },
       cancel: vi.fn(),
       waitForCompletion: vi.fn(),
@@ -435,5 +455,37 @@ describe('durable tool-call background task dispatch', () => {
     const callArgs = vi.mocked(createBackgroundTask).mock.calls[0]![1]!;
     expect(callArgs.threadId).toBe('thread-1');
     expect(callArgs.resourceId).toBe('user-1');
+  });
+});
+
+describe('durable tool-call activeTools enforcement', () => {
+  it('rejects Mastra-resolved tools outside activeTools when the run registry is unavailable', async () => {
+    const pubsub = mockPubsub();
+    const hiddenExecute = vi.fn().mockResolvedValue('hidden');
+    vi.mocked(_resolveTool).mockReturnValue({
+      execute: hiddenExecute,
+    } as any);
+
+    const result = await executeStep(
+      pubsub,
+      makeInitData({
+        options: {
+          requireToolApproval: false,
+          activeTools: ['allowedTool'],
+        },
+      }),
+      {
+        ...baseInput(),
+        toolName: 'hiddenTool',
+      },
+    );
+
+    expect(result.error).toEqual(
+      expect.objectContaining({
+        name: 'ToolNotFoundError',
+        message: expect.stringContaining('Available tools: allowedTool'),
+      }),
+    );
+    expect(hiddenExecute).not.toHaveBeenCalled();
   });
 });

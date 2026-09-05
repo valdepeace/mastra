@@ -12,6 +12,7 @@ import crypto from 'node:crypto';
 import { serve } from '@hono/node-server';
 import type { ServerType } from '@hono/node-server';
 import { Mastra } from '@mastra/core/mastra';
+import type { ApiRoute } from '@mastra/core/server';
 import { createHonoServer } from '@mastra/deployer/server';
 import { DefaultStorage } from '@mastra/libsql';
 import { Inngest } from 'inngest';
@@ -30,6 +31,9 @@ let sharedInngest: Inngest | null = null;
 let sharedMastra: Mastra | null = null;
 let sharedServer: ServerType | null = null;
 let inngestDevServer: ChildProcess | null = null;
+
+type ApiRouteCreateHandler = Extract<ApiRoute, { createHandler: unknown }>['createHandler'];
+type ApiRouteHandler = Awaited<ReturnType<ApiRouteCreateHandler>>;
 
 /**
  * Generate unique test ID to isolate each test.
@@ -74,16 +78,20 @@ export async function waitForInngestSync(ms = 500): Promise<void> {
 /**
  * Start the Inngest dev server using npx inngest-cli.
  * Returns a promise that resolves when the server is ready.
+ *
+ * `sdkUrl` is the app serve URL the dev server polls for function sync. Pass `null` for tests whose
+ * app connects outbound via `connect()` instead of being served over HTTP.
  */
-async function startInngestDevServer(): Promise<ChildProcess> {
+async function startInngestDevServer({
+  sdkUrl = `http://localhost:${HANDLER_PORT}/inngest/api`,
+}: { sdkUrl?: string | null } = {}): Promise<ChildProcess> {
   return new Promise((resolve, reject) => {
     const args = [
       'inngest-cli',
       'dev',
       '-p',
       String(INNGEST_PORT),
-      '-u',
-      `http://localhost:${HANDLER_PORT}/inngest/api`,
+      ...(sdkUrl ? ['-u', sdkUrl] : []),
       '--poll-interval=1',
       '--no-discovery',
     ];
@@ -154,6 +162,30 @@ async function waitForInngestReady(maxAttempts = 30, intervalMs = 1000): Promise
   throw new Error(`Inngest dev server not ready after ${maxAttempts} attempts`);
 }
 
+/** Stop a dev server process, escalating to SIGKILL if it ignores SIGTERM. */
+export async function stopInngestDevServer(proc: ChildProcess | null): Promise<void> {
+  if (!proc) return;
+  proc.kill('SIGTERM');
+  await new Promise(resolve => setTimeout(resolve, 500));
+  if (!proc.killed) {
+    proc.kill('SIGKILL');
+  }
+}
+
+/**
+ * Start an Inngest dev server for tests that don't serve their app over HTTP — e.g. tests that run
+ * the app on a `connect()` worker, which dials the dev server's connect gateway outbound.
+ *
+ * Returns `null` when INNGEST_DEV_EXTERNAL=true, i.e. the caller runs against an existing server.
+ * Pass the result to `stopInngestDevServer` in afterAll.
+ */
+export async function startConnectInngestDevServer(): Promise<ChildProcess | null> {
+  if (process.env.INNGEST_DEV_EXTERNAL === 'true') return null;
+  const proc = await startInngestDevServer({ sdkUrl: null });
+  await waitForInngestReady();
+  return proc;
+}
+
 /**
  * Initialize shared test infrastructure.
  * Call this once in beforeAll for the test suite.
@@ -196,7 +228,7 @@ export async function setupSharedTestInfrastructure(): Promise<void> {
         {
           path: '/inngest/api',
           method: 'ALL',
-          createHandler: async ({ mastra }) => inngestServe({ mastra, inngest }),
+          createHandler: async ({ mastra }) => inngestServe({ mastra, inngest }) as unknown as ApiRouteHandler,
         },
       ],
     },
@@ -227,16 +259,8 @@ export async function teardownSharedTestInfrastructure(): Promise<void> {
   }
 
   // Stop the Inngest dev server
-  if (inngestDevServer) {
-    inngestDevServer.kill('SIGTERM');
-    // Wait a bit for graceful shutdown
-    await new Promise(resolve => setTimeout(resolve, 500));
-    // Force kill if still running
-    if (!inngestDevServer.killed) {
-      inngestDevServer.kill('SIGKILL');
-    }
-    inngestDevServer = null;
-  }
+  await stopInngestDevServer(inngestDevServer);
+  inngestDevServer = null;
 
   sharedMastra = null;
   sharedInngest = null;

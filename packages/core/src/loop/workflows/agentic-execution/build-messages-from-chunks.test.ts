@@ -48,6 +48,17 @@ describe('buildMessagesFromChunks', () => {
     expect(result).toHaveLength(0);
   });
 
+  it('should keep an empty text span whose deltas carry providerMetadata (#20469)', () => {
+    const meta = { google: { thoughtSignature: 'sig-abc' } };
+    const result = parts([
+      { type: 'text-start', payload: { id: 't1' } },
+      { type: 'text-delta', payload: { id: 't1', text: '', providerMetadata: meta } },
+      { type: 'text-end', payload: { id: 't1' } },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ type: 'text', text: '', providerMetadata: meta });
+  });
+
   it('should handle text-delta without a matching text-start', () => {
     const result = parts([
       { type: 'text-delta', payload: { id: 't1', text: 'orphan' } },
@@ -80,9 +91,10 @@ describe('buildMessagesFromChunks', () => {
       { type: 'text-end', payload: { id: 't1' } },
     ]);
     expect(result).toHaveLength(2);
-    // Parts are emitted in text-end order
-    expect(result[0]).toMatchObject({ type: 'text', text: 'Goodbye' });
-    expect(result[1]).toMatchObject({ type: 'text', text: 'Hello, world!' });
+    // Parts are emitted in first-delta order (content arrival order), not text-end order.
+    // t1's first delta arrives before t2's first delta, so t1 appears first.
+    expect(result[0]).toMatchObject({ type: 'text', text: 'Hello, world!' });
+    expect(result[1]).toMatchObject({ type: 'text', text: 'Goodbye' });
   });
 
   // ── ProviderMetadata cascading ──────────────────────────────
@@ -119,7 +131,24 @@ describe('buildMessagesFromChunks', () => {
     expect(result).toHaveLength(1);
     expect(result[0]).toMatchObject({
       type: 'reasoning',
+      reasoning: 'Thinking...',
       details: [{ type: 'text', text: 'Thinking...' }],
+    });
+  });
+
+  it('should preserve Anthropic signed reasoning text in the primary reasoning field', () => {
+    const result = parts([
+      { type: 'reasoning-start', payload: { id: 'r1' } },
+      { type: 'reasoning-delta', payload: { id: 'r1', text: 'Signed ' } },
+      { type: 'reasoning-delta', payload: { id: 'r1', text: 'thinking.' } },
+      { type: 'reasoning-end', payload: { id: 'r1', providerMetadata: { anthropic: { signature: 'sig' } } } },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: 'reasoning',
+      reasoning: 'Signed thinking.',
+      details: [{ type: 'text', text: 'Signed thinking.' }],
+      providerMetadata: { anthropic: { signature: 'sig' } },
     });
   });
 
@@ -131,6 +160,7 @@ describe('buildMessagesFromChunks', () => {
     expect(result).toHaveLength(1);
     expect(result[0]).toMatchObject({
       type: 'reasoning',
+      reasoning: '',
       details: [{ type: 'text', text: '' }],
     });
   });
@@ -143,7 +173,11 @@ describe('buildMessagesFromChunks', () => {
       { type: 'reasoning-delta', payload: { id: 'r1', text: 'think' } },
       { type: 'reasoning-end', payload: { id: 'r1', providerMetadata: endMeta } },
     ]);
-    expect(result[0]?.providerMetadata).toEqual(endMeta);
+    expect(result[0]).toMatchObject({
+      type: 'reasoning',
+      reasoning: 'think',
+      providerMetadata: endMeta,
+    });
   });
 
   it('should handle redacted reasoning', () => {
@@ -157,6 +191,7 @@ describe('buildMessagesFromChunks', () => {
     expect(result).toHaveLength(1);
     expect(result[0]).toMatchObject({
       type: 'reasoning',
+      reasoning: '',
       details: [{ type: 'redacted', data: '' }],
     });
   });
@@ -167,6 +202,7 @@ describe('buildMessagesFromChunks', () => {
     expect(result).toHaveLength(1);
     expect(result[0]).toMatchObject({
       type: 'reasoning',
+      reasoning: '',
       details: [{ type: 'redacted', data: '' }],
       providerMetadata: meta,
     });
@@ -183,8 +219,16 @@ describe('buildMessagesFromChunks', () => {
       { type: 'reasoning-end', payload: { id: 'r2' } },
     ]);
     expect(result).toHaveLength(2);
-    expect(result[0]).toMatchObject({ type: 'reasoning', details: [{ type: 'text', text: 'Thought A. More A.' }] });
-    expect(result[1]).toMatchObject({ type: 'reasoning', details: [{ type: 'text', text: 'Thought B.' }] });
+    expect(result[0]).toMatchObject({
+      type: 'reasoning',
+      reasoning: 'Thought A. More A.',
+      details: [{ type: 'text', text: 'Thought A. More A.' }],
+    });
+    expect(result[1]).toMatchObject({
+      type: 'reasoning',
+      reasoning: 'Thought B.',
+      details: [{ type: 'text', text: 'Thought B.' }],
+    });
   });
 
   // ── Tool calls ──────────────────────────────────────────────
@@ -234,6 +278,222 @@ describe('buildMessagesFromChunks', () => {
         args: { q: 'test' },
         result: { answer: '42' },
       },
+    });
+  });
+
+  it('should merge tool-call + tool-error into a single output-error part', () => {
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          providerExecuted: true,
+        },
+      },
+      {
+        type: 'tool-error',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          error: new Error('Provider tool failed'),
+          providerExecuted: true,
+        },
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'output-error',
+        toolCallId: 'tc1',
+        toolName: 'myTool',
+        args: { q: 'test' },
+        errorText: 'Provider tool failed',
+      },
+      providerExecuted: true,
+    });
+  });
+
+  it('should preserve string tool-error messages', () => {
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          providerExecuted: true,
+        },
+      },
+      {
+        type: 'tool-error',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          error: 'boom',
+          providerExecuted: true,
+        },
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'output-error',
+        toolCallId: 'tc1',
+        toolName: 'myTool',
+        args: { q: 'test' },
+        errorText: 'boom',
+      },
+      providerExecuted: true,
+    });
+  });
+
+  it('should preserve plain-object tool-error messages', () => {
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          providerExecuted: true,
+        },
+      },
+      {
+        type: 'tool-error',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          error: { message: 'Provider object failure' },
+          providerExecuted: true,
+        },
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'output-error',
+        toolCallId: 'tc1',
+        toolName: 'myTool',
+        args: { q: 'test' },
+        errorText: 'Provider object failure',
+      },
+      providerExecuted: true,
+    });
+  });
+
+  it('should fall back for falsy tool errors', () => {
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          providerExecuted: true,
+        },
+      },
+      {
+        type: 'tool-error',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          error: null,
+          providerExecuted: true,
+        },
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'output-error',
+        toolCallId: 'tc1',
+        toolName: 'myTool',
+        args: { q: 'test' },
+        errorText: 'Tool execution failed',
+      },
+      providerExecuted: true,
+    });
+  });
+
+  it('should fall back for whitespace-only tool error strings', () => {
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          providerExecuted: true,
+        },
+      },
+      {
+        type: 'tool-error',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          error: '   ',
+          providerExecuted: true,
+        },
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'output-error',
+        toolCallId: 'tc1',
+        toolName: 'myTool',
+        args: { q: 'test' },
+        errorText: 'Tool execution failed',
+      },
+      providerExecuted: true,
+    });
+  });
+
+  it('should fall back for Error instances without usable messages', () => {
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          providerExecuted: true,
+        },
+      },
+      {
+        type: 'tool-error',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          error: new Error(''),
+          providerExecuted: true,
+        },
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'output-error',
+        toolCallId: 'tc1',
+        toolName: 'myTool',
+        args: { q: 'test' },
+        errorText: 'Tool execution failed',
+      },
+      providerExecuted: true,
     });
   });
 
@@ -304,6 +564,44 @@ describe('buildMessagesFromChunks', () => {
 
   // ── Mixed content ordering ──────────────────────────────────
 
+  it('should preserve stream start order when text-end arrives after tool-call', () => {
+    // text-start arrives BEFORE tool-call, but text-end arrives AFTER.
+    // Parts should reflect the order content *first appeared* in the stream.
+    const result = parts([
+      { type: 'text-start', payload: { id: 't1' } },
+      { type: 'text-delta', payload: { id: 't1', text: 'Before tool' } },
+      // Tool call arrives while text span t1 is still open
+      {
+        type: 'tool-call',
+        payload: { toolCallId: 'tc1', toolName: 'myTool', args: {} },
+      },
+      // Text span t1 closes after the tool-call
+      { type: 'text-end', payload: { id: 't1' } },
+    ]);
+
+    const types = result.map((p: any) => p.type);
+    // text t1 started before tool-call, so it should appear first
+    expect(types).toEqual(['text', 'tool-invocation']);
+  });
+
+  it('should preserve stream start order when reasoning-end arrives after tool-call', () => {
+    const result = parts([
+      { type: 'reasoning-start', payload: { id: 'r1' } },
+      { type: 'reasoning-delta', payload: { id: 'r1', text: 'Thinking...' } },
+      // Tool call arrives while reasoning span is still open
+      {
+        type: 'tool-call',
+        payload: { toolCallId: 'tc1', toolName: 'myTool', args: {} },
+      },
+      // Reasoning ends after tool-call
+      { type: 'reasoning-end', payload: { id: 'r1' } },
+    ]);
+
+    const types = result.map((p: any) => p.type);
+    // reasoning started before tool-call, so it should appear first
+    expect(types).toEqual(['reasoning', 'tool-invocation']);
+  });
+
   it('should preserve correct order: reasoning, text, tool-call', () => {
     const result = parts([
       { type: 'reasoning-start', payload: { id: 'r1' } },
@@ -320,6 +618,41 @@ describe('buildMessagesFromChunks', () => {
 
     const types = result.map((p: any) => p.type);
     expect(types).toEqual(['reasoning', 'text', 'tool-invocation']);
+  });
+
+  it('should produce reasoning → text → tool-calls when reasoning-end arrives after text-end (#15914)', () => {
+    // Regression for #15914: stream order from Ollama qwen3 has text-start before
+    // reasoning-start, reasoning-delta before text-delta, and reasoning-end after text-end.
+    // Parts should follow first-content-arrival order (reasoning before text).
+    const result = parts([
+      { type: 'response-metadata', payload: { id: 'rm1', modelId: 'test-model' } },
+      { type: 'text-start', payload: { id: 't1' } },
+      { type: 'reasoning-start', payload: { id: 'r1' } },
+      { type: 'reasoning-delta', payload: { id: 'r1', text: 'Thinking...' } },
+      { type: 'text-delta', payload: { id: 't1', text: 'Hello' } },
+      { type: 'tool-call-input-streaming-start', payload: { toolCallId: 'tc1', toolName: 'myTool', args: {} } },
+      { type: 'tool-call-delta', payload: { toolCallId: 'tc1', argsTextDelta: "{'q':'first'}" } },
+      { type: 'tool-call-input-streaming-end', payload: { toolCallId: 'tc1' } },
+      { type: 'tool-call', payload: { toolCallId: 'tc1', toolName: 'myTool', args: { q: 'first' } } },
+      { type: 'tool-call-input-streaming-start', payload: { toolCallId: 'tc2', toolName: 'myTool', args: {} } },
+      { type: 'tool-call-delta', payload: { toolCallId: 'tc2', argsTextDelta: "{'q':'second'}" } },
+      { type: 'tool-call-input-streaming-end', payload: { toolCallId: 'tc2' } },
+      { type: 'tool-call', payload: { toolCallId: 'tc2', toolName: 'myTool', args: { q: 'second' } } },
+      { type: 'text-end', payload: { id: 't1' } },
+      { type: 'reasoning-end', payload: { id: 'r1' } },
+      { type: 'finish', payload: { finishReason: 'stop', usage: {} } },
+    ]);
+
+    expect(result).toHaveLength(4);
+    expect(result.map((p: any) => p.type)).toEqual(['reasoning', 'text', 'tool-invocation', 'tool-invocation']);
+    expect(result[0]).toMatchObject({ type: 'reasoning', details: [{ type: 'text', text: 'Thinking...' }] });
+    expect(result[1]).toMatchObject({ type: 'text', text: 'Hello' });
+    expect(result[2]).toMatchObject({
+      toolInvocation: { state: 'call', toolCallId: 'tc1', toolName: 'myTool', args: { q: 'first' } },
+    });
+    expect(result[3]).toMatchObject({
+      toolInvocation: { state: 'call', toolCallId: 'tc2', toolName: 'myTool', args: { q: 'second' } },
+    });
   });
 
   // ── Empty stream / no parts ─────────────────────────────────
@@ -349,7 +682,7 @@ describe('buildMessagesFromChunks', () => {
     expect(msgs[0]!.id).toBe('msg-1');
     expect(msgs[0]!.role).toBe('assistant');
     expect(msgs[0]!.content.format).toBe(2);
-    expect(msgs[0]!.createdAt).toBeInstanceOf(Date);
+    expect(msgs[0]).not.toHaveProperty('createdAt');
   });
 
   it('should include responseModelMetadata in content', () => {
@@ -380,5 +713,86 @@ describe('buildMessagesFromChunks', () => {
     });
     // Verify the configured modelId is preserved in the message metadata
     expect(msgs[0]!.content.metadata).toEqual({ modelId: 'gpt-5.4', provider: 'openai.responses' });
+  });
+
+  it('uses transcript transforms for tool input and output', () => {
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId: 'call-1',
+          toolName: 'lookupCustomer',
+          args: { customerId: 'cus_123', internalPath: '/workspace/private/customer.json' },
+        },
+        metadata: {
+          mastra: {
+            toolPayloadTransform: {
+              transcript: {
+                'input-available': { transformed: { customerId: 'cus_123' } },
+              },
+            },
+          },
+        },
+      },
+      {
+        type: 'tool-result',
+        payload: {
+          toolCallId: 'call-1',
+          toolName: 'lookupCustomer',
+          args: { customerId: 'cus_123', internalPath: '/workspace/private/customer.json' },
+          result: { displayName: 'Acme', apiKey: 'secret-output' },
+        },
+        metadata: {
+          mastra: {
+            toolPayloadTransform: {
+              transcript: {
+                'input-available': { transformed: { customerId: 'cus_123' } },
+                'output-available': { transformed: { displayName: 'Acme' } },
+              },
+            },
+          },
+        },
+      },
+    ]);
+
+    expect(result[0]).toMatchObject({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'result',
+        args: { customerId: 'cus_123' },
+        result: { displayName: 'Acme' },
+      },
+    });
+  });
+
+  it('preserves raw tool payloads when transcript transform metadata is absent', () => {
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId: 'call-1',
+          toolName: 'lookupCustomer',
+          args: { customerId: 'cus_123', internalPath: '/workspace/private/customer.json' },
+        },
+      },
+      {
+        type: 'tool-result',
+        payload: {
+          toolCallId: 'call-1',
+          toolName: 'lookupCustomer',
+          args: { customerId: 'cus_123', internalPath: '/workspace/private/customer.json' },
+          result: { displayName: 'Acme', apiKey: 'secret-output' },
+        },
+      },
+    ]);
+
+    expect(result[0]).toMatchObject({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'result',
+        args: { customerId: 'cus_123', internalPath: '/workspace/private/customer.json' },
+        result: { displayName: 'Acme', apiKey: 'secret-output' },
+      },
+    });
   });
 });

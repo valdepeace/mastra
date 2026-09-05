@@ -1,18 +1,11 @@
-import {
-  Button,
-  ButtonWithTooltip,
-  Input,
-  Label,
-  ScrollArea,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-  Spinner,
-  Textarea,
-  Icon,
-} from '@mastra/playground-ui';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { Input } from '@mastra/playground-ui/components/Input';
+import { Label } from '@mastra/playground-ui/components/Label';
+import { ScrollArea } from '@mastra/playground-ui/components/ScrollArea';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@mastra/playground-ui/components/Select';
+import { Spinner } from '@mastra/playground-ui/components/Spinner';
+import { Textarea } from '@mastra/playground-ui/components/Textarea';
+import { Icon } from '@mastra/playground-ui/icons/Icon';
 import { Check, PlusIcon, XIcon } from 'lucide-react';
 import { Controller, useWatch } from 'react-hook-form';
 import type { UseFormReturn } from 'react-hook-form';
@@ -33,6 +26,11 @@ interface MCPClientFormSidebarProps {
   onTryConnect?: () => void;
   isTryingConnect?: boolean;
 }
+
+// Pin these fields to a solid surface. The filled Input/Textarea default otherwise swaps the
+// background to a translucent overlay on hover/focus, which leaks through the forced solid bg —
+// re-stating it for hover/focus-visible keeps the whole form a uniform surface3 (incl. the Select).
+const SOLID_FIELD = 'bg-surface3 hover:bg-surface3 focus-visible:bg-surface3';
 
 export function MCPClientFormSidebar({
   form,
@@ -72,34 +70,34 @@ export function MCPClientFormSidebar({
   };
 
   return (
-    <div className="h-full flex flex-col">
-      <ScrollArea className="flex-1 min-h-0">
+    <div className="flex h-full flex-col">
+      <ScrollArea className="min-h-0 flex-1">
         <div className="flex flex-col gap-6 p-4">
           <SectionHeader title="Identity" subtitle="Define the MCP client name and description." />
 
           <div className="flex flex-col gap-1.5">
-            <Label htmlFor="mcp-client-name" className="text-xs text-neutral5">
+            <Label htmlFor="mcp-client-name" className="text-neutral5 text-xs">
               Name <span className="text-accent2">*</span>
             </Label>
             <Input
               id="mcp-client-name"
               placeholder="My MCP Client"
-              className="bg-surface3"
+              className={SOLID_FIELD}
               disabled={readOnly}
               {...register('name')}
               error={!!errors.name}
             />
-            {errors.name && <span className="text-xs text-accent2">{errors.name.message}</span>}
+            {errors.name && <span className="text-accent2 text-xs">{errors.name.message}</span>}
           </div>
 
           <div className="flex flex-col gap-1.5">
-            <Label htmlFor="mcp-client-description" className="text-xs text-neutral5">
+            <Label htmlFor="mcp-client-description" className="text-neutral5 text-xs">
               Description
             </Label>
             <Textarea
               id="mcp-client-description"
               placeholder="Describe what this MCP client connects to"
-              className="bg-surface3"
+              className={SOLID_FIELD}
               disabled={readOnly}
               {...register('description')}
             />
@@ -127,22 +125,22 @@ export function MCPClientFormSidebar({
           <SectionHeader title="Server Configuration" subtitle="Configure the MCP server connection details." />
 
           <div className="flex flex-col gap-1.5">
-            <Label htmlFor="mcp-server-name" className="text-xs text-neutral5">
+            <Label htmlFor="mcp-server-name" className="text-neutral5 text-xs">
               Server Name <span className="text-accent2">*</span>
             </Label>
             <Input
               id="mcp-server-name"
               placeholder="default"
-              className="bg-surface3"
+              className={SOLID_FIELD}
               disabled={readOnly}
               {...register('serverName')}
               error={!!errors.serverName}
             />
-            {errors.serverName && <span className="text-xs text-accent2">{errors.serverName.message}</span>}
+            {errors.serverName && <span className="text-accent2 text-xs">{errors.serverName.message}</span>}
           </div>
 
           <div className="flex flex-col gap-1.5">
-            <Label className="text-xs text-neutral5">Server Type</Label>
+            <Label className="text-neutral5 text-xs">Server Type</Label>
             <Controller
               name="serverType"
               control={control}
@@ -163,29 +161,29 @@ export function MCPClientFormSidebar({
           {serverType === 'http' && (
             <>
               <div className="flex flex-col gap-1.5">
-                <Label htmlFor="mcp-url" className="text-xs text-neutral5">
+                <Label htmlFor="mcp-url" className="text-neutral5 text-xs">
                   URL <span className="text-accent2">*</span>
                 </Label>
                 <Input
                   id="mcp-url"
                   placeholder="http://localhost:4111/api/mcp/server/mcp"
-                  className="bg-surface3"
+                  className={SOLID_FIELD}
                   disabled={readOnly}
                   {...register('url')}
                   error={!!errors.url}
                 />
-                {errors.url && <span className="text-xs text-accent2">{errors.url.message}</span>}
+                {errors.url && <span className="text-accent2 text-xs">{errors.url.message}</span>}
               </div>
 
               <div className="flex flex-col gap-1.5">
-                <Label htmlFor="mcp-timeout" className="text-xs text-neutral5">
+                <Label htmlFor="mcp-timeout" className="text-neutral5 text-xs">
                   Timeout (ms)
                 </Label>
                 <Input
                   id="mcp-timeout"
                   type="number"
                   placeholder="30000"
-                  className="bg-surface3"
+                  className={SOLID_FIELD}
                   disabled={readOnly}
                   {...register('timeout', { valueAsNumber: true })}
                 />
@@ -196,47 +194,47 @@ export function MCPClientFormSidebar({
           {serverType === 'stdio' && (
             <>
               <div className="flex flex-col gap-1.5">
-                <Label htmlFor="mcp-command" className="text-xs text-neutral5">
+                <Label htmlFor="mcp-command" className="text-neutral5 text-xs">
                   Command <span className="text-accent2">*</span>
                 </Label>
                 <Input
                   id="mcp-command"
                   placeholder="npx"
-                  className="bg-surface3"
+                  className={SOLID_FIELD}
                   disabled={readOnly}
                   {...register('command')}
                   error={!!errors.command}
                 />
-                {errors.command && <span className="text-xs text-accent2">{errors.command.message}</span>}
+                {errors.command && <span className="text-accent2 text-xs">{errors.command.message}</span>}
               </div>
 
               <div className="flex flex-col gap-1.5">
-                <Label htmlFor="mcp-args" className="text-xs text-neutral5">
+                <Label htmlFor="mcp-args" className="text-neutral5 text-xs">
                   Arguments (one per line)
                 </Label>
                 <Textarea
                   id="mcp-args"
                   placeholder={'-y\n@modelcontextprotocol/server'}
-                  className="bg-surface3"
+                  className={SOLID_FIELD}
                   disabled={readOnly}
                   {...register('args')}
                 />
               </div>
 
               <div className="flex flex-col gap-1.5">
-                <Label className="text-xs text-neutral5">Environment Variables</Label>
+                <Label className="text-neutral5 text-xs">Environment Variables</Label>
                 <div className="flex flex-col gap-2">
                   {env.map((_, index) => (
-                    <div key={index} className="flex gap-2 items-center">
+                    <div key={index} className="flex items-center gap-2">
                       <Input
                         placeholder="KEY"
-                        className="bg-surface3 flex-1"
+                        className={`${SOLID_FIELD} flex-1`}
                         disabled={readOnly}
                         {...register(`env.${index}.key`)}
                       />
                       <Input
                         placeholder="VALUE"
-                        className="bg-surface3 flex-1"
+                        className={`${SOLID_FIELD} flex-1`}
                         disabled={readOnly}
                         {...register(`env.${index}.value`)}
                       />
@@ -249,7 +247,7 @@ export function MCPClientFormSidebar({
                   ))}
                   {!readOnly && (
                     <Button variant="outline" size="sm" onClick={addEnvVar} className="w-fit">
-                      <PlusIcon className="h-3 w-3 mr-1" />
+                      <PlusIcon className="mr-1 h-3 w-3" />
                       Add variable
                     </Button>
                   )}
@@ -261,7 +259,7 @@ export function MCPClientFormSidebar({
       </ScrollArea>
 
       {(showSubmit ?? !readOnly) && (
-        <div className="shrink-0 p-4 flex flex-col gap-2">
+        <div className="flex shrink-0 flex-col gap-2 p-4">
           {!readOnly &&
             (() => {
               const isDisabled = serverType !== 'http' || !url.trim() || isTryingConnect;
@@ -273,12 +271,12 @@ export function MCPClientFormSidebar({
                     : undefined;
 
               return tooltipContent ? (
-                <ButtonWithTooltip
+                <Button
                   variant="outline"
                   onClick={onTryConnect}
                   disabled={isDisabled}
                   className="w-full"
-                  tooltipContent={tooltipContent}
+                  tooltip={tooltipContent}
                 >
                   {isTryingConnect ? (
                     <>
@@ -288,7 +286,7 @@ export function MCPClientFormSidebar({
                   ) : (
                     'Try to connect'
                   )}
-                </ButtonWithTooltip>
+                </Button>
               ) : (
                 <Button variant="outline" onClick={onTryConnect} disabled={isDisabled} className="w-full">
                   {isTryingConnect ? (

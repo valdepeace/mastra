@@ -1,6 +1,7 @@
 import * as AIV5 from '@internal/ai-sdk-v5';
 import * as AIV6 from '@internal/ai-v6';
 
+import { getTransformedToolPayload, hasTransformedToolPayload } from '../../../tools/payload-transform';
 import type {
   MastraDBMessage,
   MastraMessagePart,
@@ -29,12 +30,25 @@ function withOptionalFields<T extends Record<string, unknown>, U extends Record<
   return target as T & Partial<U>;
 }
 
+function getDisplayTransform(
+  providerMetadata: unknown,
+  phase: 'input-available' | 'output-available' | 'error',
+  fallback: unknown,
+) {
+  const transform = getTransformedToolPayload(providerMetadata, 'display', phase);
+  return hasTransformedToolPayload(transform) ? transform.transformed : fallback;
+}
+
 function getToolNameFromType(type: string): string {
   return type.startsWith('tool-') ? sanitizeToolName(type.slice('tool-'.length)) : sanitizeToolName(type);
 }
 
 function normalizeToolArgs(input: unknown): Record<string, unknown> {
   return typeof input === 'object' && input !== null && !Array.isArray(input) ? (input as Record<string, unknown>) : {};
+}
+
+function normalizeToolResult(output: unknown): unknown {
+  return typeof output === 'object' && output && 'value' in output ? (output as { value: unknown }).value : output;
 }
 
 function isV6OnlyToolState(
@@ -63,6 +77,56 @@ function toMastraProviderMetadata(
 
 function getToolNameFromUIPart(part: AIV6Type.ToolUIPart | AIV6Type.DynamicToolUIPart): string {
   return part.type === 'dynamic-tool' ? sanitizeToolName(part.toolName) : getToolNameFromType(part.type);
+}
+
+function createToolInvocationPartFromUIPart(part: AIV6Type.ToolUIPart | AIV6Type.DynamicToolUIPart) {
+  const base = {
+    toolCallId: part.toolCallId,
+    toolName: getToolNameFromUIPart(part),
+    args: normalizeToolArgs(part.input),
+    approval: 'approval' in part ? toMastraApproval(part.approval) : undefined,
+    providerMetadata: 'callProviderMetadata' in part ? toMastraProviderMetadata(part.callProviderMetadata) : undefined,
+    providerExecuted: part.providerExecuted,
+    title: part.title,
+    preliminary: 'preliminary' in part ? part.preliminary : undefined,
+  };
+
+  switch (part.state) {
+    case 'input-streaming':
+      return createToolInvocationPart({
+        ...base,
+        state: 'partial-call',
+      });
+
+    case 'input-available':
+      return createToolInvocationPart({
+        ...base,
+        state: 'call',
+      });
+
+    case 'output-available':
+      return createToolInvocationPart({
+        ...base,
+        state: 'result',
+        result: normalizeToolResult(part.output),
+      });
+
+    case 'output-error':
+      return createToolInvocationPart({
+        ...base,
+        state: 'output-error',
+        errorText: part.errorText,
+        rawInput: 'rawInput' in part ? part.rawInput : undefined,
+      });
+
+    case 'approval-requested':
+    case 'approval-responded':
+    case 'output-denied':
+      return createToolInvocationPart({
+        ...base,
+        state: part.state,
+      });
+  }
 }
 
 function normalizeV6PartForV5Bridge(part: AIV6Type.UIMessage['parts'][number]): AIV5Type.UIMessage['parts'][number] {
@@ -156,9 +220,121 @@ function findApprovalRequest(
         return part;
       }
     }
+
+    const pendingToolApprovals = message.content.metadata?.pendingToolApprovals;
+    if (!pendingToolApprovals || typeof pendingToolApprovals !== 'object') {
+      continue;
+    }
+
+    for (const pendingToolApproval of Object.values(pendingToolApprovals)) {
+      if (!pendingToolApproval || typeof pendingToolApproval !== 'object') {
+        continue;
+      }
+
+      const toolCallId = 'toolCallId' in pendingToolApproval ? pendingToolApproval.toolCallId : undefined;
+      if (typeof toolCallId !== 'string') {
+        continue;
+      }
+
+      const runId = 'runId' in pendingToolApproval ? pendingToolApproval.runId : undefined;
+      const pendingApprovalId = typeof runId === 'string' ? `${runId}::${toolCallId}` : toolCallId;
+      if (pendingApprovalId !== approvalId) {
+        continue;
+      }
+
+      const existingPart = findToolInvocationPart(message.content.parts || [], toolCallId);
+      if (!existingPart) {
+        continue;
+      }
+
+      return createToolInvocationPart({
+        toolCallId: existingPart.toolInvocation.toolCallId,
+        toolName: existingPart.toolInvocation.toolName,
+        args: existingPart.toolInvocation.args,
+        state: 'approval-requested',
+        approval: { id: pendingApprovalId },
+        providerMetadata: existingPart.providerMetadata,
+        providerExecuted: existingPart.providerExecuted,
+        title: existingPart.title,
+        preliminary: existingPart.preliminary,
+      });
+    }
   }
 
   return undefined;
+}
+
+function rehydratePendingToolApprovals(parts: AIV6Type.UIMessage['parts'], metadata: Record<string, unknown>) {
+  const pendingToolApprovals = metadata.pendingToolApprovals;
+  if (!pendingToolApprovals || typeof pendingToolApprovals !== 'object') {
+    return;
+  }
+
+  for (const pendingToolApproval of Object.values(pendingToolApprovals)) {
+    if (!pendingToolApproval || typeof pendingToolApproval !== 'object') {
+      continue;
+    }
+
+    const toolCallId = 'toolCallId' in pendingToolApproval ? pendingToolApproval.toolCallId : undefined;
+    if (typeof toolCallId !== 'string') {
+      continue;
+    }
+
+    const runId = 'runId' in pendingToolApproval ? pendingToolApproval.runId : undefined;
+    const approvalId = typeof runId === 'string' ? `${runId}::${toolCallId}` : toolCallId;
+
+    const toolPartIndex = parts.findIndex(
+      part => AIV6.isToolUIPart(part) && part.toolCallId === toolCallId && part.state === 'input-available',
+    );
+    if (toolPartIndex === -1) {
+      continue;
+    }
+
+    const toolPart = parts[toolPartIndex];
+    if (!toolPart || !AIV6.isToolUIPart(toolPart) || toolPart.state !== 'input-available') {
+      continue;
+    }
+
+    parts[toolPartIndex] = {
+      ...toolPart,
+      state: 'approval-requested',
+      approval: { id: approvalId },
+    } as AIV6Type.UIMessage['parts'][number];
+  }
+}
+
+function createLegacyToolInvocations(
+  parts: MastraMessagePart[],
+): MastraDBMessage['content']['toolInvocations'] | undefined {
+  const toolInvocations: NonNullable<MastraDBMessage['content']['toolInvocations']> = [];
+
+  for (const part of parts) {
+    if (part.type !== 'tool-invocation') continue;
+
+    const invocation = part.toolInvocation;
+
+    if (invocation.state === 'result') {
+      toolInvocations.push({
+        args: invocation.args,
+        result: invocation.result,
+        toolCallId: invocation.toolCallId,
+        toolName: invocation.toolName,
+        state: 'result',
+      });
+      continue;
+    }
+
+    if (invocation.state === 'call' || invocation.state === 'partial-call') {
+      toolInvocations.push({
+        args: invocation.args,
+        toolCallId: invocation.toolCallId,
+        toolName: invocation.toolName,
+        state: invocation.state,
+      });
+    }
+  }
+
+  return toolInvocations.length > 0 ? toolInvocations : undefined;
 }
 
 /**
@@ -169,6 +345,15 @@ export class AIV6Adapter {
     const v5Message = AIV5Adapter.toUIMessage(dbMsg);
     const metadata = (v5Message.metadata || {}) as Record<string, unknown>;
     const parts: AIV6Type.UIMessage['parts'] = [];
+
+    if (dbMsg.role === 'signal' && v5Message.role !== 'user') {
+      return {
+        id: dbMsg.id,
+        role: 'system',
+        metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+        parts: v5Message.parts.map(part => AIV6Adapter.toUIPartFromV5(part)),
+      };
+    }
 
     const dbParts = dbMsg.content.parts || [];
     const hasToolInvocationParts = dbParts.some(part => part.type === 'tool-invocation');
@@ -209,9 +394,11 @@ export class AIV6Adapter {
       }
     }
 
+    rehydratePendingToolApprovals(parts, metadata);
+
     return {
       id: dbMsg.id,
-      role: dbMsg.role,
+      role: dbMsg.role === 'signal' ? v5Message.role : dbMsg.role,
       metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       parts,
     };
@@ -220,7 +407,7 @@ export class AIV6Adapter {
   static fromUIMessage(uiMsg: AIV6Type.UIMessage): MastraDBMessage {
     const compatibleParts = uiMsg.parts.filter(part => {
       if (part.type === 'source-document') return false;
-      if (AIV6.isToolUIPart(part) && isV6OnlyToolState(part.state)) return false;
+      if (AIV6.isToolUIPart(part)) return false;
       return true;
     });
 
@@ -252,7 +439,7 @@ export class AIV6Adapter {
         continue;
       }
 
-      if (!AIV6.isToolUIPart(part) || !isV6OnlyToolState(part.state)) {
+      if (!AIV6.isToolUIPart(part)) {
         const basePart = baseParts[basePartIndex++];
         if (basePart) {
           parts.push(basePart);
@@ -260,20 +447,7 @@ export class AIV6Adapter {
         continue;
       }
 
-      parts.push(
-        createToolInvocationPart({
-          toolCallId: part.toolCallId,
-          toolName: getToolNameFromUIPart(part),
-          args: normalizeToolArgs(part.input),
-          state: part.state,
-          approval: toMastraApproval(part.approval),
-          providerMetadata:
-            'callProviderMetadata' in part ? toMastraProviderMetadata(part.callProviderMetadata) : undefined,
-          providerExecuted: part.providerExecuted,
-          title: part.title,
-          preliminary: 'preliminary' in part ? part.preliminary : undefined,
-        }),
-      );
+      parts.push(createToolInvocationPartFromUIPart(part));
     }
 
     return {
@@ -281,6 +455,7 @@ export class AIV6Adapter {
       content: {
         ...baseDb.content,
         parts,
+        toolInvocations: createLegacyToolInvocations(parts) || baseDb.content.toolInvocations,
       },
     };
   }
@@ -304,6 +479,7 @@ export class AIV6Adapter {
         content: compatibleContent as unknown as AIV5Type.ModelMessage['content'],
       } as AIV5Type.ModelMessage,
       _messageSource,
+      context,
     );
 
     const parts = [...baseDb.content.parts];
@@ -407,21 +583,21 @@ export class AIV6Adapter {
           return {
             ...base,
             state: 'input-streaming',
-            input: part.toolInvocation.args,
+            input: getDisplayTransform(part.providerMetadata, 'input-available', part.toolInvocation.args),
           } as AIV6Type.UIMessage['parts'][number];
 
         case 'call':
           return {
             ...base,
             state: 'input-available',
-            input: part.toolInvocation.args,
+            input: getDisplayTransform(part.providerMetadata, 'input-available', part.toolInvocation.args),
           } as AIV6Type.UIMessage['parts'][number];
 
         case 'approval-requested':
           return {
             ...base,
             state: 'approval-requested',
-            input: part.toolInvocation.args,
+            input: getDisplayTransform(part.providerMetadata, 'input-available', part.toolInvocation.args),
             approval: {
               id: part.toolInvocation.approval?.id || part.toolInvocation.toolCallId,
             },
@@ -431,7 +607,7 @@ export class AIV6Adapter {
           return {
             ...base,
             state: 'approval-responded',
-            input: part.toolInvocation.args,
+            input: getDisplayTransform(part.providerMetadata, 'input-available', part.toolInvocation.args),
             approval: {
               id: part.toolInvocation.approval?.id || part.toolInvocation.toolCallId,
               approved: part.toolInvocation.approval?.approved ?? false,
@@ -444,8 +620,12 @@ export class AIV6Adapter {
             {
               ...base,
               state: 'output-error',
-              input: part.toolInvocation.args,
-              errorText: part.toolInvocation.errorText || '',
+              input: getDisplayTransform(part.providerMetadata, 'input-available', part.toolInvocation.args),
+              errorText: getDisplayTransform(
+                part.providerMetadata,
+                'error',
+                part.toolInvocation.errorText || '',
+              ) as string,
             },
             {
               rawInput: part.toolInvocation.rawInput,
@@ -464,7 +644,7 @@ export class AIV6Adapter {
           return {
             ...base,
             state: 'output-denied',
-            input: part.toolInvocation.args,
+            input: getDisplayTransform(part.providerMetadata, 'input-available', part.toolInvocation.args),
             approval: {
               id: part.toolInvocation.approval?.id || part.toolInvocation.toolCallId,
               approved: false,
@@ -477,8 +657,12 @@ export class AIV6Adapter {
             {
               ...base,
               state: 'output-available',
-              input: part.toolInvocation.args,
-              output: part.toolInvocation.result,
+              input: getDisplayTransform(part.providerMetadata, 'input-available', part.toolInvocation.args),
+              output: getDisplayTransform(
+                part.providerMetadata,
+                'output-available',
+                getDisplayTransform(part.providerMetadata, 'error', part.toolInvocation.result),
+              ),
             },
             {
               preliminary: part.preliminary,

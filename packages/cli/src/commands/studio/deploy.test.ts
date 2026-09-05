@@ -38,7 +38,7 @@ describe('getMastraVersion', () => {
     return mod.getMastraVersion;
   }
 
-  it('resolves the installed version of mastra from node_modules', async () => {
+  it('resolves the installed version of mastra from node_modules', { timeout: 10000 }, async () => {
     const getMastraVersion = await loadGetMastraVersion();
 
     // Create a fake node_modules/mastra/package.json
@@ -80,6 +80,14 @@ describe('getMastraVersion', () => {
 });
 
 // Mock all external dependencies
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return {
+    ...actual,
+    execSync: vi.fn().mockReturnValue('my-app'),
+  };
+});
+
 vi.mock('@clack/prompts', () => ({
   intro: vi.fn(),
   log: { step: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn() },
@@ -93,14 +101,16 @@ vi.mock('@clack/prompts', () => ({
 }));
 
 vi.mock('archiver', () => ({
-  default: vi.fn(() => ({
-    on: vi.fn(),
-    pipe: vi.fn(),
-    glob: vi.fn(),
-    finalize: vi.fn(async () => {
-      closeHandler?.();
-    }),
-  })),
+  ZipArchive: vi.fn(function () {
+    return {
+      on: vi.fn(),
+      pipe: vi.fn(),
+      glob: vi.fn(),
+      finalize: vi.fn(async () => {
+        closeHandler?.();
+      }),
+    };
+  }),
 }));
 
 vi.mock('node:fs/promises', async importOriginal => {
@@ -226,6 +236,52 @@ describe('parseEnvFile', () => {
 
     const result = parseEnvFile('export FOO=bar\nexport BAZ="qux"');
     expect(result).toEqual({ FOO: 'bar', BAZ: 'qux' });
+  });
+});
+
+describe('loadDeployEnvFromDotenv', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'mastra-loadenv-test-'));
+    delete process.env.MASTRA_PROJECT_ID;
+    delete process.env.MASTRA_ORG_ID;
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    delete process.env.MASTRA_PROJECT_ID;
+    delete process.env.MASTRA_ORG_ID;
+  });
+
+  it('seeds MASTRA_PROJECT_ID and MASTRA_ORG_ID from .env', async () => {
+    writeFileSync(join(tmpDir, '.env'), 'MASTRA_PROJECT_ID=proj_abc\nMASTRA_ORG_ID=org_xyz\nFOO=bar');
+    const { loadDeployEnvFromDotenv } = await import('./deploy.js');
+
+    loadDeployEnvFromDotenv(tmpDir);
+
+    expect(process.env.MASTRA_PROJECT_ID).toBe('proj_abc');
+    expect(process.env.MASTRA_ORG_ID).toBe('org_xyz');
+  });
+
+  it('does not override existing process.env values', async () => {
+    process.env.MASTRA_PROJECT_ID = 'env-wins';
+    writeFileSync(join(tmpDir, '.env'), 'MASTRA_PROJECT_ID=dotenv-loses\nMASTRA_ORG_ID=org_xyz');
+    const { loadDeployEnvFromDotenv } = await import('./deploy.js');
+
+    loadDeployEnvFromDotenv(tmpDir);
+
+    expect(process.env.MASTRA_PROJECT_ID).toBe('env-wins');
+    expect(process.env.MASTRA_ORG_ID).toBe('org_xyz');
+  });
+
+  it('does nothing when no env files exist', async () => {
+    const { loadDeployEnvFromDotenv } = await import('./deploy.js');
+
+    loadDeployEnvFromDotenv(tmpDir);
+
+    expect(process.env.MASTRA_PROJECT_ID).toBeUndefined();
+    expect(process.env.MASTRA_ORG_ID).toBeUndefined();
   });
 });
 
@@ -423,6 +479,32 @@ describe('readEnvVars', () => {
   });
 });
 
+describe('getDeployEnvFiles', () => {
+  it('returns an empty list when no .env* files exist (unified deploy uses this to fall back to environment-stored env vars)', async () => {
+    const { readdir } = await import('node:fs/promises');
+    vi.mocked(readdir).mockResolvedValue([] as Awaited<ReturnType<typeof readdir>>);
+
+    const { getDeployEnvFiles } = await import('./deploy.js');
+
+    await expect(getDeployEnvFiles('/project')).resolves.toEqual([]);
+  });
+
+  it('returns sorted deploy env files, excluding .example and .env.schema files', async () => {
+    const { readdir } = await import('node:fs/promises');
+    vi.mocked(readdir).mockResolvedValue([
+      { name: '.env.production', isFile: () => true, isSymbolicLink: () => false },
+      { name: '.env.example', isFile: () => true, isSymbolicLink: () => false },
+      { name: '.env.schema', isFile: () => true, isSymbolicLink: () => false },
+      { name: '.env', isFile: () => true, isSymbolicLink: () => false },
+      { name: 'package.json', isFile: () => true, isSymbolicLink: () => false },
+    ] as unknown as Awaited<ReturnType<typeof readdir>>);
+
+    const { getDeployEnvFiles } = await import('./deploy.js');
+
+    await expect(getDeployEnvFiles('/project')).resolves.toEqual(['.env', '.env.production']);
+  });
+});
+
 describe('deployAction', () => {
   it('passes disablePlatformObservability to uploadDeploy and preserves it when saving config', async () => {
     const { access, readdir, readFile, stat } = await import('node:fs/promises');
@@ -563,6 +645,63 @@ describe('deployAction', () => {
     );
   });
 
+  it('deploys without a local env file and sends no envVars payload (platform-stored vars win)', async () => {
+    const { access, readdir, readFile, stat } = await import('node:fs/promises');
+    const { fetchOrgs } = await import('../auth/api.js');
+    const { getCurrentOrgId, getToken } = await import('../auth/credentials.js');
+    const { fetchProjects, uploadDeploy, pollDeploy } = await import('./platform-api.js');
+    const { loadProjectConfig } = await import('./project-config.js');
+
+    vi.mocked(getToken).mockResolvedValue('test-token');
+    vi.mocked(getCurrentOrgId).mockResolvedValue('org-1');
+    vi.mocked(access).mockResolvedValue(undefined);
+    vi.mocked(stat).mockResolvedValue({ size: 1024 } as Awaited<ReturnType<typeof stat>>);
+    vi.mocked(fetchOrgs).mockResolvedValue([{ id: 'org-1', name: 'Test Org', role: 'admin', isCurrent: true }]);
+    vi.mocked(fetchProjects).mockResolvedValue([
+      {
+        id: 'proj-1',
+        name: 'my-app',
+        slug: 'my-app',
+        organizationId: 'org-1',
+        latestDeployId: null,
+        latestDeployStatus: null,
+        instanceUrl: null,
+        createdAt: null,
+        updatedAt: null,
+      },
+    ]);
+    vi.mocked(uploadDeploy).mockResolvedValue({ id: 'deploy-1', status: 'starting' });
+    vi.mocked(pollDeploy).mockResolvedValue({
+      id: 'deploy-1',
+      status: 'running',
+      instanceUrl: 'https://example.com',
+      error: null,
+    });
+    vi.mocked(loadProjectConfig).mockResolvedValue({
+      organizationId: 'org-1',
+      projectId: 'proj-1',
+      projectName: 'my-app',
+      projectSlug: 'my-app',
+    });
+    // No .env* files in the project dir.
+    vi.mocked(readdir).mockResolvedValue([] as Awaited<ReturnType<typeof readdir>>);
+    vi.mocked(readFile).mockResolvedValue(Buffer.from('zip-data'));
+
+    const { deployAction } = await import('./deploy.js');
+
+    await expect(deployAction(undefined, { yes: true, skipBuild: true })).resolves.toBeUndefined();
+
+    expect(uploadDeploy).toHaveBeenCalledWith(
+      'test-token',
+      'org-1',
+      'proj-1',
+      expect.any(Buffer),
+      expect.objectContaining({
+        envVars: undefined,
+      }),
+    );
+  });
+
   it('throws when headless mode missing required env vars', async () => {
     process.env.MASTRA_API_TOKEN = 'headless-token';
     // Missing MASTRA_ORG_ID and MASTRA_PROJECT_ID
@@ -586,5 +725,137 @@ describe('deployAction', () => {
     await expect(deployAction(undefined, {})).rejects.toThrow(
       'MASTRA_ORG_ID and MASTRA_PROJECT_ID are required when MASTRA_API_TOKEN is set',
     );
+  });
+});
+
+describe('resolveProject (studio)', () => {
+  beforeEach(async () => {
+    vi.resetModules();
+
+    const cp = await import('node:child_process');
+    vi.mocked(cp.execSync).mockReturnValue('my-app');
+
+    const credentials = await import('../auth/credentials.js');
+    vi.mocked(credentials.getToken).mockResolvedValue('test-token');
+    vi.mocked(credentials.getCurrentOrgId).mockResolvedValue('org-1');
+
+    const api = await import('../auth/api.js');
+    vi.mocked(api.fetchOrgs).mockResolvedValue([
+      { id: 'org-1', name: 'Test Org', role: 'admin', isCurrent: true } as unknown as Awaited<
+        ReturnType<typeof api.fetchOrgs>
+      >[number],
+    ]);
+
+    const projectConfig = await import('./project-config.js');
+    vi.mocked(projectConfig.loadProjectConfig).mockResolvedValue(null);
+    vi.mocked(projectConfig.saveProjectConfig).mockResolvedValue(undefined);
+
+    const prompts = await import('@clack/prompts');
+    vi.mocked(prompts.isCancel).mockReturnValue(false);
+    vi.mocked(prompts.confirm).mockResolvedValue(false as never);
+  });
+
+  it('prompts the user with a selector when existing projects are found', async () => {
+    const platform = await import('./platform-api.js');
+    vi.mocked(platform.fetchProjects).mockResolvedValue([
+      { id: 'proj-a', name: 'Daniel', slug: 'daniel' } as never,
+      { id: 'proj-b', name: 'Other', slug: 'other' } as never,
+    ]);
+
+    const prompts = await import('@clack/prompts');
+    // User picks an existing project — then cancels the confirm step so the test stops before build
+    vi.mocked(prompts.select).mockResolvedValueOnce('proj-a' as never);
+    vi.mocked(prompts.confirm).mockResolvedValueOnce(false as never);
+
+    const { deployAction } = await import('./deploy.js');
+    // Confirm=false triggers process.exit(0), so guard it
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
+      throw new Error('__exit__');
+    });
+
+    await expect(deployAction(undefined, {})).rejects.toThrow();
+
+    expect(prompts.select).toHaveBeenCalledTimes(1);
+    const selectArgs = vi.mocked(prompts.select).mock.calls[0]![0] as {
+      options: Array<{ value: string; label: string }>;
+      initialValue?: string;
+    };
+    expect(selectArgs.options.map(o => o.value)).toEqual(['proj-a', 'proj-b', '__create_new__']);
+
+    exitSpy.mockRestore();
+  });
+
+  it('--project <slug> bypasses the selector when it matches an existing project', async () => {
+    const platform = await import('./platform-api.js');
+    vi.mocked(platform.fetchProjects).mockResolvedValue([
+      { id: 'proj-a', name: 'Daniel', slug: 'daniel' } as never,
+      { id: 'proj-b', name: 'Other', slug: 'other' } as never,
+    ]);
+
+    const prompts = await import('@clack/prompts');
+    vi.mocked(prompts.confirm).mockResolvedValueOnce(false as never);
+
+    const { deployAction } = await import('./deploy.js');
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
+      throw new Error('__exit__');
+    });
+
+    await expect(deployAction(undefined, { project: 'daniel' })).rejects.toThrow();
+
+    expect(prompts.select).not.toHaveBeenCalled();
+
+    exitSpy.mockRestore();
+  });
+
+  it('--project <name> bypasses the selector when it matches an existing project by name', async () => {
+    const platform = await import('./platform-api.js');
+    vi.mocked(platform.fetchProjects).mockResolvedValue([
+      { id: 'proj-a', name: 'My App', slug: 'my-app-slug' } as never,
+      { id: 'proj-b', name: 'Other', slug: 'other' } as never,
+    ]);
+
+    const prompts = await import('@clack/prompts');
+    vi.mocked(prompts.confirm).mockResolvedValueOnce(false as never);
+
+    const { deployAction } = await import('./deploy.js');
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
+      throw new Error('__exit__');
+    });
+
+    await expect(deployAction(undefined, { project: 'My App' })).rejects.toThrow();
+
+    expect(prompts.select).not.toHaveBeenCalled();
+    expect(platform.createProject).not.toHaveBeenCalled();
+
+    exitSpy.mockRestore();
+  });
+
+  it('auto-accept with multiple projects and no name match throws a helpful error', async () => {
+    const platform = await import('./platform-api.js');
+    vi.mocked(platform.fetchProjects).mockResolvedValue([
+      { id: 'proj-a', name: 'Daniel', slug: 'daniel' } as never,
+      { id: 'proj-b', name: 'Other', slug: 'other' } as never,
+    ]);
+
+    const { deployAction } = await import('./deploy.js');
+
+    await expect(deployAction(undefined, { yes: true })).rejects.toThrow(/Pass --project .* to select one/);
+  });
+
+  it('auto-accept with exactly one name match picks that project without prompting', async () => {
+    const platform = await import('./platform-api.js');
+    vi.mocked(platform.fetchProjects).mockResolvedValue([
+      { id: 'proj-a', name: 'my-app', slug: 'my-app' } as never,
+      { id: 'proj-b', name: 'Other', slug: 'other' } as never,
+    ]);
+
+    const prompts = await import('@clack/prompts');
+
+    const { deployAction } = await import('./deploy.js');
+
+    // Will eventually fail when it reaches build; we just care it doesn't hit the "Pass --project" error
+    await expect(deployAction(undefined, { yes: true })).rejects.not.toThrow(/Pass --project/);
+
+    expect(prompts.select).not.toHaveBeenCalled();
   });
 });

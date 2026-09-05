@@ -1,5 +1,10 @@
 import { createDefaultTestContext } from '@internal/server-adapter-test-utils';
 import type { AdapterTestContext } from '@internal/server-adapter-test-utils';
+import {
+  MASTRA_CLIENT_TYPE_HEADER,
+  MASTRA_IS_STUDIO_KEY,
+  MASTRA_STUDIO_CLIENT_TYPE,
+} from '@mastra/server/server-adapter';
 import type { INestApplication } from '@nestjs/common';
 import { REQUEST, ContextIdFactory } from '@nestjs/core';
 import { Test } from '@nestjs/testing';
@@ -51,6 +56,7 @@ describe('NestJS Adapter - RequestContext parsing', () => {
     const request = {
       method: 'GET',
       query: { requestContext: encoded },
+      headers: {},
       res: undefined,
     };
 
@@ -65,12 +71,27 @@ describe('NestJS Adapter - RequestContext parsing', () => {
     const request = {
       method: 'POST',
       body: { requestContext: { sessionId: 'session-9' } },
+      headers: {},
       res: undefined,
     };
 
     const service = await createService(context, request);
 
     expect(service.requestContext.get('sessionId')).toBe('session-9');
+  });
+
+  it('marks the context as Studio when the client type header is set', async () => {
+    const context = await createDefaultTestContext();
+    const request = {
+      method: 'GET',
+      query: {},
+      headers: { [MASTRA_CLIENT_TYPE_HEADER]: MASTRA_STUDIO_CLIENT_TYPE },
+      res: undefined,
+    };
+
+    const service = await createService(context, request);
+
+    expect(service.requestContext.get(MASTRA_IS_STUDIO_KEY)).toBe(true);
   });
 
   it('passes body requestContext through to Mastra route execution', async () => {
@@ -91,7 +112,7 @@ describe('NestJS Adapter - RequestContext parsing', () => {
     const expressApp = app.getHttpAdapter().getInstance() as Application;
     const response = await executeExpressRequest(expressApp, {
       method: 'POST',
-      path: '/agents/test-agent/generate',
+      path: '/api/agents/test-agent/generate',
       body: {
         messages: [{ role: 'user', content: 'hello' }],
         requestContext: { sessionId: 'session-42' },
@@ -124,13 +145,17 @@ describe('NestJS Adapter - RequestContext parsing', () => {
     const expressApp = app.getHttpAdapter().getInstance() as Application;
     const response = await executeExpressRequest(expressApp, {
       method: 'GET',
-      path: '/agents?tag=1&tag=2&requestContext=%7B%22traceId%22%3A%22trace-99%22%7D',
+      path: '/api/agents?tag=1&tag=2&requestContext=%7B%22traceId%22%3A%22trace-99%22%7D',
     });
 
     expect(response.status).toBe(200);
     expect(executeHandler).toHaveBeenCalledOnce();
+    // Repeated query params arrive as a string array; the route's
+    // queryParamSchema (e.g. z.coerce.number().array()) decides whether to
+    // coerce. This matches Hono/Express/Fastify/Koa adapter behavior — see
+    // #16114.
     expect(executeHandler.mock.calls[0]?.[1].queryParams).toMatchObject({
-      tag: [1, 2],
+      tag: ['1', '2'],
     });
     expect(executeHandler.mock.calls[0]?.[1].requestContext.get('traceId')).toBe('trace-99');
   });

@@ -10,11 +10,43 @@ import { calculatorWithUI, greetUserWithUI } from '../mcp/app-tools';
 import { PIIDetector, LanguageDetector, PromptInjectionDetector, ModerationProcessor } from '@mastra/core/processors';
 import { createAnswerRelevancyScorer } from '@mastra/evals/scorers/prebuilt';
 import { requestContextDemoAgent } from './request-context-demo-agent';
+import { DaytonaSandbox } from '@mastra/daytona';
+import { E2BDesktopSandbox } from '@mastra/e2b-desktop';
+import { Workspace } from '@mastra/core/workspace';
 
 // Export Dynamic Tools Agent
 export { dynamicToolsAgent } from './dynamic-tools-agent.js';
 export { slackDemoAgent } from './slack-agent.js';
+export { billingAgent, balanceAgent } from './billing-agent.js';
 const memory = new Memory();
+
+/**
+ * Code-defined agent that Studio is allowed to override in full.
+ * Use this fixture to verify the "Download JSON" / "Open PR" flow on the
+ * code-agent CMS edit page.
+ */
+export const codeOverrideEditableAgent = new Agent({
+  id: 'code-override-editable',
+  name: 'Code Override Editable',
+  description: 'Code-defined agent that Studio may override (instructions + tools)',
+  // instructions: 'You are the original code-defined instructions for the editable override agent.',
+  model: 'openai/gpt-5.4-mini',
+  editor: { instructions: true, tools: true },
+});
+
+/**
+ * Code-defined agent locked from Studio overrides via `editor: false`.
+ * The CMS edit page should hide Download JSON / Open PR / Save / Publish buttons
+ * and the sidebar should expose no editable sections.
+ */
+export const codeOverrideLockedAgent = new Agent({
+  id: 'code-override-locked',
+  name: 'Code Override Locked',
+  description: 'Code-defined agent locked from Studio overrides.',
+  instructions: 'These instructions are owned by code and cannot be edited from Studio.',
+  model: 'openai/gpt-5.4-mini',
+  editor: false,
+});
 
 // Define schema directly compatible with OpenAI's requirements
 const mySchema = jsonSchema({
@@ -41,6 +73,22 @@ export const weatherInfo = tool({
       wind: '10 mph',
     };
   },
+});
+
+/**
+ * Code-defined agent that only allows Studio to override tool DESCRIPTIONS
+ * (not tool membership). Verifies the descriptions-only mode of the Tools tab:
+ * Add/Remove tool controls and MCP/Integration sections must be hidden,
+ * but per-tool description inputs stay editable.
+ */
+export const codeOverrideDescriptionsOnlyAgent = new Agent({
+  id: 'code-override-descriptions-only',
+  name: 'Code Override Descriptions Only',
+  description: 'Code-defined agent that only allows editing tool descriptions from Studio.',
+  instructions: 'Code-defined instructions that Studio cannot override in descriptions-only mode.',
+  model: 'openai/gpt-5.4-mini',
+  tools: { cookingTool, weatherInfo },
+  editor: { tools: { description: true } },
 });
 
 export const chefAgent = new Agent({
@@ -76,7 +124,7 @@ export const dynamicAgent = new Agent({
   },
   model: ({ requestContext }) => {
     if (requestContext.get('foo')) {
-      return 'openai/gpt-5.4' as const;
+      return 'openai/gpt-5.5' as const;
     }
     return 'openai/gpt-5.4-mini' as const;
   },
@@ -153,7 +201,7 @@ export const schemaValidatedAgent = new Agent({
 });
 
 const piiDetector = new PIIDetector({
-  model: 'openai/gpt-5.4',
+  model: 'openai/gpt-5.5',
   redactionMethod: 'mask',
   preserveFormat: true,
   includeDetections: true,
@@ -184,7 +232,7 @@ export const chefAgentResponses = new Agent({
     ingredients they have available. Your first priority is understanding what ingredients and equipment the user has access to, then suggesting achievable recipes.
     You explain cooking steps clearly and offer substitutions when needed, maintaining a friendly and encouraging tone throughout.
     `,
-  model: 'openai/gpt-5.4',
+  model: 'openai/gpt-5.5',
   tools: async () => {
     return {
       web_search_preview: openai.tools.webSearchPreview(),
@@ -209,12 +257,12 @@ export const agentThatHarassesYou = new Agent({
   instructions: `
     You are a agent that harasses you. You are a jerk. You are a meanie. You are a bully. You are a asshole.
     `,
-  model: 'openai/gpt-5.4',
+  model: 'openai/gpt-5.5',
   outputProcessors: [moderationDetector],
 });
 
 const answerRelevance = createAnswerRelevancyScorer({
-  model: 'openai/gpt-5.4',
+  model: 'openai/gpt-5.5',
 });
 
 export const evalAgent = new Agent({
@@ -223,7 +271,7 @@ export const evalAgent = new Agent({
   instructions: `
     You are a helpful assistant with a weather tool.
     `,
-  model: 'openai/gpt-5.4',
+  model: 'openai/gpt-5.5',
   tools: {
     weatherInfo,
   },
@@ -265,4 +313,38 @@ Available tools:
     calculatorWithUI,
     greetUserWithUI,
   },
+});
+
+const computerUseProvider = process.env.COMPUTER_USE_PROVIDER === 'e2b-desktop' ? 'e2b-desktop' : 'daytona';
+
+const computerUseSandbox =
+  computerUseProvider === 'e2b-desktop'
+    ? new E2BDesktopSandbox({
+        id: 'computer-use-agent-example',
+        apiKey: process.env.E2B_API_KEY,
+        resolution: [1280, 720],
+      })
+    : new DaytonaSandbox({
+        id: 'computer-use-agent-example',
+        apiKey: process.env.DAYTONA_API_KEY,
+        autoStopInterval: 15,
+        computerUse: true,
+      });
+
+export const computerUseAgent = new Agent({
+  id: 'computer-use-agent',
+  name: 'Computer Use Agent',
+  description: `Controls a remote Linux desktop through the provider-neutral workspace computer tools (${computerUseProvider}).`,
+  instructions: [
+    'You control a remote Linux desktop through workspace computer and shell tools.',
+    'Take a screenshot and inspect the screen dimensions before interacting with the desktop.',
+    'Use fresh screenshots after actions instead of assuming that the interface has not changed.',
+    'Use mouse and keyboard tools for desktop interactions, and use shell tools to verify resulting files or process state when possible.',
+    'Do not expose credentials or authenticated desktop stream URLs in your response.',
+  ].join('\n'),
+  model: 'openai/gpt-5.6-sol',
+  workspace: new Workspace({
+    id: `computer-use-${computerUseProvider}-workspace`,
+    sandbox: computerUseSandbox,
+  }),
 });

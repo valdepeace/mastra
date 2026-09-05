@@ -1,5 +1,5 @@
 import type { ScheduleResponse } from '@mastra/client-js';
-import { EntityList, EntityListSkeleton } from '@mastra/playground-ui';
+import { DataList, DataListSkeleton, useDataListKeyboard } from '@mastra/playground-ui/components/DataList';
 import { useMemo } from 'react';
 import { formatScheduleTimestamp, formatRelativeTime } from '../utils/format';
 import { ScheduleStatusText } from './schedule-status-badge';
@@ -20,52 +20,54 @@ export function SchedulesList({ schedules, isLoading, search = '' }: SchedulesLi
   const filtered = useMemo(() => {
     const term = search.toLowerCase();
     if (!term) return schedules;
-    return schedules.filter(s => s.id.toLowerCase().includes(term) || s.target.workflowId.toLowerCase().includes(term));
+    return schedules.filter(
+      s => s.id.toLowerCase().includes(term) || (s.workflowId ?? s.agentId ?? '').toLowerCase().includes(term),
+    );
   }, [schedules, search]);
 
+  const { containerRef, getRowProps } = useDataListKeyboard({ count: filtered.length });
+
   if (isLoading) {
-    return <EntityListSkeleton columns={COLUMNS} />;
+    return <DataListSkeleton columns={COLUMNS} />;
   }
 
   return (
-    <EntityList columns={COLUMNS}>
-      <EntityList.Top>
-        <EntityList.TopCell>Workflow</EntityList.TopCell>
-        <EntityList.TopCell>Schedule ID</EntityList.TopCell>
-        <EntityList.TopCell>Cron</EntityList.TopCell>
-        <EntityList.TopCell>Status</EntityList.TopCell>
-        <EntityList.TopCell>Next fire</EntityList.TopCell>
-        <EntityList.TopCell>Last run</EntityList.TopCell>
-      </EntityList.Top>
+    <DataList columns={COLUMNS} className="min-w-0" scrollRef={containerRef}>
+      <DataList.Top>
+        <DataList.TopCell>Target</DataList.TopCell>
+        <DataList.TopCell>Schedule ID</DataList.TopCell>
+        <DataList.TopCell>Cron</DataList.TopCell>
+        <DataList.TopCell>Status</DataList.TopCell>
+        <DataList.TopCell>Next fire</DataList.TopCell>
+        <DataList.TopCell>Last run</DataList.TopCell>
+      </DataList.Top>
 
-      {filtered.length === 0 && search ? <EntityList.NoMatch message="No schedules match your search" /> : null}
-      {filtered.length === 0 && !search ? <EntityList.NoMatch message="No schedules configured" /> : null}
+      {filtered.length === 0 && search ? <DataList.NoMatch message="No schedules match your search" /> : null}
+      {filtered.length === 0 && !search ? <DataList.NoMatch message="No schedules configured" /> : null}
 
-      {filtered.map(s => (
-        <EntityList.RowLink key={s.id} to={paths.scheduleLink(s.id)} LinkComponent={Link}>
-          <EntityList.NameCell>
-            <span className="truncate">{s.target.workflowId}</span>
-          </EntityList.NameCell>
-          <EntityList.TextCell>
-            <span className="truncate font-mono text-ui-sm" title={s.id}>
+      {filtered.map((s, index) => (
+        <DataList.RowLink key={s.id} to={paths.scheduleLink(s.id)} LinkComponent={Link} {...getRowProps(index)}>
+          <DataList.NameCell>{s.workflowId ?? s.agentId}</DataList.NameCell>
+          <DataList.Cell className="min-w-0">
+            <span className="text-ui-smd text-neutral3 block truncate font-mono" title={s.id}>
               {s.id}
             </span>
-          </EntityList.TextCell>
-          <EntityList.TextCell>
+          </DataList.Cell>
+          <DataList.Cell>
             <span className="inline-flex items-center gap-2 whitespace-nowrap">
-              <code className="font-mono text-ui-sm">{s.cron}</code>
+              <code className="text-ui-sm font-mono">{s.cron}</code>
               {s.timezone ? <span className="text-neutral4 text-ui-xs">{s.timezone}</span> : null}
             </span>
-          </EntityList.TextCell>
-          <EntityList.TextCell>
+          </DataList.Cell>
+          <DataList.Cell>
             <ScheduleStatusText status={s.status} />
-          </EntityList.TextCell>
-          <EntityList.TextCell>
+          </DataList.Cell>
+          <DataList.Cell>
             <span className="whitespace-nowrap" title={formatScheduleTimestamp(s.nextFireAt)}>
               {formatRelativeTime(s.nextFireAt)}
             </span>
-          </EntityList.TextCell>
-          <EntityList.TextCell>
+          </DataList.Cell>
+          <DataList.Cell>
             {s.lastRun ? (
               <span className="inline-flex items-center gap-2 whitespace-nowrap">
                 <WorkflowRunStatusInline status={s.lastRun.status} />
@@ -80,9 +82,9 @@ export function SchedulesList({ schedules, isLoading, search = '' }: SchedulesLi
             ) : (
               <span className="text-neutral4">Never</span>
             )}
-          </EntityList.TextCell>
-        </EntityList.RowLink>
+          </DataList.Cell>
+        </DataList.RowLink>
       ))}
-    </EntityList>
+    </DataList>
   );
 }

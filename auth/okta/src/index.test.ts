@@ -40,6 +40,7 @@ describe('MastraAuthOkta', () => {
     delete process.env.OKTA_REDIRECT_URI;
     delete process.env.OKTA_COOKIE_PASSWORD;
     delete process.env.OKTA_ISSUER;
+    delete process.env.OKTA_AUDIENCE;
   });
 
   describe('constructor', () => {
@@ -85,6 +86,53 @@ describe('MastraAuthOkta', () => {
     });
   });
 
+  describe('endpoint URL construction', () => {
+    test('injects /oauth2 for bare-domain (org server) issuers', () => {
+      const auth = new MastraAuthOkta({ issuer: 'https://example.okta.com' });
+      const url = auth.getLoginUrl('http://localhost/cb', 'test-state');
+      expect(url.startsWith('https://example.okta.com/oauth2/v1/authorize?')).toBe(true);
+    });
+
+    test('leaves custom-server issuers untouched', () => {
+      const auth = new MastraAuthOkta({ issuer: 'https://example.oktapreview.com/oauth2/default' });
+      const url = auth.getLoginUrl('http://localhost/cb', 'test-state');
+      expect(url.startsWith('https://example.oktapreview.com/oauth2/default/v1/authorize?')).toBe(true);
+    });
+
+    test('normalizes trailing slashes on org-server issuers', () => {
+      const auth = new MastraAuthOkta({ issuer: 'https://example.okta.com/' });
+      const url = auth.getLoginUrl('http://localhost/cb', 'test-state');
+      expect(url.startsWith('https://example.okta.com/oauth2/v1/authorize?')).toBe(true);
+      expect(url).not.toContain('//v1/');
+      expect(url).not.toContain('.com//');
+    });
+
+    test('normalizes trailing slashes on custom-server issuers', () => {
+      const auth = new MastraAuthOkta({ issuer: 'https://example.oktapreview.com/oauth2/default/' });
+      const url = auth.getLoginUrl('http://localhost/cb', 'test-state');
+      expect(url.startsWith('https://example.oktapreview.com/oauth2/default/v1/authorize?')).toBe(true);
+      expect(url).not.toContain('default//');
+    });
+
+    test('JWT iss-claim validation still uses raw issuer for org server', async () => {
+      const mockJWKS = vi.fn();
+      (createRemoteJWKSet as any).mockReturnValue(mockJWKS);
+      (jwtVerify as any).mockResolvedValue({
+        payload: { sub: 'u1', email: 'a@b.com' },
+      });
+
+      const auth = new MastraAuthOkta({ issuer: 'https://example.okta.com' });
+      await auth.authenticateToken('token', {} as any);
+
+      expect(createRemoteJWKSet).toHaveBeenCalledWith(new URL('https://example.okta.com/oauth2/v1/keys'));
+      expect(jwtVerify).toHaveBeenCalledWith(
+        'token',
+        mockJWKS,
+        expect.objectContaining({ issuer: 'https://example.okta.com' }),
+      );
+    });
+  });
+
   describe('authenticateToken', () => {
     test('verifies JWT and returns user', async () => {
       const mockJWKS = vi.fn();
@@ -119,6 +167,68 @@ describe('MastraAuthOkta', () => {
           updatedAt: undefined,
         },
       });
+    });
+
+    test('verifies against the configured audience option', async () => {
+      const mockJWKS = vi.fn();
+      (createRemoteJWKSet as any).mockReturnValue(mockJWKS);
+      (jwtVerify as any).mockResolvedValue({ payload: { sub: 'u1' } });
+
+      const auth = new MastraAuthOkta({ audience: 'api://default' });
+      await auth.authenticateToken('test-token', {} as any);
+
+      expect(jwtVerify).toHaveBeenCalledWith(
+        'test-token',
+        mockJWKS,
+        expect.objectContaining({ audience: 'api://default' }),
+      );
+    });
+
+    test('verifies against OKTA_AUDIENCE when no option is given', async () => {
+      const mockJWKS = vi.fn();
+      (createRemoteJWKSet as any).mockReturnValue(mockJWKS);
+      (jwtVerify as any).mockResolvedValue({ payload: { sub: 'u1' } });
+      process.env.OKTA_AUDIENCE = 'https://dev-123456.okta.com';
+
+      const auth = new MastraAuthOkta();
+      await auth.authenticateToken('test-token', {} as any);
+
+      expect(jwtVerify).toHaveBeenCalledWith(
+        'test-token',
+        mockJWKS,
+        expect.objectContaining({ audience: 'https://dev-123456.okta.com' }),
+      );
+    });
+
+    test('accepts an array of audiences', async () => {
+      const mockJWKS = vi.fn();
+      (createRemoteJWKSet as any).mockReturnValue(mockJWKS);
+      (jwtVerify as any).mockResolvedValue({ payload: { sub: 'u1' } });
+
+      const auth = new MastraAuthOkta({ audience: ['test-client-id', 'api://default'] });
+      await auth.authenticateToken('test-token', {} as any);
+
+      expect(jwtVerify).toHaveBeenCalledWith(
+        'test-token',
+        mockJWKS,
+        expect.objectContaining({ audience: ['test-client-id', 'api://default'] }),
+      );
+    });
+
+    test('the option wins over OKTA_AUDIENCE', async () => {
+      const mockJWKS = vi.fn();
+      (createRemoteJWKSet as any).mockReturnValue(mockJWKS);
+      (jwtVerify as any).mockResolvedValue({ payload: { sub: 'u1' } });
+      process.env.OKTA_AUDIENCE = 'from-env';
+
+      const auth = new MastraAuthOkta({ audience: 'from-option' });
+      await auth.authenticateToken('test-token', {} as any);
+
+      expect(jwtVerify).toHaveBeenCalledWith(
+        'test-token',
+        mockJWKS,
+        expect.objectContaining({ audience: 'from-option' }),
+      );
     });
 
     test('returns null for invalid token', async () => {
