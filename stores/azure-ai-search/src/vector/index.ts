@@ -835,6 +835,15 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
    * @throws {MastraError} When upsert operation fails
    */
   async upsert({ indexName, vectors, metadata = [], ids, deleteFilter }: AzureAISearchUpsertParams): Promise<string[]> {
+    if (vectors.length === 0) {
+      throw new MastraError({
+        id: 'STORAGE_AZURE_AI_SEARCH_UPSERT_EMPTY_VECTORS',
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.USER,
+        text: 'At least one vector must be provided to upsert.',
+        details: { indexName },
+      });
+    }
     if (metadata.length > 0 && metadata.length !== vectors.length) {
       throw new MastraError({
         id: 'STORAGE_AZURE_AI_SEARCH_UPSERT_METADATA_LENGTH_MISMATCH',

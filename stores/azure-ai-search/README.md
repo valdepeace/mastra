@@ -2,6 +2,15 @@
 
 Azure AI Search vector store provider for Mastra. This package provides vector storage and similarity search capabilities using Azure AI Search's vector search features.
 
+## Update note (2026-09-05)
+
+This branch had fallen behind `mastra-ai/mastra`'s `main` since the original PR. Re-verifying it against a current checkout, with `@mastra/core` built from source (not npm), surfaced a few gaps that needed fixing before the package could be called production-ready:
+
+- **Unit tests**: 1 outdated test asserted the old (unsafe) `deleteFilter` behavior — deleting matches _before_ the new vectors were written, which could drop data on a failed upload. The implementation had already moved to the safer delete-after-upload approach; the test was updated to match, plus a new case covering that a replacement document matching `deleteFilter` is never deleted.
+- **Integration tests** (run against a live Azure AI Search instance via the shared `@internal/test-utils` conformance suite): 143/191 passed. Fixed a real gap — `upsert()` with an empty `vectors` array silently resolved instead of rejecting. Remaining failures are Azure-specific edge cases (document-key character restrictions on UUID-URN style ids, fixed-schema field type strictness, and a couple of test-side timeouts) rather than logic bugs, and are tracked separately.
+
+Bottom line: the vector store works correctly end-to-end against real Azure AI Search; the fixes above close the gap between this snapshot and the package's current state.
+
 ## Installation
 
 ```bash

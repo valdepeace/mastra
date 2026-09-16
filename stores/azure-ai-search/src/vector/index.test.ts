@@ -320,7 +320,13 @@ describe('AzureAISearchVector Unit Tests', () => {
       ]);
     });
 
-    it('should apply deleteFilter before upsert', async () => {
+    it('should delete documents matching deleteFilter after upsert succeeds', async () => {
+      // Stale doc matched by the filter before upload; must be swept up afterward.
+      const mockResults = (async function* () {
+        yield { document: { id: 'stale-doc' } };
+      })();
+      mockSearchClientInstance.search.mockResolvedValue({ results: mockResults });
+
       const deleteVectorsSpy = vi.spyOn(azureVector, 'deleteVectors').mockResolvedValue();
 
       await azureVector.upsert({
@@ -330,10 +336,34 @@ describe('AzureAISearchVector Unit Tests', () => {
         deleteFilter: { eq: { type: 'document' } },
       });
 
+      // Snapshotting matching ids happens before upload (search), but the
+      // actual delete is issued by id only after upload succeeds.
+      expect(mockSearchClientInstance.search).toHaveBeenCalled();
       expect(deleteVectorsSpy).toHaveBeenCalledWith({
         indexName: 'test-index',
-        filter: { eq: { type: 'document' } },
+        ids: ['stale-doc'],
       });
+    });
+
+    it('should not delete replacement documents that also match deleteFilter', async () => {
+      // The upsert's own new id happens to match the filter too - it must
+      // survive the post-upload cleanup since it's the replacement, not stale data.
+      const mockResults = (async function* () {
+        yield { document: { id: 'kept-id' } };
+      })();
+      mockSearchClientInstance.search.mockResolvedValue({ results: mockResults });
+
+      const deleteVectorsSpy = vi.spyOn(azureVector, 'deleteVectors').mockResolvedValue();
+
+      await azureVector.upsert({
+        indexName: 'test-index',
+        vectors: [[0.1, 0.2, 0.3]],
+        metadata: [{ type: 'document' }],
+        ids: ['kept-id'],
+        deleteFilter: { eq: { type: 'document' } },
+      });
+
+      expect(deleteVectorsSpy).not.toHaveBeenCalled();
     });
   });
 
