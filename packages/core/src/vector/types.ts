@@ -62,7 +62,13 @@ export interface CreateIndexParams {
   metric?: 'cosine' | 'euclidean' | 'dotproduct';
 }
 
-export interface QueryVectorParams<Filter = VectorFilter> {
+export type RetrievalMode = 'dense' | 'hybrid';
+
+export type VectorStoreCapabilities = {
+  retrievalModes: readonly RetrievalMode[];
+};
+
+type BaseQueryVectorParams<Filter = VectorFilter> = {
   indexName: string;
   /**
    * The query vector for similarity search.
@@ -78,7 +84,19 @@ export interface QueryVectorParams<Filter = VectorFilter> {
   includeVector?: boolean;
   /** Optional sparse vector for hybrid query */
   sparseVector?: SparseVector;
-}
+};
+
+export type DenseQueryVectorParams<Filter = VectorFilter> = BaseQueryVectorParams<Filter> & {
+  retrievalMode?: 'dense';
+  textQuery?: never;
+};
+
+export type HybridQueryVectorParams<Filter = VectorFilter> = BaseQueryVectorParams<Filter> & {
+  retrievalMode: 'hybrid';
+  textQuery: string;
+};
+
+export type QueryVectorParams<Filter = VectorFilter> = DenseQueryVectorParams<Filter> | HybridQueryVectorParams<Filter>;
 
 export interface DescribeIndexParams {
   indexName: string;

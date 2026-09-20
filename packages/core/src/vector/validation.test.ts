@@ -18,7 +18,15 @@
 import { describe, expect, it } from 'vitest';
 
 import { MastraError } from '../error';
-import { validateTopK, validateUpsert, validateUpsertInput, validateVectorValues } from './validation';
+import type { QueryVectorParams } from './types';
+import {
+  validateQueryInput,
+  validateTopK,
+  validateUpsert,
+  validateUpsertInput,
+  validateVectorValues,
+} from './validation';
+import { MastraVector } from './vector';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -335,5 +343,44 @@ describe('validateUpsert', () => {
   it('validates both structure and values together when validateValues = true', () => {
     // Structure fine, but values bad
     expect(() => validateUpsert(STORE, [[1, NaN]], undefined, ['id-1'], true)).toThrow(MastraError);
+  });
+});
+
+describe('hybrid retrieval validation', () => {
+  it('defaults a vector store to dense-only retrieval', () => {
+    const vectorStore = Object.create(MastraVector.prototype) as MastraVector;
+
+    expect(vectorStore.getCapabilities()).toEqual({ retrievalModes: ['dense'] });
+  });
+
+  it('accepts a strict hybrid query with text', () => {
+    expect(() =>
+      validateQueryInput(STORE, {
+        indexName: 'docs',
+        queryVector: [0.1],
+        retrievalMode: 'hybrid',
+        textQuery: 'circuit breaker',
+      }),
+    ).not.toThrow();
+  });
+
+  it('rejects blank strict hybrid text', () => {
+    expect(() =>
+      validateQueryInput(STORE, {
+        indexName: 'docs',
+        queryVector: [0.1],
+        retrievalMode: 'hybrid',
+        textQuery: '   ',
+      }),
+    ).toThrow(/textQuery/i);
+  });
+
+  it('models hybrid text as required while preserving the dense shape', () => {
+    const denseQuery: QueryVectorParams = { indexName: 'docs', queryVector: [0.1] };
+    // @ts-expect-error Hybrid queries require textQuery.
+    const invalidHybridQuery: QueryVectorParams = { indexName: 'docs', retrievalMode: 'hybrid' };
+
+    expect(denseQuery).toEqual({ indexName: 'docs', queryVector: [0.1] });
+    expect(invalidHybridQuery).toEqual({ indexName: 'docs', retrievalMode: 'hybrid' });
   });
 });

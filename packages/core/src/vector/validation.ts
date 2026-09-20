@@ -7,6 +7,7 @@
 
 import { MastraError, ErrorDomain, ErrorCategory } from '../error';
 import { createVectorErrorId } from '../storage';
+import type { QueryVectorParams } from './types';
 
 /**
  * Validates upsert input parameters
@@ -150,5 +151,19 @@ export function validateUpsert(
 
   if (validateValues && vectors) {
     validateVectorValues(storeName, vectors);
+  }
+}
+
+export function validateQueryInput(storeName: string, params: QueryVectorParams): void {
+  if (params.retrievalMode === 'hybrid' && params.textQuery.trim() === '') {
+    throw new MastraError({
+      id: createVectorErrorId(storeName, 'QUERY', 'INVALID_HYBRID_TEXT_QUERY'),
+      text: 'textQuery must be non-blank for hybrid retrieval',
+      domain: ErrorDomain.MASTRA_VECTOR,
+      category: ErrorCategory.USER,
+      details: {
+        message: 'textQuery must be non-blank for hybrid retrieval',
+      },
+    });
   }
 }

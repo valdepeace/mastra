@@ -22,6 +22,7 @@ import type {
   CreateIndexParams,
   UpsertVectorParams,
   QueryVectorParams,
+  VectorStoreCapabilities,
   IndexStats,
   QueryResult,
   UpdateVectorParams,
@@ -89,6 +90,10 @@ export abstract class MastraVector<Filter = VectorFilter> extends MastraBase {
 
   get indexSeparator(): string {
     return '_';
+  }
+
+  getCapabilities(): VectorStoreCapabilities {
+    return { retrievalModes: ['dense'] };
   }
 
   abstract query(params: QueryVectorParams<Filter>): Promise<QueryResult[]>;
