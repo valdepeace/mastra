@@ -1,8 +1,10 @@
 import type { RequestContext } from '@mastra/core/request-context';
 import type { MastraUnion } from '@mastra/core/tools';
-import type { MastraVector, MastraEmbeddingModel, MastraEmbeddingOptions } from '@mastra/core/vector';
+import type { MastraVector, MastraEmbeddingModel, MastraEmbeddingOptions, RetrievalMode } from '@mastra/core/vector';
 
 import type { RerankConfig } from '../rerank';
+
+export type RetrievalPolicy = RetrievalMode | 'auto';
 
 /**
  * Context passed to dynamic vector store resolver functions.
@@ -164,6 +166,8 @@ export type VectorQueryToolOptions = {
   includeSources?: boolean;
   /** Optional reranker configuration to improve result relevance */
   reranker?: RerankConfig;
+  /** Retrieval policy. Defaults to dense; auto uses store capabilities. */
+  retrievalMode?: RetrievalPolicy;
   /** Database-specific configuration options */
   databaseConfig?: DatabaseConfig;
 } & ProviderOptions &

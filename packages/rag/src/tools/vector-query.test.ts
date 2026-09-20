@@ -1,3 +1,4 @@
+import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import { RequestContext } from '@mastra/core/request-context';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { rerank } from '../rerank';
@@ -8,7 +9,10 @@ vi.mock('../utils', async importOriginal => {
   const actual: any = await importOriginal();
   return {
     ...actual,
-    vectorQuerySearch: vi.fn().mockResolvedValue({ results: [{ metadata: { text: 'foo' }, vector: [1, 2, 3] }] }),
+    vectorQuerySearch: vi.fn().mockResolvedValue({
+      results: [{ metadata: { text: 'foo' }, vector: [1, 2, 3] }],
+      retrievalModeUsed: 'dense',
+    }),
   };
 });
 
@@ -695,6 +699,60 @@ describe('createVectorQueryTool', () => {
           databaseConfig: undefined,
           providerOptions: { google: { outputDimensionality: 768 } },
         }),
+      );
+    });
+  });
+
+  describe('retrieval mode', () => {
+    it('forwards retrieval mode and includes the effective mode in the response', async () => {
+      const tool = createVectorQueryTool({
+        indexName: 'testIndex',
+        model: mockModel,
+        vectorStore: { id: 'test-store' } as any,
+        retrievalMode: 'auto',
+      });
+
+      const result = await tool.execute({ queryText: 'circuit breaker', topK: 3 }, {});
+
+      expect(vectorQuerySearch).toHaveBeenCalledWith(expect.objectContaining({ retrievalMode: 'auto' }));
+      expect(result).toMatchObject({
+        relevantContext: expect.any(Array),
+        sources: expect.any(Array),
+        retrievalModeUsed: 'dense',
+      });
+    });
+
+    it('includes the effective mode after reranking', async () => {
+      const tool = createVectorQueryTool({
+        indexName: 'testIndex',
+        model: mockModel,
+        vectorStore: { id: 'test-store' } as any,
+        reranker: { model: 'reranker-model' } as any,
+      });
+
+      const result = await tool.execute({ queryText: 'circuit breaker', topK: 3 }, {});
+
+      expect(result).toMatchObject({ retrievalModeUsed: 'dense' });
+    });
+
+    it('rethrows unsupported strict hybrid errors', async () => {
+      vi.mocked(vectorQuerySearch).mockRejectedValueOnce(
+        new MastraError({
+          id: 'RAG_VECTOR_STORE_HYBRID_UNSUPPORTED',
+          text: 'Vector store "denseStore" does not support hybrid retrieval',
+          domain: ErrorDomain.MASTRA,
+          category: ErrorCategory.USER,
+        }),
+      );
+      const tool = createVectorQueryTool({
+        indexName: 'testIndex',
+        model: mockModel,
+        vectorStore: { id: 'denseStore' } as any,
+        retrievalMode: 'hybrid',
+      });
+
+      await expect(tool.execute({ queryText: 'circuit breaker', topK: 3 }, {})).rejects.toThrow(
+        /does not support hybrid retrieval/,
       );
     });
   });

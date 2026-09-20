@@ -1,9 +1,16 @@
+import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import type { ObservabilityContext } from '@mastra/core/observability';
 import { SpanType } from '@mastra/core/observability';
-import type { MastraVector, MastraEmbeddingModel, QueryResult, QueryVectorParams } from '@mastra/core/vector';
-import { embedV1, embedV2, embedV3 } from '@mastra/core/vector';
+import type {
+  MastraVector,
+  MastraEmbeddingModel,
+  QueryResult,
+  QueryVectorParams,
+  RetrievalMode,
+} from '@mastra/core/vector';
+import { embedV1, embedV2, embedV3, validateQueryInput } from '@mastra/core/vector';
 import type { VectorFilter } from '@mastra/core/vector/filter';
-import type { DatabaseConfig, ProviderOptions } from '../tools/types';
+import type { DatabaseConfig, ProviderOptions, RetrievalPolicy } from '../tools/types';
 
 type VectorQuerySearchParams = {
   indexName: string;
@@ -14,15 +21,17 @@ type VectorQuerySearchParams = {
   topK: number;
   includeVectors?: boolean;
   maxRetries?: number;
+  retrievalMode?: RetrievalPolicy;
   /** Database-specific configuration options */
   databaseConfig?: DatabaseConfig;
   /** Observability context for tracing nested operations */
   observabilityContext?: ObservabilityContext;
 } & ProviderOptions;
 
-interface VectorQuerySearchResult {
+export interface VectorQuerySearchResult {
   results: QueryResult[];
   queryEmbedding: number[];
+  retrievalModeUsed: RetrievalMode;
 }
 
 enum DatabaseType {
@@ -45,6 +54,7 @@ export const vectorQuerySearch = async ({
   topK,
   includeVectors = false,
   maxRetries = 2,
+  retrievalMode,
   databaseConfig = {},
   providerOptions,
   observabilityContext,
@@ -114,13 +124,38 @@ export const vectorQuerySearch = async ({
   });
 
   // ----- Vector store query -----
-  const queryParams: QueryVectorParams = {
+  const requestedMode = retrievalMode ?? 'dense';
+  const capabilities = vectorStore.getCapabilities();
+  const retrievalModeUsed: RetrievalMode =
+    requestedMode === 'auto' ? (capabilities.retrievalModes.includes('hybrid') ? 'hybrid' : 'dense') : requestedMode;
+
+  if (retrievalModeUsed === 'hybrid' && !capabilities.retrievalModes.includes('hybrid')) {
+    throw new MastraError({
+      id: 'RAG_VECTOR_STORE_HYBRID_UNSUPPORTED',
+      text: `Vector store "${vectorStore.id}" does not support hybrid retrieval`,
+      domain: ErrorDomain.MASTRA,
+      category: ErrorCategory.USER,
+      details: {
+        vectorStoreId: vectorStore.id,
+        retrievalMode: 'hybrid',
+        supportedRetrievalModes: capabilities.retrievalModes.join(','),
+      },
+    });
+  }
+
+  const denseQueryParams = {
     indexName,
     queryVector: embedding,
     topK,
     filter: queryFilter,
     includeVector: includeVectors,
   };
+  const queryParams: QueryVectorParams =
+    retrievalModeUsed === 'hybrid'
+      ? { ...denseQueryParams, retrievalMode: 'hybrid', textQuery: queryText }
+      : denseQueryParams;
+
+  validateQueryInput(vectorStore.id, queryParams);
 
   const querySpan = parentSpan?.createChildSpan({
     type: SpanType.RAG_VECTOR_OPERATION,
@@ -133,6 +168,7 @@ export const vectorQuerySearch = async ({
       indexName,
       topK,
       dimensions: embedding?.length,
+      retrievalModeUsed,
     },
   });
 
@@ -148,7 +184,7 @@ export const vectorQuerySearch = async ({
     output: { returned: results?.length ?? 0 },
   });
 
-  return { results, queryEmbedding: embedding };
+  return { results, queryEmbedding: embedding, retrievalModeUsed };
 };
 
 const databaseSpecificParams = (databaseConfig: DatabaseConfig) => {

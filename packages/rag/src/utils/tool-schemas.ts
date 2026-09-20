@@ -15,6 +15,7 @@ export const outputSchema = z.object({
   // Kept as z.any() for compatibility with prior usage.
   relevantContext: z.any(),
   // Array of full retrieval result objects
+  retrievalModeUsed: z.enum(['dense', 'hybrid']).optional(),
   sources: z.array(
     z.object({
       id: z.string(), // Unique chunk/document identifier

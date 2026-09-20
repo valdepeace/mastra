@@ -1,3 +1,4 @@
+import { MastraError } from '@mastra/core/error';
 import { createObservabilityContext } from '@mastra/core/observability';
 import { createTool } from '@mastra/core/tools';
 import type { MastraEmbeddingModel } from '@mastra/core/vector';
@@ -47,6 +48,7 @@ export const createVectorQueryTool = (options: VectorQueryToolOptions) => {
       const includeSources: boolean = requestContext?.get('includeSources') ?? options.includeSources ?? true;
       const reranker: RerankConfig | undefined = requestContext?.get('reranker') ?? options.reranker;
       const databaseConfig = requestContext?.get('databaseConfig') ?? options.databaseConfig;
+      const retrievalMode = requestContext?.get('retrievalMode') ?? options.retrievalMode;
       const model: MastraEmbeddingModel<string> = requestContext?.get('model') ?? options.model;
       const providerOptions: ProviderOptions['providerOptions'] =
         requestContext?.get('providerOptions') ?? options.providerOptions;
@@ -80,7 +82,7 @@ export const createVectorQueryTool = (options: VectorQueryToolOptions) => {
           logger.debug('Prepared vector query parameters', { queryText, topK: topKValue, queryFilter, databaseConfig });
         }
 
-        const { results } = await vectorQuerySearch({
+        const { results, retrievalModeUsed } = await vectorQuerySearch({
           indexName,
           vectorStore,
           queryText,
@@ -88,6 +90,7 @@ export const createVectorQueryTool = (options: VectorQueryToolOptions) => {
           queryFilter: Object.keys(queryFilter || {}).length > 0 ? queryFilter : undefined,
           topK: topKValue,
           includeVectors,
+          retrievalMode,
           databaseConfig,
           providerOptions,
           observabilityContext,
@@ -134,7 +137,7 @@ export const createVectorQueryTool = (options: VectorQueryToolOptions) => {
 
           const sources = includeSources ? convertToSources(rerankedResults) : [];
 
-          return { relevantContext: relevantChunks, sources };
+          return { relevantContext: relevantChunks, sources, retrievalModeUsed };
         }
 
         const relevantChunks = results.map(result => result?.metadata);
@@ -147,8 +150,13 @@ export const createVectorQueryTool = (options: VectorQueryToolOptions) => {
         return {
           relevantContext: relevantChunks,
           sources,
+          retrievalModeUsed,
         };
       } catch (err) {
+        if (err instanceof MastraError && err.id === 'RAG_VECTOR_STORE_HYBRID_UNSUPPORTED') {
+          logger?.error('Unsupported hybrid retrieval mode', { error: err });
+          throw err;
+        }
         if (logger) {
           logger.error('Unexpected error in VectorQueryTool execute', {
             error: err,

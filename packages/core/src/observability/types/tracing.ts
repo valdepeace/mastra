@@ -830,6 +830,8 @@ export interface RagVectorOperationAttributes extends AIBaseAttributes {
   topK?: number;
   /** Vector dimensions */
   dimensions?: number;
+  /** Effective retrieval mode */
+  retrievalModeUsed?: 'dense' | 'hybrid';
 }
 
 /**
