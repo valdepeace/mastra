@@ -18,9 +18,10 @@ import type {
   QueryResult,
   QueryVectorParams,
   UpdateVectorParams,
+  VectorStoreCapabilities,
   UpsertVectorParams,
 } from '@mastra/core/vector';
-import { MastraVector } from '@mastra/core/vector';
+import { MastraVector, validateQueryInput } from '@mastra/core/vector';
 import type { AzureAISearchVectorFilter } from './filter';
 import { AzureAISearchFilterTranslator } from './filter';
 
@@ -224,7 +225,7 @@ export interface AzureAISearchCreateIndexParams extends CreateIndexParams {
 /**
  * Extended query parameters for Azure AI Search advanced features
  */
-export interface AzureAISearchAdvancedQueryParams extends AzureAISearchQueryVectorParams {
+export type AzureAISearchAdvancedQueryParams = Omit<AzureAISearchQueryVectorParams, 'retrievalMode' | 'textQuery'> & {
   /** Enable semantic search capabilities */
   useSemanticSearch?: boolean;
   /** Semantic search configuration */
@@ -269,7 +270,7 @@ export interface AzureAISearchAdvancedQueryParams extends AzureAISearchQueryVect
   }>;
   /** Vector filter mode: apply before or after vector search */
   filterMode?: 'preFilter' | 'postFilter';
-}
+};
 
 /**
  * Azure AI Search vector store implementation for Mastra
@@ -1090,7 +1091,17 @@ export class AzureAISearchVector extends MastraVector<AzureAISearchVectorFilter>
    * @returns Array of search results with scores and metadata
    * @throws {MastraError} When search operation fails
    */
+  getCapabilities(): VectorStoreCapabilities {
+    return { retrievalModes: ['dense', 'hybrid'] };
+  }
+
   async query(params: QueryVectorParams<AzureAISearchVectorFilter>): Promise<QueryResult[]> {
+    validateQueryInput(this.id, params);
+
+    if (params.retrievalMode === 'hybrid') {
+      return this.hybridQuery(params);
+    }
+
     return this.advancedQuery(params);
   }
 

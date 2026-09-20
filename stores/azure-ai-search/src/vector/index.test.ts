@@ -391,6 +391,50 @@ describe('AzureAISearchVector Unit Tests', () => {
       });
     });
 
+    it('advertises native hybrid retrieval support', () => {
+      expect(azureVector.getCapabilities()).toEqual({ retrievalModes: ['dense', 'hybrid'] });
+    });
+
+    it('routes Core hybrid requests to hybridQuery', async () => {
+      const hybridQuery = vi.spyOn(azureVector, 'hybridQuery').mockResolvedValue([]);
+      const advancedQuery = vi.spyOn(azureVector, 'advancedQuery').mockResolvedValue([]);
+
+      await azureVector.query({
+        indexName: 'test-index',
+        queryVector: [0.1, 0.2],
+        topK: 3,
+        retrievalMode: 'hybrid',
+        textQuery: 'circuit breaker',
+      });
+
+      expect(hybridQuery).toHaveBeenCalledWith({
+        indexName: 'test-index',
+        queryVector: [0.1, 0.2],
+        topK: 3,
+        retrievalMode: 'hybrid',
+        textQuery: 'circuit breaker',
+      });
+      expect(advancedQuery).not.toHaveBeenCalled();
+    });
+
+    it('keeps dense Core requests on advancedQuery', async () => {
+      const hybridQuery = vi.spyOn(azureVector, 'hybridQuery').mockResolvedValue([]);
+      const advancedQuery = vi.spyOn(azureVector, 'advancedQuery').mockResolvedValue([]);
+
+      await azureVector.query({
+        indexName: 'test-index',
+        queryVector: [0.1, 0.2],
+        topK: 3,
+      });
+
+      expect(advancedQuery).toHaveBeenCalledWith({
+        indexName: 'test-index',
+        queryVector: [0.1, 0.2],
+        topK: 3,
+      });
+      expect(hybridQuery).not.toHaveBeenCalled();
+    });
+
     it('should include the vector in results when includeVector is true', async () => {
       const result = await azureVector.query({
         indexName: 'test-index',
