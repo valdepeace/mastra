@@ -44,6 +44,56 @@ describe('WeaviateVector', () => {
     expect(results?.[0]?.id).toBe(ids[1]);
   }, 50000);
 
+  it('supports native hybrid retrieval over searchable metadata.content', async () => {
+    const ids = await weaviate.upsert({
+      indexName: testIndex,
+      vectors: [
+        [0.6, 0.4, 0.0],
+        [0.4, 0.6, 0.0],
+      ],
+      metadata: [
+        { label: 'hybrid-retry', content: 'Retry budget guidance for circuit breaker recovery.' },
+        { label: 'hybrid-cache', content: 'Cache warming guidance for deployment recovery.' },
+      ],
+    });
+
+    const results = await weaviate.query({
+      indexName: testIndex,
+      queryVector: [0.6, 0.4, 0.0],
+      topK: 1,
+      filter: { label: 'hybrid-retry' },
+      includeVector: true,
+      retrievalMode: 'hybrid',
+      textQuery: 'retry budget circuit breaker',
+    });
+
+    expect(weaviate.getCapabilities()).toEqual({ retrievalModes: ['dense', 'hybrid'] });
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      id: ids[0],
+      metadata: { label: 'hybrid-retry', content: 'Retry budget guidance for circuit breaker recovery.' },
+    });
+    expect(typeof results[0]?.score).toBe('number');
+    expect(results[0]?.vector).toHaveLength(dimension);
+
+    const collection = await (weaviate as any).getCollection(testIndex);
+    const config = await collection.config.get();
+    expect(config.properties).toContainEqual(
+      expect.objectContaining({ name: 'content', dataType: 'text', tokenization: 'word' }),
+    );
+  }, 50000);
+
+  it('rejects blank hybrid text before calling Weaviate', async () => {
+    await expect(
+      weaviate.query({
+        indexName: testIndex,
+        queryVector: [0.1, 0.2, 0.3],
+        retrievalMode: 'hybrid',
+        textQuery: '   ',
+      }),
+    ).rejects.toThrow(/textQuery/i);
+  }, 50000);
+
   it('should list and describe the index', async () => {
     const indexes = await weaviate.listIndexes();
     expect(indexes).toContain(testIndex);

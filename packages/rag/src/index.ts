@@ -6,3 +6,4 @@ export { GraphRAG } from './graph-rag';
 export type { GraphRAGSnapshot } from './graph-rag';
 export * from './tools';
 export * from './utils/default-settings';
+export * from './utils/vector-search';

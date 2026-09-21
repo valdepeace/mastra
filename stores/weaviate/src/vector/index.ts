@@ -1,12 +1,19 @@
 import { MastraError, ErrorDomain, ErrorCategory } from '@mastra/core/error';
 import { createVectorErrorId } from '@mastra/core/storage';
-import { MastraVector, validateUpsertInput, validateVectorValues, validateTopK } from '@mastra/core/vector';
+import {
+  MastraVector,
+  validateUpsertInput,
+  validateVectorValues,
+  validateTopK,
+  validateQueryInput,
+} from '@mastra/core/vector';
 import type {
   QueryResult,
   IndexStats,
   CreateIndexParams,
   UpsertVectorParams,
   QueryVectorParams,
+  VectorStoreCapabilities,
   DescribeIndexParams,
   DeleteIndexParams,
   DeleteVectorParams,
@@ -90,6 +97,10 @@ export class WeaviateVector extends MastraVector<WeaviateVectorFilter> {
   constructor(params: WeaviateVectorParams) {
     super({ id: params.id });
     this.connectOptions = params;
+  }
+
+  getCapabilities(): VectorStoreCapabilities {
+    return { retrievalModes: ['dense', 'hybrid'] };
   }
 
   private getClient(): Promise<WeaviateClient> {
@@ -267,14 +278,17 @@ export class WeaviateVector extends MastraVector<WeaviateVectorFilter> {
         description: JSON.stringify(meta),
         // Store the original Mastra id as an exact-match ("field") text property so
         // arbitrary (e.g. numeric) ids are not misinterpreted by Weaviate's auto-schema.
-        properties: [{ name: MASTRA_ID_PROPERTY, dataType: 'text', tokenization: 'field' }],
+        properties: [
+          { name: MASTRA_ID_PROPERTY, dataType: 'text', tokenization: 'field' },
+          { name: 'content', dataType: 'text', tokenization: 'word' },
+        ],
         // Index null state so `$exists` / null-equality filters are supported.
         invertedIndex: weaviate.configure.invertedIndex({ indexNullState: true }),
         vectorizers: weaviate.configure.vectors.selfProvided({
           vectorIndexConfig: weaviate.configure.vectorIndex.hnsw({ distanceMetric: distance }),
         }),
       });
-      this.knownProperties.set(collectionName, new Set([MASTRA_ID_PROPERTY]));
+      this.knownProperties.set(collectionName, new Set([MASTRA_ID_PROPERTY, 'content']));
     } catch (error) {
       if (error instanceof MastraError) throw error;
       throw new MastraError(
@@ -336,6 +350,7 @@ export class WeaviateVector extends MastraVector<WeaviateVectorFilter> {
           vectors: vector,
           properties: {
             ...encodeMetaProperties(metadata?.[i]),
+            ...(typeof metadata?.[i]?.content === 'string' ? { content: metadata[i].content } : {}),
             [MASTRA_ID_PROPERTY]: originalId,
           },
         };
@@ -376,8 +391,14 @@ export class WeaviateVector extends MastraVector<WeaviateVectorFilter> {
       properties[decodeMetaKey(key)] = value;
     }
 
+    const nativeScore = obj.metadata?.score;
     const distance = obj.metadata?.distance;
-    const score = typeof distance === 'number' ? 1 - distance : (obj.metadata?.certainty ?? 0);
+    const score =
+      typeof nativeScore === 'number'
+        ? nativeScore
+        : typeof distance === 'number'
+          ? 1 - distance
+          : (obj.metadata?.certainty ?? 0);
 
     const result: QueryResult = {
       id: typeof originalId === 'string' ? originalId : obj.uuid,
@@ -393,14 +414,10 @@ export class WeaviateVector extends MastraVector<WeaviateVectorFilter> {
     return result;
   }
 
-  async query({
-    indexName,
-    queryVector,
-    topK = 10,
-    filter,
-    includeVector = false,
-  }: QueryVectorParams<WeaviateVectorFilter>): Promise<QueryResult[]> {
+  async query(params: QueryVectorParams<WeaviateVectorFilter>): Promise<QueryResult[]> {
     try {
+      validateQueryInput(this.id, params);
+      const { indexName, queryVector, topK = 10, filter, includeVector = false } = params;
       validateTopK('WEAVIATE', topK);
 
       const meta = await this.requireMeta(indexName, 'QUERY');
@@ -416,23 +433,33 @@ export class WeaviateVector extends MastraVector<WeaviateVectorFilter> {
 
       const collection = await this.getCollection(indexName);
       const filters = this.transformFilter(collection, filter);
-      const returnMetadata = ['distance'] as const;
+      const queryOptions = {
+        limit: topK,
+        includeVector,
+        ...(filters ? { filters } : {}),
+      };
 
-      if (queryVector) {
-        const response = await collection.query.nearVector(queryVector, {
-          limit: topK,
-          includeVector,
-          returnMetadata: returnMetadata as any,
-          ...(filters ? { filters } : {}),
+      if (params.retrievalMode === 'hybrid') {
+        const response = await collection.query.hybrid(params.textQuery, {
+          ...queryOptions,
+          returnMetadata: ['score'],
+          vector: { vector: queryVector ?? [] },
+          alpha: 0.5,
+          fusionType: 'RelativeScore',
+          queryProperties: ['content'],
         });
         return response.objects.map(obj => this.toQueryResult(obj, includeVector));
       }
 
-      const response = await collection.query.fetchObjects({
-        limit: topK,
-        includeVector,
-        ...(filters ? { filters } : {}),
-      });
+      if (queryVector) {
+        const response = await collection.query.nearVector(queryVector, {
+          ...queryOptions,
+          returnMetadata: ['distance'],
+        });
+        return response.objects.map(obj => this.toQueryResult(obj, includeVector));
+      }
+
+      const response = await collection.query.fetchObjects(queryOptions);
       return response.objects.map(obj => this.toQueryResult(obj, includeVector));
     } catch (error) {
       if (error instanceof MastraError) throw error;
@@ -441,7 +468,7 @@ export class WeaviateVector extends MastraVector<WeaviateVectorFilter> {
           id: createVectorErrorId('WEAVIATE', 'QUERY', 'FAILED'),
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
-          details: { indexName },
+          details: { indexName: params.indexName },
         },
         error,
       );
